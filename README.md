@@ -4,10 +4,16 @@ Simple Alpaca paper-trading bot with a basic SMA strategy.
 
 ## Setup
 
-Install dependencies:
+Install dependencies in PowerShell:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+If `python` is not available on your machine, use:
+
+```bash
+py -m pip install -r requirements.txt
 ```
 
 Create a `.env` file:
@@ -39,9 +45,15 @@ python trading_bot.py
 Run the local dashboard:
 
 ```bash
-streamlit run dashboard.py
+python -m streamlit run dashboard.py
 ```
 
-The bot now records local history to `bot_history.db` by default. Override that with `BOT_DB_PATH` if you want the SQLite file somewhere else.
+If `python` is not available, use:
 
-The original notebook prototype is still in `trading_bot.ipynb`.
+```bash
+py -m streamlit run dashboard.py
+```
+
+Streamlit should print a local URL, usually `http://localhost:8501`.
+
+The bot now records local history to `bot_history.db` by default. Override that with `BOT_DB_PATH` if you want the SQLite file somewhere else.

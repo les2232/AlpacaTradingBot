@@ -1,5 +1,0 @@
-alpaca-py
-python-dotenv
-pytz
-streamlit
-pandas
