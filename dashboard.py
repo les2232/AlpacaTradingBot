@@ -210,10 +210,10 @@ def main() -> None:
         positions_rows.append(
             {
                 "symbol": symbol,
-                "qty": float(position.qty),
-                "market_value": float(position.market_value),
-                "avg_entry_price": float(position.avg_entry_price),
-                "unrealized_pl": float(position.unrealized_pl),
+                "qty": float(position.qty) if position.qty is not None else 0.0,
+                "market_value": float(position.market_value) if position.market_value is not None else 0.0,
+                "avg_entry_price": float(position.avg_entry_price) if position.avg_entry_price is not None else 0.0,
+                "unrealized_pl": float(position.unrealized_pl) if position.unrealized_pl is not None else 0.0,
             }
         )
 
