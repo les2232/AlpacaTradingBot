@@ -1,6 +1,6 @@
 # AlpacaTradingBot
 
-Simple Alpaca paper-trading bot with a basic SMA strategy.
+Simple Alpaca paper-trading bot with a basic intraday SMA strategy.
 
 ## Setup
 
@@ -26,7 +26,8 @@ BOT_SYMBOLS=AAPL,MSFT,NVDA
 MAX_USD_PER_TRADE=200
 MAX_OPEN_POSITIONS=3
 MAX_DAILY_LOSS_USD=300
-SMA_DAYS=20
+SMA_BARS=20
+BAR_TIMEFRAME_MINUTES=15
 ```
 
 Run the bot once:

@@ -273,11 +273,14 @@ def main() -> None:
         st.write(f"Max per trade: {format_money(bot.config.max_usd_per_trade)}")
         st.write(f"Max open positions: {bot.config.max_open_positions}")
         st.write(f"Max daily loss: {format_money(bot.config.max_daily_loss_usd)}")
-        st.write(f"SMA window: {bot.config.sma_days} days")
+        st.write(
+            f"SMA window: {bot.config.sma_bars} x {bot.config.bar_timeframe_minutes}-minute bars"
+        )
     with notes_col:
         render_section_title("Session Notes")
         st.write(f"Snapshot time: `{snapshot.timestamp_utc}`")
         st.write(f"Paper mode: `{bot.config.paper}`")
+        st.write(f"Price feed: `{bot.get_price_feed_status()}`")
         st.write(f"Watched symbols: `{', '.join(bot.config.symbols)}`")
         st.write(f"Recent order count shown: `{len(recent_orders)}`")
         st.write(f"History database: `{bot.storage.db_path}`")

@@ -1,4 +1,7 @@
 import os
+import math
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -6,8 +9,9 @@ from typing import Any, cast
 
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.live.stock import StockDataStream
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.models import Position
@@ -23,7 +27,8 @@ class BotConfig:
     max_usd_per_trade: float
     max_open_positions: int
     max_daily_loss_usd: float
-    sma_days: int
+    sma_bars: int
+    bar_timeframe_minutes: int
     paper: bool = True
 
 
@@ -71,12 +76,16 @@ def load_config() -> BotConfig:
     if not symbols:
         raise RuntimeError("BOT_SYMBOLS must contain at least one ticker.")
 
+    sma_bars_raw = os.getenv("SMA_BARS") or os.getenv("SMA_DAYS", "20")
+    bar_timeframe_minutes = int(os.getenv("BAR_TIMEFRAME_MINUTES", "15"))
+
     return BotConfig(
         symbols=symbols,
         max_usd_per_trade=float(os.getenv("MAX_USD_PER_TRADE", "200")),
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "3")),
         max_daily_loss_usd=float(os.getenv("MAX_DAILY_LOSS_USD", "300")),
-        sma_days=int(os.getenv("SMA_DAYS", "20")),
+        sma_bars=int(sma_bars_raw),
+        bar_timeframe_minutes=bar_timeframe_minutes,
         paper=os.getenv("ALPACA_PAPER", "true").lower() != "false",
     )
 
@@ -95,44 +104,105 @@ class AlpacaTradingBot:
         self.config = config
         self.trading = TradingClient(api_key, api_secret, paper=config.paper)
         self.data = StockHistoricalDataClient(api_key, api_secret)
+        self.data_stream = StockDataStream(api_key, api_secret, feed=DataFeed.IEX)
         db_path = Path(os.getenv("BOT_DB_PATH", "bot_history.db"))
         self.storage = BotStorage(db_path)
+        self._latest_prices: dict[str, float] = {}
+        self._latest_price_times: dict[str, float] = {}
+        self._price_lock = threading.Lock()
+        self._stream_error: str | None = None
+        self._stream_thread: threading.Thread | None = None
+        self._start_price_stream()
 
     def get_account(self) -> Any:
         return cast(Any, self.trading).get_account()
 
+    def get_price_feed_status(self) -> str:
+        with self._price_lock:
+            active_symbols = len(self._latest_prices)
+
+        if self._stream_error:
+            return f"stream error: {self._stream_error}"
+        if active_symbols == 0:
+            return "stream connecting"
+        return f"live stream active for {active_symbols}/{len(self.config.symbols)} symbols"
+
+    def _start_price_stream(self) -> None:
+        if self._stream_thread is not None:
+            return
+
+        self.data_stream.subscribe_trades(self._handle_trade, *self.config.symbols)
+        self._stream_thread = threading.Thread(target=self._run_price_stream, daemon=True)
+        self._stream_thread.start()
+
+    def _run_price_stream(self) -> None:
+        try:
+            self.data_stream.run()
+        except Exception as exc:
+            self._stream_error = str(exc)
+
+    async def _handle_trade(self, trade: Any) -> None:
+        symbol = str(getattr(trade, "symbol", ""))
+        price = getattr(trade, "price", None)
+        if not symbol or price is None:
+            return
+
+        with self._price_lock:
+            self._latest_prices[symbol] = float(price)
+            self._latest_price_times[symbol] = time.time()
+            self._stream_error = None
+
     def get_latest_price(self, symbol: str) -> float:
+        with self._price_lock:
+            cached_price = self._latest_prices.get(symbol)
+            cached_at = self._latest_price_times.get(symbol)
+
+        if cached_price is not None and cached_at is not None and (time.time() - cached_at) <= 15:
+            return cached_price
+
         request = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
         latest = cast(dict[str, Any], cast(Any, self.data).get_stock_latest_trade(request))
-        return float(latest[symbol].price)
+        price = float(latest[symbol].price)
+
+        with self._price_lock:
+            self._latest_prices[symbol] = price
+            self._latest_price_times[symbol] = time.time()
+
+        return price
 
     def get_positions_by_symbol(self) -> dict[str, Position]:
         positions = cast(list[Position], cast(Any, self.trading).get_all_positions())
         return {position.symbol: position for position in positions}
 
-    def get_sma(self, symbol: str, days: int) -> float:
+    def get_sma(self, symbol: str, bars: int) -> float:
+        if bars <= 0:
+            raise RuntimeError("SMA_BARS must be greater than zero.")
+
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=days * 3)
+        trading_minutes_per_day = 390
+        timeframe_minutes = self.config.bar_timeframe_minutes
+        trading_days_needed = max(2, math.ceil((bars * timeframe_minutes) / trading_minutes_per_day))
+        start = end - timedelta(days=trading_days_needed * 5)
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
-            timeframe=cast(TimeFrame, TimeFrame.Day),
+            timeframe=TimeFrame(timeframe_minutes, TimeFrameUnit.Minute),
             start=start,
             end=end,
-            limit=days,
+            limit=bars,
             feed=DataFeed.IEX,
         )
 
         bars_response = cast(Any, self.data).get_stock_bars(request)
-        bars = cast(list[Any], bars_response.data.get(symbol, []))
-        closes = [float(bar.close) for bar in bars][-days:]
-        if len(closes) < max(5, days // 2):
-            raise RuntimeError(f"Not enough daily bars for {symbol}: got {len(closes)}")
+        intraday_bars = cast(list[Any], bars_response.data.get(symbol, []))
+        closes = [float(bar.close) for bar in intraday_bars][-bars:]
+        if len(closes) < max(5, bars // 2):
+            raise RuntimeError(f"Not enough intraday bars for {symbol}: got {len(closes)}")
 
         return sum(closes) / len(closes)
 
     def decide(self, symbol: str, positions: dict[str, Position]) -> str:
         price = self.get_latest_price(symbol)
-        sma = self.get_sma(symbol, days=self.config.sma_days)
+        sma = self.get_sma(symbol, bars=self.config.sma_bars)
         holding = symbol in positions
 
         if price > sma and not holding:
@@ -159,7 +229,7 @@ class AlpacaTradingBot:
             position = positions.get(symbol)
             try:
                 price = self.get_latest_price(symbol)
-                sma = self.get_sma(symbol, days=self.config.sma_days)
+                sma = self.get_sma(symbol, bars=self.config.sma_bars)
                 holding = position is not None
                 quantity = float(position.qty) if position is not None else 0.0
                 market_value = float(position.market_value) if position is not None else 0.0
