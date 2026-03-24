@@ -196,12 +196,27 @@ def main() -> None:
     symbols_df = pd.DataFrame([asdict(item) for item in snapshot.symbols])
     if not symbols_df.empty:
         symbols_df = symbols_df[
-            ["symbol", "price", "sma", "action", "holding", "quantity", "market_value", "error"]
+            [
+                "symbol",
+                "price",
+                "sma",
+                "ml_probability_up",
+                "ml_confidence",
+                "ml_training_rows",
+                "action",
+                "holding",
+                "quantity",
+                "market_value",
+                "error",
+            ]
         ]
         symbols_df = symbols_df.rename(
             columns={
                 "price": "last_price",
                 "market_value": "position_value",
+                "ml_probability_up": "ml_up_prob",
+                "ml_confidence": "ml_conf",
+                "ml_training_rows": "ml_rows",
             }
         )
 
@@ -280,6 +295,10 @@ def main() -> None:
         render_section_title("Session Notes")
         st.write(f"Snapshot time: `{snapshot.timestamp_utc}`")
         st.write(f"Paper mode: `{bot.config.paper}`")
+        st.write(f"Strategy mode: `{bot.config.strategy_mode}`")
+        st.write(
+            f"ML thresholds: buy >= {bot.config.ml_probability_buy:.2f}, sell <= {bot.config.ml_probability_sell:.2f}"
+        )
         st.write(f"Price feed: `{bot.get_price_feed_status()}`")
         st.write(f"Watched symbols: `{', '.join(bot.config.symbols)}`")
         st.write(f"Recent order count shown: `{len(recent_orders)}`")

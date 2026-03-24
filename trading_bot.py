@@ -30,6 +30,20 @@ class BotConfig:
     sma_bars: int
     bar_timeframe_minutes: int
     paper: bool = True
+    strategy_mode: str = "hybrid"
+    ml_lookback_bars: int = 320
+    ml_probability_buy: float = 0.55
+    ml_probability_sell: float = 0.45
+    ml_train_every_seconds: int = 900
+
+
+@dataclass(frozen=True)
+class MlSignal:
+    probability_up: float
+    confidence: float
+    training_rows: int
+    model_age_seconds: float
+    feature_names: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -41,6 +55,9 @@ class SymbolSnapshot:
     holding: bool
     quantity: float
     market_value: float
+    ml_probability_up: float | None = None
+    ml_confidence: float | None = None
+    ml_training_rows: int | None = None
     error: str | None = None
 
 
@@ -70,6 +87,42 @@ class OrderSnapshot:
     notional: float | None
 
 
+@dataclass(frozen=True)
+class TrainedLogisticModel:
+    weights: tuple[float, ...]
+    bias: float
+    means: tuple[float, ...]
+    scales: tuple[float, ...]
+    trained_at_unix: float
+    training_rows: int
+    feature_names: tuple[str, ...]
+
+    def predict_probability(self, features: list[float]) -> float:
+        z = self.bias
+        for value, mean, scale, weight in zip(features, self.means, self.scales, self.weights):
+            normalized = (value - mean) / scale
+            z += normalized * weight
+        return 1.0 / (1.0 + math.exp(-max(min(z, 35.0), -35.0)))
+
+
+FEATURE_NAMES = (
+    "ret_1",
+    "ret_3",
+    "ret_5",
+    "price_vs_sma_10",
+    "price_vs_sma_20",
+    "volatility_10",
+    "volume_vs_avg_10",
+)
+
+
+def _safe_float(value: str | None, default: float) -> float:
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def load_config() -> BotConfig:
     symbols_raw = os.getenv("BOT_SYMBOLS", "AAPL,MSFT,NVDA")
     symbols = [symbol.strip().upper() for symbol in symbols_raw.split(",") if symbol.strip()]
@@ -87,6 +140,11 @@ def load_config() -> BotConfig:
         sma_bars=int(sma_bars_raw),
         bar_timeframe_minutes=bar_timeframe_minutes,
         paper=os.getenv("ALPACA_PAPER", "true").lower() != "false",
+        strategy_mode=os.getenv("STRATEGY_MODE", "hybrid").strip().lower(),
+        ml_lookback_bars=int(os.getenv("ML_LOOKBACK_BARS", "320")),
+        ml_probability_buy=_safe_float(os.getenv("ML_PROBABILITY_BUY"), 0.55),
+        ml_probability_sell=_safe_float(os.getenv("ML_PROBABILITY_SELL"), 0.45),
+        ml_train_every_seconds=int(os.getenv("ML_TRAIN_EVERY_SECONDS", "900")),
     )
 
 
@@ -112,6 +170,7 @@ class AlpacaTradingBot:
         self._price_lock = threading.Lock()
         self._stream_error: str | None = None
         self._stream_thread: threading.Thread | None = None
+        self._model_cache: dict[str, TrainedLogisticModel] = {}
         self._start_price_stream()
 
     def get_account(self) -> Any:
@@ -174,40 +233,205 @@ class AlpacaTradingBot:
         positions = cast(list[Position], cast(Any, self.trading).get_all_positions())
         return {position.symbol: position for position in positions}
 
-    def get_sma(self, symbol: str, bars: int) -> float:
-        if bars <= 0:
-            raise RuntimeError("SMA_BARS must be greater than zero.")
+    def _get_intraday_bars(self, symbol: str, bars_needed: int) -> list[Any]:
+        if bars_needed <= 0:
+            raise RuntimeError("bars_needed must be greater than zero.")
 
         end = datetime.now(timezone.utc)
         trading_minutes_per_day = 390
         timeframe_minutes = self.config.bar_timeframe_minutes
-        trading_days_needed = max(2, math.ceil((bars * timeframe_minutes) / trading_minutes_per_day))
-        start = end - timedelta(days=trading_days_needed * 5)
+        trading_days_needed = max(3, math.ceil((bars_needed * timeframe_minutes) / trading_minutes_per_day))
+        start = end - timedelta(days=trading_days_needed * 6)
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame(timeframe_minutes, TimeFrameUnit.Minute),
             start=start,
             end=end,
-            limit=bars,
+            limit=bars_needed,
             feed=DataFeed.IEX,
         )
 
         bars_response = cast(Any, self.data).get_stock_bars(request)
-        intraday_bars = cast(list[Any], bars_response.data.get(symbol, []))
+        return cast(list[Any], bars_response.data.get(symbol, []))
+
+    def get_sma(self, symbol: str, bars: int) -> float:
+        if bars <= 0:
+            raise RuntimeError("SMA_BARS must be greater than zero.")
+
+        intraday_bars = self._get_intraday_bars(symbol, bars)
         closes = [float(bar.close) for bar in intraday_bars][-bars:]
         if len(closes) < max(5, bars // 2):
             raise RuntimeError(f"Not enough intraday bars for {symbol}: got {len(closes)}")
 
         return sum(closes) / len(closes)
 
+    def _mean(self, values: list[float]) -> float:
+        return sum(values) / len(values)
+
+    def _stddev(self, values: list[float], mean_value: float) -> float:
+        variance = sum((value - mean_value) ** 2 for value in values) / max(1, len(values))
+        return math.sqrt(max(variance, 1e-12))
+
+    def _build_feature_vector(self, closes: list[float], volumes: list[float], index: int) -> list[float]:
+        price = closes[index]
+        ret_1 = (price / closes[index - 1]) - 1.0
+        ret_3 = (price / closes[index - 3]) - 1.0
+        ret_5 = (price / closes[index - 5]) - 1.0
+        sma_10 = self._mean(closes[index - 9 : index + 1])
+        sma_20 = self._mean(closes[index - 19 : index + 1])
+        vol_returns = [
+            (closes[j] / closes[j - 1]) - 1.0
+            for j in range(index - 9, index + 1)
+            if j - 1 >= 0
+        ]
+        avg_volume_10 = self._mean(volumes[index - 9 : index + 1])
+        return [
+            ret_1,
+            ret_3,
+            ret_5,
+            (price / sma_10) - 1.0,
+            (price / sma_20) - 1.0,
+            self._stddev(vol_returns, self._mean(vol_returns)),
+            (volumes[index] / max(avg_volume_10, 1.0)) - 1.0,
+        ]
+
+    def _train_logistic_regression(
+        self,
+        feature_rows: list[list[float]],
+        labels: list[int],
+        feature_names: tuple[str, ...],
+    ) -> TrainedLogisticModel:
+        row_count = len(feature_rows)
+        column_count = len(feature_rows[0])
+        means: list[float] = []
+        scales: list[float] = []
+
+        for col in range(column_count):
+            column_values = [row[col] for row in feature_rows]
+            mean_value = self._mean(column_values)
+            scale = self._stddev(column_values, mean_value)
+            means.append(mean_value)
+            scales.append(scale if scale > 1e-9 else 1.0)
+
+        normalized_rows: list[list[float]] = []
+        for row in feature_rows:
+            normalized_rows.append(
+                [(value - means[idx]) / scales[idx] for idx, value in enumerate(row)]
+            )
+
+        weights = [0.0] * column_count
+        bias = 0.0
+        learning_rate = 0.08
+        epochs = 180
+
+        for _ in range(epochs):
+            grad_w = [0.0] * column_count
+            grad_b = 0.0
+            for row, label in zip(normalized_rows, labels):
+                z = bias + sum(weight * value for weight, value in zip(weights, row))
+                prob = 1.0 / (1.0 + math.exp(-max(min(z, 35.0), -35.0)))
+                error = prob - label
+                for idx, value in enumerate(row):
+                    grad_w[idx] += error * value
+                grad_b += error
+
+            row_scale = 1.0 / row_count
+            for idx in range(column_count):
+                weights[idx] -= learning_rate * grad_w[idx] * row_scale
+            bias -= learning_rate * grad_b * row_scale
+
+        return TrainedLogisticModel(
+            weights=tuple(weights),
+            bias=bias,
+            means=tuple(means),
+            scales=tuple(scales),
+            trained_at_unix=time.time(),
+            training_rows=row_count,
+            feature_names=feature_names,
+        )
+
+    def _get_or_train_ml_model(self, symbol: str) -> TrainedLogisticModel:
+        cached_model = self._model_cache.get(symbol)
+        if cached_model is not None and (time.time() - cached_model.trained_at_unix) < self.config.ml_train_every_seconds:
+            return cached_model
+
+        bars_needed = max(self.config.ml_lookback_bars, 80)
+        intraday_bars = self._get_intraday_bars(symbol, bars_needed)
+        closes = [float(bar.close) for bar in intraday_bars]
+        volumes = [float(getattr(bar, "volume", 0.0) or 0.0) for bar in intraday_bars]
+
+        if len(closes) < 40:
+            raise RuntimeError(f"Not enough bars to train ML model for {symbol}: got {len(closes)}")
+
+        feature_rows: list[list[float]] = []
+        labels: list[int] = []
+        max_index = len(closes) - 2
+        for index in range(19, max_index + 1):
+            features = self._build_feature_vector(closes, volumes, index)
+            next_close = closes[index + 1]
+            label = 1 if next_close > closes[index] else 0
+            feature_rows.append(features)
+            labels.append(label)
+
+        if len(feature_rows) < 20:
+            raise RuntimeError(f"Not enough ML training rows for {symbol}: got {len(feature_rows)}")
+
+        model = self._train_logistic_regression(feature_rows, labels, FEATURE_NAMES)
+        self._model_cache[symbol] = model
+        return model
+
+    def get_ml_signal(self, symbol: str) -> MlSignal:
+        model = self._get_or_train_ml_model(symbol)
+        bars_needed = max(self.config.sma_bars, 25)
+        intraday_bars = self._get_intraday_bars(symbol, bars_needed)
+        closes = [float(bar.close) for bar in intraday_bars]
+        volumes = [float(getattr(bar, "volume", 0.0) or 0.0) for bar in intraday_bars]
+        latest_index = len(closes) - 1
+        if latest_index < 19:
+            raise RuntimeError(f"Not enough bars to score ML signal for {symbol}: got {len(closes)}")
+
+        features = self._build_feature_vector(closes, volumes, latest_index)
+        probability = model.predict_probability(features)
+        confidence = abs(probability - 0.5) * 2.0
+        return MlSignal(
+            probability_up=probability,
+            confidence=confidence,
+            training_rows=model.training_rows,
+            model_age_seconds=time.time() - model.trained_at_unix,
+            feature_names=model.feature_names,
+        )
+
     def decide(self, symbol: str, positions: dict[str, Position]) -> str:
         price = self.get_latest_price(symbol)
         sma = self.get_sma(symbol, bars=self.config.sma_bars)
+        ml_signal = self.get_ml_signal(symbol)
         holding = symbol in positions
+        mode = self.config.strategy_mode
 
-        if price > sma and not holding:
+        if mode == "sma":
+            if price > sma and not holding:
+                return "BUY"
+            if price < sma and holding:
+                return "SELL"
+            return "HOLD"
+
+        if mode == "ml":
+            if ml_signal.probability_up >= self.config.ml_probability_buy and not holding:
+                return "BUY"
+            if ml_signal.probability_up <= self.config.ml_probability_sell and holding:
+                return "SELL"
+            return "HOLD"
+
+        # hybrid mode: require SMA trend confirmation for buys, allow either risk signal for sells
+        if (
+            price > sma
+            and ml_signal.probability_up >= self.config.ml_probability_buy
+            and not holding
+        ):
             return "BUY"
-        if price < sma and holding:
+        if holding and (
+            price < sma or ml_signal.probability_up <= self.config.ml_probability_sell
+        ):
             return "SELL"
         return "HOLD"
 
@@ -230,16 +454,33 @@ class AlpacaTradingBot:
             try:
                 price = self.get_latest_price(symbol)
                 sma = self.get_sma(symbol, bars=self.config.sma_bars)
+                ml_signal = self.get_ml_signal(symbol)
                 holding = position is not None
                 quantity = float(position.qty) if position is not None else 0.0
                 market_value = float(position.market_value) if position is not None else 0.0
 
-                if price > sma and not holding:
-                    action = "BUY"
-                elif price < sma and holding:
-                    action = "SELL"
+                mode = self.config.strategy_mode
+                if mode == "sma":
+                    if price > sma and not holding:
+                        action = "BUY"
+                    elif price < sma and holding:
+                        action = "SELL"
+                    else:
+                        action = "HOLD"
+                elif mode == "ml":
+                    if ml_signal.probability_up >= self.config.ml_probability_buy and not holding:
+                        action = "BUY"
+                    elif ml_signal.probability_up <= self.config.ml_probability_sell and holding:
+                        action = "SELL"
+                    else:
+                        action = "HOLD"
                 else:
-                    action = "HOLD"
+                    if price > sma and ml_signal.probability_up >= self.config.ml_probability_buy and not holding:
+                        action = "BUY"
+                    elif holding and (price < sma or ml_signal.probability_up <= self.config.ml_probability_sell):
+                        action = "SELL"
+                    else:
+                        action = "HOLD"
 
                 symbols.append(
                     SymbolSnapshot(
@@ -250,6 +491,9 @@ class AlpacaTradingBot:
                         holding=holding,
                         quantity=quantity,
                         market_value=market_value,
+                        ml_probability_up=ml_signal.probability_up,
+                        ml_confidence=ml_signal.confidence,
+                        ml_training_rows=ml_signal.training_rows,
                     )
                 )
             except Exception as exc:
@@ -361,6 +605,7 @@ class AlpacaTradingBot:
         snapshot = self.build_snapshot()
         print(f"Connected. Cash: {snapshot.cash} Buying power: {snapshot.buying_power}")
         print(f"Daily PnL: {snapshot.daily_pnl:.2f}")
+        print(f"Strategy mode: {self.config.strategy_mode}")
 
         if snapshot.kill_switch_triggered:
             print("Kill switch triggered. No trades submitted.")
@@ -369,8 +614,9 @@ class AlpacaTradingBot:
 
         if not execute_orders:
             for item in snapshot.symbols:
-                suffix = f" ERROR: {item.error}" if item.error else ""
-                print(f"{item.symbol} -> {item.action}{suffix}")
+                suffix = f" ml_up={item.ml_probability_up:.3f}" if item.ml_probability_up is not None else ""
+                error_suffix = f" ERROR: {item.error}" if item.error else ""
+                print(f"{item.symbol} -> {item.action}{suffix}{error_suffix}")
             self.record_state(snapshot)
             return snapshot
 
@@ -378,14 +624,19 @@ class AlpacaTradingBot:
         open_positions = len(positions)
 
         for item in snapshot.symbols:
+            symbol = item.symbol
             try:
-                symbol = item.symbol
                 action = item.action
                 if item.error:
                     print(f"{symbol} ERROR: {item.error}")
                     continue
 
-                print(f"{symbol} -> {action}")
+                ml_text = (
+                    f" ml_up={item.ml_probability_up:.3f} conf={item.ml_confidence:.3f}"
+                    if item.ml_probability_up is not None and item.ml_confidence is not None
+                    else ""
+                )
+                print(f"{symbol} -> {action}{ml_text}")
 
                 if action == "BUY":
                     if symbol in positions:
