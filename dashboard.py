@@ -330,7 +330,7 @@ def main() -> None:
             st.info("No symbol history yet.")
         else:
             symbol_chart = symbol_history[["timestamp_utc", "price", "sma"]].copy()
-            symbol_chart = symbol_chart.dropna(how="all", subset=["price", "sma"])
+            symbol_chart = symbol_chart.dropna(how="any", subset=["price", "sma"])
             symbol_chart["timestamp_utc"] = parse_mixed_iso_timestamps(symbol_chart["timestamp_utc"])
             symbol_chart = symbol_chart.dropna(subset=["timestamp_utc"])
             symbol_chart = symbol_chart.set_index("timestamp_utc")

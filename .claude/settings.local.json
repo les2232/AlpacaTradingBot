@@ -3,7 +3,10 @@
     "allow": [
       "Bash(git add:*)",
       "Bash(git commit -m ':*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(python dataset_snapshotter.py --symbols AAPL MSFT NVDA --start 2025-10-04T00:00:00Z --end 2026-04-04T00:00:00Z --timeframe 15Min --feed iex)",
+      "Bash(python backtest_runner.py --dataset \"datasets/AAPL-MSFT-NVDA__15Min__20251004T000000Z__20260404T000000Z__iex__97a82de73db1\" --sma-bars 20)",
+      "Bash(python backtest_runner.py --dataset \"datasets/AAPL-MSFT-NVDA__15Min__20251004T000000Z__20260404T000000Z__iex__97a82de73db1\" --strategy-mode hybrid)"
     ]
   }
 }
