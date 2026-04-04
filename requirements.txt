@@ -3,3 +3,5 @@ python-dotenv
 pytz
 streamlit
 pandas
+pyarrow
+scikit-learn
