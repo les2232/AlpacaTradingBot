@@ -1,7 +1,9 @@
 from dataclasses import asdict
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 
 from trading_bot import AlpacaTradingBot, load_config
 
@@ -103,11 +105,22 @@ st.markdown(
 
 @st.cache_resource
 def get_bot() -> AlpacaTradingBot:
+    load_dotenv(Path.cwd() / ".env")
     return AlpacaTradingBot(load_config())
 
 
 def format_money(value: float) -> str:
     return f"${value:,.2f}"
+
+
+def parse_mixed_iso_timestamps(values: pd.Series) -> pd.Series:
+    try:
+        parsed = pd.to_datetime(values, utc=True, errors="coerce", format="mixed")
+    except (TypeError, ValueError):
+        parsed = pd.to_datetime(values, utc=True, errors="coerce")
+    if parsed.isna().all():
+        parsed = pd.to_datetime(values, utc=True, errors="coerce")
+    return parsed
 
 
 def render_metric_card(label: str, value: str, delta: str | None = None) -> None:
@@ -135,11 +148,54 @@ def render_section_title(title: str) -> None:
     )
 
 
+def render_startup_error(exc: Exception) -> None:
+    st.markdown(
+        """
+        <div class="hero">
+            <div class="eyebrow">Startup Error</div>
+            <h1>Dashboard Unavailable</h1>
+            <p>The dashboard loaded, but the trading bot could not be initialized.</p>
+            <div class="status-pill danger">Initialization Failed</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.error(f"{type(exc).__name__}: {exc}")
+    st.markdown(
+        """
+        **Common causes**
+
+        - Missing or invalid `ALPACA_API_KEY` / `ALPACA_API_SECRET`
+        - Missing Python packages after recent code changes
+        - Alpaca API or network connectivity issues during startup
+        """
+    )
+    st.markdown(
+        """
+        **Next checks**
+
+        - Run `python -m pip install -r requirements.txt`
+        - Confirm `.env` contains valid Alpaca credentials
+        - Re-run `python -m streamlit run dashboard.py` from the project root
+        """
+    )
+    with st.expander("Traceback"):
+        st.exception(exc)
+
+
 def main() -> None:
-    bot = get_bot()
+    try:
+        bot = get_bot()
+    except Exception as exc:
+        render_startup_error(exc)
+        return
 
     if "snapshot" not in st.session_state:
-        st.session_state.snapshot, st.session_state.recent_orders = bot.capture_state()
+        try:
+            st.session_state.snapshot, st.session_state.recent_orders = bot.capture_state()
+        except Exception as exc:
+            render_startup_error(exc)
+            return
 
     kill_switch_class = "status-pill danger" if st.session_state.snapshot.kill_switch_triggered else "status-pill"
     kill_switch_text = "Kill Switch Active" if st.session_state.snapshot.kill_switch_triggered else "Kill Switch Clear"
@@ -168,17 +224,29 @@ def main() -> None:
         run_cycle = button_cols[1].button("Run bot cycle", use_container_width=True)
 
     if refresh:
-        st.session_state.snapshot, st.session_state.recent_orders = bot.capture_state()
+        try:
+            st.session_state.snapshot, st.session_state.recent_orders = bot.capture_state()
+        except Exception as exc:
+            render_startup_error(exc)
+            return
 
     if run_cycle:
-        st.session_state.snapshot = bot.run_once(execute_orders=execute_orders)
-        st.session_state.recent_orders = bot.get_recent_orders(limit=12)
+        try:
+            st.session_state.snapshot = bot.run_once(execute_orders=execute_orders)
+            st.session_state.recent_orders = bot.get_recent_orders(limit=12)
+        except Exception as exc:
+            render_startup_error(exc)
+            return
 
     snapshot = st.session_state.snapshot
-    recent_orders = st.session_state.get("recent_orders", bot.get_recent_orders(limit=12))
-    run_history = pd.DataFrame(bot.storage.get_run_history(limit=120))
-    selected_symbol = st.selectbox("History symbol", bot.config.symbols, index=0)
-    symbol_history = pd.DataFrame(bot.storage.get_symbol_history(selected_symbol, limit=120))
+    try:
+        recent_orders = st.session_state.get("recent_orders", bot.get_recent_orders(limit=12))
+        run_history = pd.DataFrame(bot.storage.get_run_history(limit=120))
+        selected_symbol = st.selectbox("History symbol", bot.config.symbols, index=0)
+        symbol_history = pd.DataFrame(bot.storage.get_symbol_history(selected_symbol, limit=120))
+    except Exception as exc:
+        render_startup_error(exc)
+        return
 
     metric_cols = st.columns(5)
     with metric_cols[0]:
@@ -203,6 +271,9 @@ def main() -> None:
                 "ml_probability_up",
                 "ml_confidence",
                 "ml_training_rows",
+                "ml_buy_threshold",
+                "ml_sell_threshold",
+                "ml_model_name",
                 "action",
                 "holding",
                 "quantity",
@@ -217,6 +288,9 @@ def main() -> None:
                 "ml_probability_up": "ml_up_prob",
                 "ml_confidence": "ml_conf",
                 "ml_training_rows": "ml_rows",
+                "ml_buy_threshold": "ml_buy_thr",
+                "ml_sell_threshold": "ml_sell_thr",
+                "ml_model_name": "ml_model",
             }
         )
 
@@ -246,7 +320,8 @@ def main() -> None:
             st.info("No saved run history yet.")
         else:
             account_chart = run_history[["timestamp_utc", "equity", "cash", "daily_pnl"]].copy()
-            account_chart["timestamp_utc"] = pd.to_datetime(account_chart["timestamp_utc"])
+            account_chart["timestamp_utc"] = parse_mixed_iso_timestamps(account_chart["timestamp_utc"])
+            account_chart = account_chart.dropna(subset=["timestamp_utc"])
             account_chart = account_chart.set_index("timestamp_utc")
             st.line_chart(account_chart)
     with history_right:
@@ -256,12 +331,21 @@ def main() -> None:
         else:
             symbol_chart = symbol_history[["timestamp_utc", "price", "sma"]].copy()
             symbol_chart = symbol_chart.dropna(how="all", subset=["price", "sma"])
-            symbol_chart["timestamp_utc"] = pd.to_datetime(symbol_chart["timestamp_utc"])
+            symbol_chart["timestamp_utc"] = parse_mixed_iso_timestamps(symbol_chart["timestamp_utc"])
+            symbol_chart = symbol_chart.dropna(subset=["timestamp_utc"])
             symbol_chart = symbol_chart.set_index("timestamp_utc")
             if symbol_chart.empty:
                 st.info("No price/SMA points saved yet for this symbol.")
             else:
                 st.line_chart(symbol_chart)
+            if "ml_probability_up" in symbol_history.columns:
+                ml_chart = symbol_history[["timestamp_utc", "ml_probability_up", "ml_confidence"]].copy()
+                ml_chart = ml_chart.dropna(how="all", subset=["ml_probability_up", "ml_confidence"])
+                if not ml_chart.empty:
+                    ml_chart["timestamp_utc"] = parse_mixed_iso_timestamps(ml_chart["timestamp_utc"])
+                    ml_chart = ml_chart.dropna(subset=["timestamp_utc"])
+                    ml_chart = ml_chart.set_index("timestamp_utc")
+                    st.line_chart(ml_chart)
             action_counts = symbol_history["action"].value_counts().rename_axis("action").reset_index(name="count")
             st.dataframe(action_counts, use_container_width=True, hide_index=True)
 
@@ -286,19 +370,31 @@ def main() -> None:
     with risk_col:
         render_section_title("Risk Guardrails")
         st.write(f"Max per trade: {format_money(bot.config.max_usd_per_trade)}")
+        st.write(f"Max per symbol: {format_money(bot.config.max_symbol_exposure_usd)}")
         st.write(f"Max open positions: {bot.config.max_open_positions}")
         st.write(f"Max daily loss: {format_money(bot.config.max_daily_loss_usd)}")
+        st.write(f"Max orders per minute: {bot.config.max_orders_per_minute}")
+        st.write(f"Price collar: {bot.config.max_price_deviation_bps:.0f} bps")
+        st.write(f"Max live price age: {bot.config.max_live_price_age_seconds}s")
+        st.write(f"Max completed-bar delay: {bot.config.max_data_delay_seconds}s")
         st.write(
             f"SMA window: {bot.config.sma_bars} x {bot.config.bar_timeframe_minutes}-minute bars"
         )
     with notes_col:
         render_section_title("Session Notes")
+        learned_thresholds = [
+            f"{item.symbol}: buy >= {item.ml_buy_threshold:.2f}, sell <= {item.ml_sell_threshold:.2f}"
+            for item in snapshot.symbols
+            if item.ml_buy_threshold is not None and item.ml_sell_threshold is not None
+        ]
+        model_names = sorted({item.ml_model_name for item in snapshot.symbols if item.ml_model_name})
         st.write(f"Snapshot time: `{snapshot.timestamp_utc}`")
         st.write(f"Paper mode: `{bot.config.paper}`")
         st.write(f"Strategy mode: `{bot.config.strategy_mode}`")
-        st.write(
-            f"ML thresholds: buy >= {bot.config.ml_probability_buy:.2f}, sell <= {bot.config.ml_probability_sell:.2f}"
-        )
+        if model_names:
+            st.write(f"ML model(s): `{', '.join(model_names)}`")
+        if learned_thresholds:
+            st.write(f"Validation thresholds: `{'; '.join(learned_thresholds)}`")
         st.write(f"Price feed: `{bot.get_price_feed_status()}`")
         st.write(f"Watched symbols: `{', '.join(bot.config.symbols)}`")
         st.write(f"Recent order count shown: `{len(recent_orders)}`")
