@@ -918,6 +918,13 @@ class AlpacaTradingBot:
         print(f"Submitted SELL {symbol} qty={qty}")
         return order
 
+    def _seconds_until_next_bar(self) -> float:
+        now = datetime.now(timezone.utc)
+        bar_seconds = int(self._bar_interval().total_seconds())
+        last_bar_unix = int(now.timestamp()) // bar_seconds * bar_seconds
+        next_bar_unix = last_bar_unix + bar_seconds
+        return max(0.0, next_bar_unix - now.timestamp())
+
     def _et_now(self) -> datetime:
         return datetime.now(_ET)
 
@@ -1112,6 +1119,15 @@ def main() -> None:
 
     flatten_thread = threading.Thread(target=_eod_flatten_worker, name="eod-flatten", daemon=True)
     flatten_thread.start()
+
+    wait_seconds = bot._seconds_until_next_bar()
+    if wait_seconds > 1:
+        next_bar_utc = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+        print(f"Aligning to next bar boundary: waiting {wait_seconds:.0f}s until {next_bar_utc.strftime('%H:%M:%S')} UTC")
+        shutdown_event.wait(timeout=wait_seconds)
+        if shutdown_event.is_set():
+            print("Bot loop exited.")
+            return
 
     while not shutdown_event.is_set():
         if bot._is_past_flatten_deadline():
