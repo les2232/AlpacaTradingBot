@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 bot_history.db
 .env
+datasets/
+*.out.log
+*.err.log
+*.code-workspace

@@ -2,6 +2,8 @@
 
 Simple Alpaca paper-trading bot with a basic intraday SMA strategy.
 
+Default operating rules are frozen in [TRADING_SPEC.md](TRADING_SPEC.md).
+
 ## Setup
 
 Install dependencies in PowerShell:
@@ -58,3 +60,18 @@ py -m streamlit run dashboard.py
 Streamlit should print a local URL, usually `http://localhost:8501`.
 
 The bot now records local history to `bot_history.db` by default. Override that with `BOT_DB_PATH` if you want the SQLite file somewhere else.
+
+## Offline Dataset Snapshots
+
+Build a versioned Parquet snapshot of historical bars:
+
+```bash
+python dataset_snapshotter.py --symbols AAPL MSFT NVDA --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z --timeframe 15Min --feed iex
+```
+
+This writes a dataset under `datasets/` with:
+
+- `bars.parquet`
+- `manifest.json`
+
+The dataset version includes the date range, feed, and a code hash so offline training data can be tied back to the exact snapshotting logic.
