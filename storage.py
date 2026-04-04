@@ -34,6 +34,9 @@ class BotStorage:
                     symbol TEXT NOT NULL,
                     price REAL,
                     sma REAL,
+                    ml_probability_up REAL,
+                    ml_confidence REAL,
+                    ml_training_rows INTEGER,
                     action TEXT NOT NULL,
                     holding INTEGER NOT NULL,
                     quantity REAL NOT NULL,
@@ -56,6 +59,18 @@ class BotStorage:
                 );
                 """
             )
+            symbol_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(symbol_runs)").fetchall()
+            }
+            column_migrations = {
+                "ml_probability_up": "ALTER TABLE symbol_runs ADD COLUMN ml_probability_up REAL",
+                "ml_confidence": "ALTER TABLE symbol_runs ADD COLUMN ml_confidence REAL",
+                "ml_training_rows": "ALTER TABLE symbol_runs ADD COLUMN ml_training_rows INTEGER",
+            }
+            for column_name, statement in column_migrations.items():
+                if column_name not in symbol_columns:
+                    connection.execute(statement)
 
     def save_snapshot(self, snapshot: Any, orders: list[Any]) -> int:
         with self._connect() as connection:
@@ -80,8 +95,8 @@ class BotStorage:
             connection.executemany(
                 """
                 INSERT INTO symbol_runs (
-                    run_id, symbol, price, sma, action, holding, quantity, market_value, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    run_id, symbol, price, sma, ml_probability_up, ml_confidence, ml_training_rows, action, holding, quantity, market_value, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -89,6 +104,9 @@ class BotStorage:
                         item.symbol,
                         item.price,
                         item.sma,
+                        item.ml_probability_up,
+                        item.ml_confidence,
+                        item.ml_training_rows,
                         item.action,
                         int(item.holding),
                         item.quantity,
@@ -152,7 +170,19 @@ class BotStorage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT b.timestamp_utc, s.symbol, s.price, s.sma, s.action, s.holding, s.quantity, s.market_value, s.error
+                SELECT
+                    b.timestamp_utc,
+                    s.symbol,
+                    s.price,
+                    s.sma,
+                    s.ml_probability_up,
+                    s.ml_confidence,
+                    s.ml_training_rows,
+                    s.action,
+                    s.holding,
+                    s.quantity,
+                    s.market_value,
+                    s.error
                 FROM symbol_runs s
                 JOIN bot_runs b ON b.id = s.run_id
                 WHERE s.symbol = ?
