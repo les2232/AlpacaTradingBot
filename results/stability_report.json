@@ -1,0 +1,138 @@
+{
+  "saved_at": "2026-04-06T01:19:20Z",
+  "validation_windows": [
+    30,
+    60,
+    90
+  ],
+  "per_window": [
+    {
+      "lookback_days": 30,
+      "dataset": "datasets\\AAPL-GOOGL-JPM-KO-META-MSFT__15Min__20251004T000000Z__20260404T000000Z__sip__7bdcdff15c5f",
+      "config": {
+        "strategy_mode": "sma",
+        "sma_bars": 20,
+        "entry_threshold_pct": 0.0025,
+        "threshold_mode": "static_pct",
+        "time_window_mode": "morning_only",
+        "regime_filter_enabled": false,
+        "orb_filter_mode": "none",
+        "breakout_exit_style": "target_1x_stop_low",
+        "mean_reversion_exit_style": "sma"
+      },
+      "performance": {
+        "total_return_pct": 4.606178,
+        "profit_factor": 1.253684,
+        "max_drawdown_pct": 3.967358,
+        "sharpe_ratio": 1.274551,
+        "win_rate": 38.793103,
+        "trades_per_day": 1.870968,
+        "realized_pnl": 92.123568,
+        "combined_score": 1.0
+      }
+    },
+    {
+      "lookback_days": 60,
+      "dataset": "datasets\\AAPL-GOOGL-JPM-KO-META-MSFT__15Min__20251004T000000Z__20260404T000000Z__sip__7bdcdff15c5f",
+      "config": {
+        "strategy_mode": "sma",
+        "sma_bars": 20,
+        "entry_threshold_pct": 0.0025,
+        "threshold_mode": "static_pct",
+        "time_window_mode": "morning_only",
+        "regime_filter_enabled": false,
+        "orb_filter_mode": "none",
+        "breakout_exit_style": "target_1x_stop_low",
+        "mean_reversion_exit_style": "sma"
+      },
+      "performance": {
+        "total_return_pct": 4.606178,
+        "profit_factor": 1.253684,
+        "max_drawdown_pct": 3.967358,
+        "sharpe_ratio": 1.274551,
+        "win_rate": 38.793103,
+        "trades_per_day": 1.870968,
+        "realized_pnl": 92.123568,
+        "combined_score": 1.0
+      }
+    },
+    {
+      "lookback_days": 90,
+      "dataset": "datasets\\AAPL-GOOGL-JPM-KO-META-MSFT__15Min__20251004T000000Z__20260404T000000Z__sip__7bdcdff15c5f",
+      "config": {
+        "strategy_mode": "sma",
+        "sma_bars": 20,
+        "entry_threshold_pct": 0.0025,
+        "threshold_mode": "static_pct",
+        "time_window_mode": "morning_only",
+        "regime_filter_enabled": false,
+        "orb_filter_mode": "none",
+        "breakout_exit_style": "target_1x_stop_low",
+        "mean_reversion_exit_style": "sma"
+      },
+      "performance": {
+        "total_return_pct": 4.606178,
+        "profit_factor": 1.253684,
+        "max_drawdown_pct": 3.967358,
+        "sharpe_ratio": 1.274551,
+        "win_rate": 38.793103,
+        "trades_per_day": 1.870968,
+        "realized_pnl": 92.123568,
+        "combined_score": 1.0
+      }
+    }
+  ],
+  "average_performance": {
+    "total_return_pct": 4.606178,
+    "profit_factor": 1.253684,
+    "max_drawdown_pct": 3.967358,
+    "sharpe_ratio": 1.274551,
+    "win_rate": 38.793103,
+    "trades_per_day": 1.870968,
+    "realized_pnl": 92.123568
+  },
+  "stability": {
+    "stable": true,
+    "reasons": [],
+    "params_consistent": true,
+    "inconsistent_params": {}
+  },
+  "market_regime": {
+    "regime": "sideways",
+    "disabled_by_regime": false,
+    "avg_volatility": 0.001171,
+    "avg_sma_slope_pct": -0.005717,
+    "per_symbol": {
+      "AAPL": {
+        "regime": "sideways",
+        "current_volatility": 0.001341,
+        "sma_slope_pct": -0.002025
+      },
+      "GOOGL": {
+        "regime": "sideways",
+        "current_volatility": 0.00116,
+        "sma_slope_pct": -0.004641
+      },
+      "JPM": {
+        "regime": "sideways",
+        "current_volatility": 0.001051,
+        "sma_slope_pct": -0.009365
+      },
+      "KO": {
+        "regime": "sideways",
+        "current_volatility": 0.000794,
+        "sma_slope_pct": 0.006131
+      },
+      "META": {
+        "regime": "sideways",
+        "current_volatility": 0.001171,
+        "sma_slope_pct": -0.017598
+      },
+      "MSFT": {
+        "regime": "sideways",
+        "current_volatility": 0.001509,
+        "sma_slope_pct": -0.006803
+      }
+    }
+  }
+}

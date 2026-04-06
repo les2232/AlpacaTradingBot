@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
         default=str(DATASET_ROOT),
         help="Root directory for versioned dataset snapshots.",
     )
+    parser.add_argument(
+        "--align-mode",
+        default="shared",
+        choices=["shared", "none"],
+        help="Alignment mode: shared keeps only timestamps present for every symbol; none keeps all rows.",
+    )
     return parser.parse_args()
 
 
@@ -199,6 +205,50 @@ def fetch_bars(
     return dataset
 
 
+def align_symbols_on_shared_timestamps(dataset: pd.DataFrame, symbols: list[str]) -> pd.DataFrame:
+    if dataset.empty:
+        return dataset
+
+    timestamp_counts = (
+        dataset.dropna(subset=["timestamp"])
+        .groupby("timestamp")["symbol"]
+        .nunique()
+    )
+    shared_timestamps = timestamp_counts[timestamp_counts == len(symbols)].index
+    aligned = dataset[dataset["timestamp"].isin(shared_timestamps)].copy()
+    return aligned.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+
+def compute_symbol_row_counts(dataset: pd.DataFrame, symbols: list[str]) -> dict[str, int]:
+    if dataset.empty:
+        return {symbol: 0 for symbol in symbols}
+
+    counts = dataset.groupby("symbol").size().to_dict()
+    return {symbol: int(counts.get(symbol, 0)) for symbol in symbols}
+
+
+def build_symbol_retention_report(
+    symbols: list[str],
+    before_counts: dict[str, int],
+    after_counts: dict[str, int],
+) -> list[dict[str, Any]]:
+    report: list[dict[str, Any]] = []
+    for symbol in symbols:
+        before = int(before_counts.get(symbol, 0))
+        after = int(after_counts.get(symbol, 0))
+        percent_retained = (after / before * 100.0) if before > 0 else 0.0
+        report.append(
+            {
+                "symbol": symbol,
+                "rows_before_alignment": before,
+                "rows_after_alignment": after,
+                "percent_retained": percent_retained,
+            }
+        )
+    report.sort(key=lambda row: (row["percent_retained"], row["rows_after_alignment"], row["symbol"]))
+    return report
+
+
 def write_dataset(
     dataset: pd.DataFrame,
     manifest: dict[str, Any],
@@ -244,7 +294,36 @@ def main() -> None:
     dataset_id = build_dataset_id(symbols, args.timeframe, start, end, args.feed.lower(), code_hash)
 
     client = StockHistoricalDataClient(api_key, api_secret)
-    dataset = fetch_bars(client, symbols, timeframe, start, end, feed, adjustment)
+    print(f"requested_feed={args.feed.lower()}")
+    try:
+        dataset = fetch_bars(client, symbols, timeframe, start, end, feed, adjustment)
+    except Exception as exc:
+        if args.feed.lower() == "sip":
+            raise RuntimeError(
+                "SIP data request failed. This usually means the account does not have SIP market-data "
+                "permissions or subscription access enabled. Try `--feed iex` or enable SIP access in Alpaca."
+            ) from exc
+        raise
+    raw_row_count = int(len(dataset))
+    raw_symbol_row_counts = compute_symbol_row_counts(dataset, symbols)
+    if args.align_mode == "shared":
+        dataset = align_symbols_on_shared_timestamps(dataset, symbols)
+    elif args.align_mode != "none":
+        raise RuntimeError(f"Unsupported align mode: {args.align_mode}")
+
+    aligned_row_count = int(len(dataset))
+    aligned_timestamp_count = int(dataset["timestamp"].nunique()) if not dataset.empty else 0
+    percent_rows_retained = (
+        (aligned_row_count / raw_row_count) * 100.0
+        if raw_row_count > 0
+        else 0.0
+    )
+    aligned_symbol_row_counts = compute_symbol_row_counts(dataset, symbols)
+    symbol_retention_report = build_symbol_retention_report(
+        symbols,
+        raw_symbol_row_counts,
+        aligned_symbol_row_counts,
+    )
 
     manifest = {
         "dataset_id": dataset_id,
@@ -254,10 +333,23 @@ def main() -> None:
         "start_utc": start.isoformat(),
         "end_utc": end.isoformat(),
         "feed": args.feed.lower(),
+        "feed_warning": (
+            "IEX is single-exchange data and can distort volume-sensitive intraday research."
+            if args.feed.lower() == "iex"
+            else None
+        ),
         "adjustment": args.adjustment.lower(),
+        "align_mode": args.align_mode,
         "code_hash": code_hash,
-        "row_count": int(len(dataset)),
+        "row_count": aligned_row_count,
+        "raw_row_count": raw_row_count,
+        "aligned_row_count": aligned_row_count,
         "symbol_count": int(len(symbols)),
+        "aligned_timestamp_count": aligned_timestamp_count,
+        "percent_rows_retained": percent_rows_retained,
+        "per_symbol_row_counts_before_alignment": raw_symbol_row_counts,
+        "per_symbol_row_counts_after_alignment": aligned_symbol_row_counts,
+        "symbol_retention_report": symbol_retention_report,
         "columns": list(dataset.columns),
         "source": "alpaca_stock_bars",
         "code_hash_files": list(CODE_HASH_FILES),
@@ -265,7 +357,28 @@ def main() -> None:
 
     parquet_path, manifest_path = write_dataset(dataset, manifest, output_root, dataset_id)
     print(f"dataset_id={dataset_id}")
-    print(f"rows={len(dataset)}")
+    print(f"raw_rows={raw_row_count}")
+    print(f"aligned_rows={aligned_row_count}")
+    print(f"percent_retained={percent_rows_retained:.2f}%")
+    print(f"aligned_timestamps={aligned_timestamp_count}")
+    print("symbol_retention_report:")
+    print(f"{'symbol':<8}  {'before':>8}  {'after':>8}  {'retained':>9}")
+    for row in symbol_retention_report:
+        print(
+            f"{row['symbol']:<8}  "
+            f"{row['rows_before_alignment']:>8}  "
+            f"{row['rows_after_alignment']:>8}  "
+            f"{row['percent_retained']:>8.2f}%"
+        )
+    if percent_rows_retained < 90.0:
+        print("warning=alignment retained less than 90% of rows")
+        if args.align_mode == "shared":
+            print("worst_symbols_for_shared_alignment:")
+            for row in symbol_retention_report[:3]:
+                print(
+                    f"{row['symbol']}: before={row['rows_before_alignment']}, "
+                    f"after={row['rows_after_alignment']}, retained={row['percent_retained']:.2f}%"
+                )
     print(f"parquet={parquet_path}")
     print(f"manifest={manifest_path}")
 

@@ -1,3 +1,4 @@
+import logging
 import os
 import math
 import threading
@@ -17,11 +18,48 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.models import Position
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+import pandas as pd
 import pytz
 from dotenv import load_dotenv
 
+try:
+    from ml.predict import to_ml_signal as offline_to_ml_signal
+except Exception as exc:
+    offline_to_ml_signal = None
+    _ML_PREDICT_IMPORT_ERROR: Exception | None = exc
+else:
+    _ML_PREDICT_IMPORT_ERROR = None
+
 from storage import BotStorage
-from strategy import Strategy, StrategyConfig, MlSignal
+from strategy import (
+    ORB_FILTER_CHOICES,
+    ORB_FILTER_NONE,
+    STRATEGY_MODE_BREAKOUT,
+    STRATEGY_MODE_CHOICES,
+    STRATEGY_MODE_HYBRID,
+    STRATEGY_MODE_ML,
+    Strategy,
+    StrategyConfig,
+    MlSignal,
+    THRESHOLD_MODE_CHOICES,
+    THRESHOLD_MODE_STATIC_PCT,
+    calculate_opening_range_series,
+    calculate_atr_pct_values,
+    calculate_atr_percentile_series,
+    REGIME_SMA_PERIOD,
+    REGIME_TIMEFRAME_MINUTES,
+    estimate_atr_percentile_lookback_bars,
+    estimate_regime_lookback_bars,
+    is_entry_window_open,
+    normalize_orb_filter_mode,
+    normalize_strategy_mode,
+    normalize_threshold_mode,
+    normalize_time_window_mode,
+    TIME_WINDOW_CHOICES,
+    TIME_WINDOW_FULL_DAY,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -35,9 +73,17 @@ class BotConfig:
     bar_timeframe_minutes: int
     paper: bool = True
     strategy_mode: str = "hybrid"
+    symbol_strategy_modes: dict[str, str] | None = None
     ml_lookback_bars: int = 320
     ml_probability_buy: float = 0.55
     ml_probability_sell: float = 0.45
+    entry_threshold_pct: float = 0.001
+    threshold_mode: str = THRESHOLD_MODE_STATIC_PCT
+    atr_multiple: float = 1.0
+    atr_percentile_threshold: float = 0.0
+    time_window_mode: str = TIME_WINDOW_FULL_DAY
+    regime_filter_enabled: bool = False
+    orb_filter_mode: str = ORB_FILTER_NONE
     ml_train_every_seconds: int = 900
     ml_model_type: str = "logistic"
     ml_validation_fraction: float = 0.2
@@ -161,6 +207,28 @@ def _safe_float(value: str | None, default: float) -> float:
         return default
 
 
+def _parse_symbol_strategy_map(raw_value: str | None) -> dict[str, str]:
+    if not raw_value:
+        return {}
+    parsed: dict[str, str] = {}
+    for item in raw_value.split(","):
+        if not item.strip():
+            continue
+        symbol, sep, mode = item.partition(":")
+        if not sep:
+            raise RuntimeError(
+                "SYMBOL_STRATEGY_MAP must use SYMBOL:MODE pairs, e.g. AAPL:sma,MSFT:breakout"
+            )
+        normalized_mode = normalize_strategy_mode(mode)
+        if normalized_mode not in STRATEGY_MODE_CHOICES:
+            raise RuntimeError(
+                f"Unsupported strategy mode {mode!r} in SYMBOL_STRATEGY_MAP. "
+                f"Choose from {', '.join(STRATEGY_MODE_CHOICES)}."
+            )
+        parsed[symbol.strip().upper()] = normalized_mode
+    return parsed
+
+
 def load_config() -> BotConfig:
     symbols_raw = os.getenv("BOT_SYMBOLS", "AAPL,MSFT,NVDA")
     symbols = [symbol.strip().upper() for symbol in symbols_raw.split(",") if symbol.strip()]
@@ -181,10 +249,25 @@ def load_config() -> BotConfig:
         sma_bars=int(sma_bars_raw),
         bar_timeframe_minutes=bar_timeframe_minutes,
         paper=os.getenv("ALPACA_PAPER", "true").lower() != "false",
-        strategy_mode=os.getenv("STRATEGY_MODE", "hybrid").strip().lower(),
+        strategy_mode=normalize_strategy_mode(os.getenv("STRATEGY_MODE", "hybrid")),
+        symbol_strategy_modes=_parse_symbol_strategy_map(os.getenv("SYMBOL_STRATEGY_MAP")),
         ml_lookback_bars=int(os.getenv("ML_LOOKBACK_BARS", "320")),
         ml_probability_buy=_safe_float(os.getenv("ML_PROBABILITY_BUY"), 0.55),
         ml_probability_sell=_safe_float(os.getenv("ML_PROBABILITY_SELL"), 0.45),
+        entry_threshold_pct=_safe_float(os.getenv("ENTRY_THRESHOLD_PCT"), 0.001),
+        threshold_mode=normalize_threshold_mode(
+            os.getenv("THRESHOLD_MODE", THRESHOLD_MODE_STATIC_PCT)
+        ),
+        atr_multiple=_safe_float(
+            os.getenv("ATR_MULTIPLE", os.getenv("ATR_THRESHOLD_MULTIPLIER")),
+            1.0,
+        ),
+        atr_percentile_threshold=_safe_float(os.getenv("ATR_PERCENTILE_THRESHOLD"), 0.0),
+        time_window_mode=normalize_time_window_mode(
+            os.getenv("TIME_WINDOW_MODE", TIME_WINDOW_FULL_DAY)
+        ),
+        regime_filter_enabled=os.getenv("REGIME_FILTER_ENABLED", "false").lower() == "true",
+        orb_filter_mode=normalize_orb_filter_mode(os.getenv("ORB_FILTER_MODE", ORB_FILTER_NONE)),
         ml_train_every_seconds=int(os.getenv("ML_TRAIN_EVERY_SECONDS", "900")),
         ml_model_type=os.getenv("ML_MODEL_TYPE", "logistic").strip().lower(),
         ml_validation_fraction=_safe_float(os.getenv("ML_VALIDATION_FRACTION"), 0.2),
@@ -222,11 +305,82 @@ class AlpacaTradingBot:
         self.data_stream: StockDataStream | None = None
         self._stream_thread: threading.Thread | None = None
         self._model_cache: dict[str, TrainedSignalModel] = {}
+        self._ml_disabled_reason: str | None = None
+        self._bars_cache: dict[tuple[str, int, int, str], list[Any]] = {}
+        self._hourly_regime_cache: dict[tuple[str, str], bool | None] = {}
         self.strategy = Strategy(
             StrategyConfig(
                 strategy_mode=config.strategy_mode,
                 ml_probability_buy=config.ml_probability_buy,
                 ml_probability_sell=config.ml_probability_sell,
+                entry_threshold_pct=config.entry_threshold_pct,
+                threshold_mode=config.threshold_mode,
+                atr_multiple=config.atr_multiple,
+                atr_percentile_threshold=config.atr_percentile_threshold,
+                time_window_mode=config.time_window_mode,
+                regime_filter_enabled=config.regime_filter_enabled,
+                orb_filter_mode=config.orb_filter_mode,
+            )
+        )
+        self._symbol_strategy_modes = config.symbol_strategy_modes or {}
+        invalid_symbol_modes = [
+            mode for mode in self._symbol_strategy_modes.values()
+            if mode not in STRATEGY_MODE_CHOICES
+        ]
+        if invalid_symbol_modes:
+            raise RuntimeError(
+                f"Unsupported symbol strategy mode(s): {', '.join(sorted(set(invalid_symbol_modes)))}. "
+                f"Choose from {', '.join(STRATEGY_MODE_CHOICES)}."
+            )
+        if config.strategy_mode not in STRATEGY_MODE_CHOICES:
+            raise RuntimeError(
+                f"Unsupported STRATEGY_MODE={config.strategy_mode}. "
+                f"Choose from {', '.join(STRATEGY_MODE_CHOICES)}."
+            )
+        if config.threshold_mode not in THRESHOLD_MODE_CHOICES:
+            raise RuntimeError(
+                f"Unsupported THRESHOLD_MODE={config.threshold_mode}. "
+                f"Choose from {', '.join(THRESHOLD_MODE_CHOICES)}."
+            )
+        if config.time_window_mode not in TIME_WINDOW_CHOICES:
+            raise RuntimeError(
+                f"Unsupported TIME_WINDOW_MODE={config.time_window_mode}. "
+                f"Choose from {', '.join(TIME_WINDOW_CHOICES)}."
+            )
+        if config.orb_filter_mode not in ORB_FILTER_CHOICES:
+            raise RuntimeError(
+                f"Unsupported ORB_FILTER_MODE={config.orb_filter_mode}. "
+                f"Choose from {', '.join(ORB_FILTER_CHOICES)}."
+            )
+        if offline_to_ml_signal is None and any(
+            mode in {STRATEGY_MODE_ML, STRATEGY_MODE_HYBRID}
+            for mode in {config.strategy_mode, *self._symbol_strategy_modes.values()}
+        ):
+            self._disable_ml_trading("ml.predict import failed", _ML_PREDICT_IMPORT_ERROR)
+
+    def _disable_ml_trading(self, reason: str, exc: Exception | None = None) -> None:
+        if self._ml_disabled_reason is not None:
+            return
+        self._ml_disabled_reason = reason
+        if exc is not None:
+            logger.error("ML trading disabled: %s (%s)", reason, exc)
+        else:
+            logger.error("ML trading disabled: %s", reason)
+
+    def _strategy_for_symbol(self, symbol: str) -> Strategy:
+        strategy_mode = self._symbol_strategy_modes.get(symbol, self.config.strategy_mode)
+        return Strategy(
+            StrategyConfig(
+                strategy_mode=strategy_mode,
+                ml_probability_buy=self.config.ml_probability_buy,
+                ml_probability_sell=self.config.ml_probability_sell,
+                entry_threshold_pct=self.config.entry_threshold_pct,
+                threshold_mode=self.config.threshold_mode,
+                atr_multiple=self.config.atr_multiple,
+                atr_percentile_threshold=self.config.atr_percentile_threshold,
+                time_window_mode=self.config.time_window_mode,
+                regime_filter_enabled=self.config.regime_filter_enabled,
+                orb_filter_mode=self.config.orb_filter_mode,
             )
         )
 
@@ -343,21 +497,26 @@ class AlpacaTradingBot:
             return raw_timestamp.replace(tzinfo=timezone.utc)
         return raw_timestamp.astimezone(timezone.utc)
 
-    def _get_intraday_bars(
+    def _get_bars(
         self,
         symbol: str,
         bars_needed: int,
+        timeframe_minutes: int,
         decision_timestamp: datetime | None = None,
     ) -> list[Any]:
         if bars_needed <= 0:
             raise RuntimeError("bars_needed must be greater than zero.")
 
         aligned_decision_timestamp = decision_timestamp or self.get_decision_timestamp()
+        cache_key = (symbol, timeframe_minutes, bars_needed, aligned_decision_timestamp.isoformat())
+        cached_bars = self._bars_cache.get(cache_key)
+        if cached_bars is not None:
+            return cached_bars
+
         trading_minutes_per_day = 390
-        timeframe_minutes = self.config.bar_timeframe_minutes
         trading_days_needed = max(3, math.ceil((bars_needed * timeframe_minutes) / trading_minutes_per_day))
         start = aligned_decision_timestamp - timedelta(days=trading_days_needed * 6)
-        request_end = aligned_decision_timestamp + self._bar_interval()
+        request_end = aligned_decision_timestamp + timedelta(minutes=timeframe_minutes)
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame(timeframe_minutes, TimeFrameUnit.Minute),
@@ -372,9 +531,46 @@ class AlpacaTradingBot:
         completed_bars = [
             bar
             for bar in bars
-            if (self._get_bar_start_time(bar) + self._bar_interval()) <= aligned_decision_timestamp
+            if (self._get_bar_start_time(bar) + timedelta(minutes=timeframe_minutes)) <= aligned_decision_timestamp
         ]
-        return completed_bars[-bars_needed:]
+        result = completed_bars[-bars_needed:]
+        self._bars_cache[cache_key] = result
+        return result
+
+    def _get_intraday_bars(
+        self,
+        symbol: str,
+        bars_needed: int,
+        decision_timestamp: datetime | None = None,
+    ) -> list[Any]:
+        return self._get_bars(
+            symbol,
+            bars_needed,
+            self.config.bar_timeframe_minutes,
+            decision_timestamp=decision_timestamp,
+        )
+
+    def _get_hourly_regime(self, symbol: str, decision_timestamp: datetime) -> bool | None:
+        cache_key = (symbol, decision_timestamp.isoformat())
+        cached = self._hourly_regime_cache.get(cache_key)
+        if cached is not None or cache_key in self._hourly_regime_cache:
+            return cached
+
+        hourly_bars = self._get_bars(
+            symbol,
+            REGIME_SMA_PERIOD + 1,
+            REGIME_TIMEFRAME_MINUTES,
+            decision_timestamp=decision_timestamp,
+        )
+        if len(hourly_bars) < REGIME_SMA_PERIOD:
+            self._hourly_regime_cache[cache_key] = None
+            return None
+
+        hourly_closes = [float(bar.close) for bar in hourly_bars]
+        sma_50 = sum(hourly_closes[-REGIME_SMA_PERIOD:]) / REGIME_SMA_PERIOD
+        bullish = hourly_closes[-1] > sma_50
+        self._hourly_regime_cache[cache_key] = bullish
+        return bullish
 
     def _latest_bar_close_time(self, bars: list[Any]) -> datetime:
         if not bars:
@@ -624,7 +820,12 @@ class AlpacaTradingBot:
         return model
 
     def get_ml_signal(self, symbol: str, decision_timestamp: datetime | None = None) -> MlSignal:
-        model = self._get_or_train_ml_model(symbol)
+        if self._ml_disabled_reason is not None:
+            raise RuntimeError(f"ML trading disabled: {self._ml_disabled_reason}")
+        if offline_to_ml_signal is None:
+            self._disable_ml_trading("ml.predict import failed", _ML_PREDICT_IMPORT_ERROR)
+            raise RuntimeError(f"ML trading disabled: {self._ml_disabled_reason}")
+
         bars_needed = max(self.config.sma_bars, 25)
         aligned_decision_timestamp = decision_timestamp or self.get_decision_timestamp()
         intraday_bars = self._get_intraday_bars(
@@ -639,35 +840,53 @@ class AlpacaTradingBot:
             raise RuntimeError(f"Not enough bars to score ML signal for {symbol}: got {len(closes)}")
 
         features = self._build_feature_vector(closes, volumes, latest_index)
-        probability = model.predict_probability(features)
-        confidence = abs(probability - 0.5) * 2.0
-        return MlSignal(
-            probability_up=probability,
-            confidence=confidence,
-            training_rows=model.training_rows,
-            model_age_seconds=time.time() - model.trained_at_unix,
-            feature_names=model.feature_names,
-            buy_threshold=model.buy_threshold,
-            sell_threshold=model.sell_threshold,
-            validation_rows=model.validation_rows,
-            model_name=model.model_name,
+        try:
+            ml_signal = offline_to_ml_signal(
+                features,
+                buy_threshold=self.config.ml_probability_buy,
+                sell_threshold=self.config.ml_probability_sell,
+            )
+        except Exception as exc:
+            self._disable_ml_trading("offline model load or inference failed", exc)
+            raise RuntimeError(f"ML trading disabled: {self._ml_disabled_reason}") from exc
+
+        logger.debug(
+            "ML inference symbol=%s prob=%.3f buy_thr=%.3f sell_thr=%.3f model=%s",
+            symbol,
+            ml_signal.probability_up,
+            ml_signal.buy_threshold,
+            ml_signal.sell_threshold,
+            ml_signal.model_name,
         )
+        return ml_signal
 
     def evaluate_symbol(
         self,
         symbol: str,
-        holding: bool,
+        position: Position | None,
         decision_timestamp: datetime | None = None,
     ) -> SymbolEvaluation:
         aligned_decision_timestamp = decision_timestamp or self.get_decision_timestamp()
-        bars_needed = max(self.config.sma_bars, 25)
+        holding = position is not None
+        strategy = self._strategy_for_symbol(symbol)
+        effective_strategy_mode = strategy.config.strategy_mode
+        bars_needed = max(
+            self.config.sma_bars,
+            25,
+            estimate_atr_percentile_lookback_bars(self.config.bar_timeframe_minutes),
+            estimate_regime_lookback_bars(self.config.bar_timeframe_minutes),
+        )
         intraday_bars = self._get_intraday_bars(
             symbol,
             bars_needed,
             decision_timestamp=aligned_decision_timestamp,
         )
         closes = [float(bar.close) for bar in intraday_bars]
-        if len(closes) < max(20, self.config.sma_bars):
+        highs = [float(bar.high) for bar in intraday_bars]
+        lows = [float(bar.low) for bar in intraday_bars]
+        timestamps = [pd.Timestamp(getattr(bar, "timestamp")) for bar in intraday_bars]
+        min_history_bars = 2 if effective_strategy_mode == STRATEGY_MODE_BREAKOUT else max(20, self.config.sma_bars)
+        if len(closes) < min_history_bars:
             raise RuntimeError(
                 f"Not enough completed bars for {symbol} at {aligned_decision_timestamp.isoformat()}: got {len(closes)}"
             )
@@ -679,9 +898,61 @@ class AlpacaTradingBot:
             )
 
         price = closes[-1]
-        sma = sum(closes[-self.config.sma_bars :]) / self.config.sma_bars
-        ml_signal = self.get_ml_signal(symbol, decision_timestamp=aligned_decision_timestamp)
-        action = self.strategy.decide_action(price, sma, ml_signal, holding)
+        sma = (
+            sum(closes[-self.config.sma_bars :]) / self.config.sma_bars
+            if len(closes) >= self.config.sma_bars
+            else price
+        )
+        ml_signal = (
+            self.get_ml_signal(symbol, decision_timestamp=aligned_decision_timestamp)
+            if effective_strategy_mode in (STRATEGY_MODE_ML, STRATEGY_MODE_HYBRID)
+            else MlSignal(
+                probability_up=0.5,
+                confidence=0.0,
+                training_rows=0,
+                model_age_seconds=0.0,
+                feature_names=(),
+                buy_threshold=self.config.ml_probability_buy,
+                sell_threshold=self.config.ml_probability_sell,
+                validation_rows=0,
+                model_name="dummy",
+            )
+        )
+        atr_pct_values = calculate_atr_pct_values(highs, lows, closes)
+        atr_percentiles = calculate_atr_percentile_series(timestamps, highs, lows, closes)
+        opening_range_highs, opening_range_lows = calculate_opening_range_series(timestamps, highs, lows)
+        recent_volumes = [float(getattr(bar, "volume", 0.0) or 0.0) for bar in intraday_bars][-20:]
+        avg_volume = (sum(recent_volumes) / len(recent_volumes)) if recent_volumes else None
+        current_volume = float(getattr(intraday_bars[-1], "volume", 0.0) or 0.0)
+        volume_ratio = (current_volume / avg_volume) if avg_volume and avg_volume > 0 else None
+        recent_atr_pct_values = [value for value in atr_pct_values[-20:] if value is not None]
+        avg_atr_pct = (
+            sum(recent_atr_pct_values) / len(recent_atr_pct_values)
+            if recent_atr_pct_values
+            else None
+        )
+        current_atr_pct = atr_pct_values[-1] if atr_pct_values else None
+        volatility_ratio = (
+            current_atr_pct / avg_atr_pct
+            if current_atr_pct is not None and avg_atr_pct is not None and avg_atr_pct > 0
+            else None
+        )
+        bullish_regime = self._get_hourly_regime(symbol, aligned_decision_timestamp)
+        action = strategy.decide_action(
+            price,
+            sma,
+            ml_signal,
+            holding,
+            atr_pct_values[-1] if atr_pct_values else None,
+            atr_percentiles[-1],
+            time_window_open=self._is_in_entry_window(aligned_decision_timestamp.astimezone(_ET)),
+            bullish_regime=bullish_regime,
+            opening_range_high=opening_range_highs[-1] if opening_range_highs else None,
+            opening_range_low=opening_range_lows[-1] if opening_range_lows else None,
+            position_entry_price=float(position.avg_entry_price) if position is not None else None,
+            volume_ratio=volume_ratio,
+            volatility_ratio=volatility_ratio,
+        )
         return SymbolEvaluation(
             price=price,
             sma=sma,
@@ -696,8 +967,7 @@ class AlpacaTradingBot:
         positions: dict[str, Position],
         decision_timestamp: datetime | None = None,
     ) -> str:
-        holding = symbol in positions
-        return self.evaluate_symbol(symbol, holding, decision_timestamp=decision_timestamp).action
+        return self.evaluate_symbol(symbol, positions.get(symbol), decision_timestamp=decision_timestamp).action
 
     def daily_pnl(self) -> float:
         account = self.get_account()
@@ -718,7 +988,7 @@ class AlpacaTradingBot:
             position = positions.get(symbol)
             try:
                 holding = position is not None
-                evaluation = self.evaluate_symbol(symbol, holding, decision_timestamp=decision_timestamp)
+                evaluation = self.evaluate_symbol(symbol, position, decision_timestamp=decision_timestamp)
                 quantity = float(position.qty) if position is not None else 0.0
                 market_value = float(position.market_value) if position is not None else 0.0
 
@@ -929,8 +1199,8 @@ class AlpacaTradingBot:
         return datetime.now(_ET)
 
     def _is_in_entry_window(self, now_et: datetime | None = None) -> bool:
-        t = (now_et or self._et_now()).time()
-        return _SESSION_ENTRY_START <= t <= _SESSION_ENTRY_END
+        timestamp = now_et or self._et_now()
+        return is_entry_window_open(pd.Timestamp(timestamp), self.config.time_window_mode)
 
     def _is_past_flatten_deadline(self, now_et: datetime | None = None) -> bool:
         t = (now_et or self._et_now()).time()

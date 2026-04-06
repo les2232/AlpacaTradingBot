@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-04-06T01:19:20Z",
+  "should_trade": true,
+  "approved": true,
+  "stable": true,
+  "disabled_by_regime": false,
+  "rejection_reasons": [],
+  "stability_reasons": [],
+  "market_regime": "sideways",
+  "regime_avg_vol": 0.001171,
+  "regime_avg_slope_pct": -0.005717,
+  "selected_config": {
+    "strategy_mode": "sma",
+    "sma_bars": 20,
+    "entry_threshold_pct": 0.0025,
+    "threshold_mode": "static_pct",
+    "time_window_mode": "morning_only",
+    "regime_filter_enabled": false,
+    "orb_filter_mode": "none",
+    "breakout_exit_style": "target_1x_stop_low",
+    "mean_reversion_exit_style": "sma"
+  },
+  "performance": {
+    "total_return_pct": 4.606178,
+    "profit_factor": 1.253684,
+    "max_drawdown_pct": 3.967358,
+    "sharpe_ratio": 1.274551,
+    "trades_per_day": 1.870968
+  }
+}

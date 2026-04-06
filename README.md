@@ -69,6 +69,12 @@ Build a versioned Parquet snapshot of historical bars:
 python dataset_snapshotter.py --symbols AAPL MSFT NVDA --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z --timeframe 15Min --feed iex
 ```
 
+Feed notes:
+
+- `--feed iex` works on more accounts, but it is single-exchange data and can understate or distort intraday volume-sensitive signals.
+- `--feed sip` uses broader consolidated market data when your Alpaca account has SIP access enabled.
+- If `--feed sip` fails because of permissions or subscription limits, the snapshotter now prints a clearer explanation and suggests falling back to `iex`.
+
 This writes a dataset under `datasets/` with:
 
 - `bars.parquet`
