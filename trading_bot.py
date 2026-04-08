@@ -84,9 +84,6 @@ class BotConfig:
     time_window_mode: str = TIME_WINDOW_FULL_DAY
     regime_filter_enabled: bool = False
     orb_filter_mode: str = ORB_FILTER_NONE
-    ml_train_every_seconds: int = 900
-    ml_model_type: str = "logistic"
-    ml_validation_fraction: float = 0.2
     max_orders_per_minute: int = 6
     max_price_deviation_bps: float = 75.0
     max_data_delay_seconds: int = 1800
@@ -108,6 +105,7 @@ class SymbolSnapshot:
     ml_buy_threshold: float | None = None
     ml_sell_threshold: float | None = None
     ml_model_name: str | None = None
+    holding_minutes: float | None = None
     error: str | None = None
 
 
@@ -146,58 +144,10 @@ class OrderSnapshot:
     notional: float | None
 
 
-@dataclass(frozen=True)
-class TrainedSignalModel:
-    estimator: Any
-    trained_at_unix: float
-    training_rows: int
-    feature_names: tuple[str, ...]
-    buy_threshold: float
-    sell_threshold: float
-    validation_rows: int
-    model_name: str
-
-    def predict_probability(self, features: list[float]) -> float:
-        probabilities = cast(list[list[float]], self.estimator.predict_proba([features]))
-        return float(probabilities[0][1])
-
-
 _ET = pytz.timezone("America/New_York")
 _SESSION_ENTRY_START = dt_time(9, 45)   # no new entries before this
 _SESSION_ENTRY_END   = dt_time(15, 45)  # no new entries after this
 _SESSION_FLATTEN_AT  = dt_time(15, 55)  # forced EOD flatten deadline
-
-
-FEATURE_NAMES = (
-    "ret_1",
-    "ret_3",
-    "ret_5",
-    "price_vs_sma_10",
-    "price_vs_sma_20",
-    "volatility_10",
-    "volume_vs_avg_10",
-)
-
-
-def _get_sklearn_components() -> tuple[Any, Any, Any, Any, Any]:
-    try:
-        from sklearn.calibration import CalibratedClassifierCV
-        from sklearn.ensemble import GradientBoostingClassifier
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
-    except ImportError as exc:
-        raise RuntimeError(
-            "Missing scikit-learn. Run `python -m pip install -r requirements.txt`."
-        ) from exc
-
-    return (
-        CalibratedClassifierCV,
-        GradientBoostingClassifier,
-        LogisticRegression,
-        Pipeline,
-        StandardScaler,
-    )
 
 
 def _safe_float(value: str | None, default: float) -> float:
@@ -230,6 +180,8 @@ def _parse_symbol_strategy_map(raw_value: str | None) -> dict[str, str]:
 
 
 def load_config() -> BotConfig:
+    # Live execution config is intentionally sourced from environment variables
+    # and normalized into BotConfig here. Offline tools use their own CLI args.
     symbols_raw = os.getenv("BOT_SYMBOLS", "AAPL,MSFT,NVDA")
     symbols = [symbol.strip().upper() for symbol in symbols_raw.split(",") if symbol.strip()]
     if not symbols:
@@ -268,9 +220,6 @@ def load_config() -> BotConfig:
         ),
         regime_filter_enabled=os.getenv("REGIME_FILTER_ENABLED", "false").lower() == "true",
         orb_filter_mode=normalize_orb_filter_mode(os.getenv("ORB_FILTER_MODE", ORB_FILTER_NONE)),
-        ml_train_every_seconds=int(os.getenv("ML_TRAIN_EVERY_SECONDS", "900")),
-        ml_model_type=os.getenv("ML_MODEL_TYPE", "logistic").strip().lower(),
-        ml_validation_fraction=_safe_float(os.getenv("ML_VALIDATION_FRACTION"), 0.2),
         max_orders_per_minute=int(os.getenv("MAX_ORDERS_PER_MINUTE", "6")),
         max_price_deviation_bps=_safe_float(os.getenv("MAX_PRICE_DEVIATION_BPS"), 75.0),
         max_data_delay_seconds=int(os.getenv("MAX_DATA_DELAY_SECONDS", "1800")),
@@ -304,8 +253,9 @@ class AlpacaTradingBot:
         self._stream_error: str | None = None
         self.data_stream: StockDataStream | None = None
         self._stream_thread: threading.Thread | None = None
-        self._model_cache: dict[str, TrainedSignalModel] = {}
         self._ml_disabled_reason: str | None = None
+        self._last_processed_decision_timestamp: datetime | None = None
+        self._position_first_seen_utc: dict[str, datetime] = {}
         self._bars_cache: dict[tuple[str, int, int, str], list[Any]] = {}
         self._hourly_regime_cache: dict[tuple[str, str], bool | None] = {}
         self.strategy = Strategy(
@@ -386,6 +336,52 @@ class AlpacaTradingBot:
 
     def get_account(self) -> Any:
         return cast(Any, self.trading).get_account()
+
+    def _log_skip(self, reason: str, detail: str) -> None:
+        logger.info("%s %s", reason, detail)
+        print(f"{reason}: {detail}")
+
+    def _position_holding_minutes(self, symbol: str, now_utc: datetime) -> float | None:
+        first_seen = self._position_first_seen_utc.get(symbol)
+        if first_seen is None:
+            return None
+        return max(0.0, (now_utc - first_seen).total_seconds() / 60.0)
+
+    def _update_position_holding_state(
+        self,
+        positions: dict[str, Position],
+        observed_at_utc: datetime,
+    ) -> None:
+        for symbol in positions:
+            self._position_first_seen_utc.setdefault(symbol, observed_at_utc)
+        for symbol in list(self._position_first_seen_utc):
+            if symbol not in positions:
+                del self._position_first_seen_utc[symbol]
+
+    def _should_process_decision_timestamp(self, timestamp: datetime) -> bool:
+        last_processed = self._last_processed_decision_timestamp
+        if last_processed is not None and timestamp <= last_processed:
+            self._log_skip(
+                "SKIP_DUPLICATE_BAR",
+                f"decision_timestamp={timestamp.isoformat()} last_processed={last_processed.isoformat()}",
+            )
+            return False
+        self._last_processed_decision_timestamp = timestamp
+        return True
+
+    def _is_regular_hours(self, timestamp: datetime | pd.Timestamp) -> bool:
+        stamp = pd.Timestamp(timestamp)
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize("UTC")
+        time_et = stamp.tz_convert("America/New_York").time()
+        return dt_time(9, 30) <= time_et < dt_time(16, 0)
+
+    def _is_market_open(self) -> bool:
+        try:
+            clock = cast(Any, self.trading).get_clock()
+        except Exception as exc:
+            raise RuntimeError("Unable to fetch Alpaca market clock.") from exc
+        return bool(getattr(clock, "is_open", False))
 
     def get_price_feed_status(self) -> str:
         with self._price_lock:
@@ -618,207 +614,6 @@ class AlpacaTradingBot:
             (volumes[index] / max(avg_volume_10, 1.0)) - 1.0,
         ]
 
-    def _build_base_estimator(self) -> Any:
-        _, GradientBoostingClassifier, LogisticRegression, Pipeline, StandardScaler = (
-            _get_sklearn_components()
-        )
-        if self.config.ml_model_type == "gradient_boosting":
-            return GradientBoostingClassifier(
-                n_estimators=150,
-                learning_rate=0.05,
-                max_depth=2,
-                random_state=42,
-            )
-        return Pipeline(
-            steps=[
-                ("scaler", StandardScaler()),
-                (
-                    "model",
-                    LogisticRegression(
-                        C=0.5,
-                        class_weight="balanced",
-                        max_iter=1000,
-                        random_state=42,
-                    ),
-                ),
-            ]
-        )
-
-    def _has_both_classes(self, labels: list[int]) -> bool:
-        return len(set(labels)) >= 2
-
-    def _fit_calibrated_model(
-        self,
-        train_features: list[list[float]],
-        train_labels: list[int],
-        calibration_features: list[list[float]],
-        calibration_labels: list[int],
-    ) -> tuple[Any, str]:
-        if not self._has_both_classes(train_labels):
-            raise RuntimeError("Training split does not contain both classes.")
-
-        CalibratedClassifierCV, _, _, _, _ = _get_sklearn_components()
-        estimator = self._build_base_estimator()
-        estimator.fit(train_features, train_labels)
-        if not calibration_features or not self._has_both_classes(calibration_labels):
-            return estimator, self.config.ml_model_type
-
-        calibrator = CalibratedClassifierCV(estimator, method="sigmoid", cv="prefit")
-        calibrator.fit(calibration_features, calibration_labels)
-        return calibrator, f"{self.config.ml_model_type}+sigmoid_calibrated"
-
-    def _split_ml_datasets(
-        self,
-        feature_rows: list[list[float]],
-        labels: list[int],
-    ) -> tuple[list[list[float]], list[int], list[list[float]], list[int], list[list[float]], list[int]]:
-        row_count = len(feature_rows)
-        validation_fraction = min(max(self.config.ml_validation_fraction, 0.1), 0.3)
-        validation_rows = max(20, int(row_count * validation_fraction))
-        calibration_rows = max(20, int(row_count * validation_fraction))
-        training_rows = row_count - validation_rows - calibration_rows
-
-        if training_rows < 40:
-            raise RuntimeError(
-                f"Not enough ML rows for train/calibration/validation split: got {row_count}"
-            )
-
-        train_end = training_rows
-        calibration_end = train_end + calibration_rows
-        return (
-            feature_rows[:train_end],
-            labels[:train_end],
-            feature_rows[train_end:calibration_end],
-            labels[train_end:calibration_end],
-            feature_rows[calibration_end:],
-            labels[calibration_end:],
-        )
-
-    def _f1_score(self, true_labels: list[int], predicted_labels: list[int], positive_label: int) -> float:
-        true_positive = 0
-        false_positive = 0
-        false_negative = 0
-
-        for truth, predicted in zip(true_labels, predicted_labels):
-            if predicted == positive_label and truth == positive_label:
-                true_positive += 1
-            elif predicted == positive_label and truth != positive_label:
-                false_positive += 1
-            elif predicted != positive_label and truth == positive_label:
-                false_negative += 1
-
-        precision = true_positive / max(1, true_positive + false_positive)
-        recall = true_positive / max(1, true_positive + false_negative)
-        if precision + recall == 0:
-            return 0.0
-        return 2.0 * precision * recall / (precision + recall)
-
-    def _select_validation_thresholds(
-        self,
-        probabilities_up: list[float],
-        labels: list[int],
-    ) -> tuple[float, float]:
-        if len(probabilities_up) < 20:
-            return self.config.ml_probability_buy, self.config.ml_probability_sell
-
-        buy_thresholds = [round(value, 2) for value in [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70]]
-        sell_thresholds = [round(value, 2) for value in [0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48, 0.50]]
-
-        best_buy_threshold = self.config.ml_probability_buy
-        best_sell_threshold = self.config.ml_probability_sell
-        best_buy_score = -1.0
-        best_sell_score = -1.0
-
-        for threshold in buy_thresholds:
-            predicted = [1 if probability >= threshold else 0 for probability in probabilities_up]
-            score = self._f1_score(labels, predicted, positive_label=1)
-            acted = sum(predicted)
-            if score > best_buy_score or (math.isclose(score, best_buy_score) and acted > 0):
-                best_buy_score = score
-                best_buy_threshold = threshold
-
-        for threshold in sell_thresholds:
-            predicted = [0 if probability <= threshold else 1 for probability in probabilities_up]
-            score = self._f1_score(labels, predicted, positive_label=0)
-            acted = sum(1 for probability in probabilities_up if probability <= threshold)
-            if score > best_sell_score or (math.isclose(score, best_sell_score) and acted > 0):
-                best_sell_score = score
-                best_sell_threshold = threshold
-
-        if best_sell_threshold > best_buy_threshold:
-            midpoint = (best_buy_threshold + best_sell_threshold) / 2.0
-            best_sell_threshold = min(best_sell_threshold, midpoint)
-            best_buy_threshold = max(best_buy_threshold, midpoint)
-
-        return best_buy_threshold, best_sell_threshold
-
-    def _get_or_train_ml_model(self, symbol: str) -> TrainedSignalModel:
-        cached_model = self._model_cache.get(symbol)
-        if cached_model is not None and (time.time() - cached_model.trained_at_unix) < self.config.ml_train_every_seconds:
-            return cached_model
-
-        bars_needed = max(self.config.ml_lookback_bars, 80)
-        decision_timestamp = self.get_decision_timestamp()
-        intraday_bars = self._get_intraday_bars(
-            symbol,
-            bars_needed,
-            decision_timestamp=decision_timestamp,
-        )
-        closes = [float(bar.close) for bar in intraday_bars]
-        volumes = [float(getattr(bar, "volume", 0.0) or 0.0) for bar in intraday_bars]
-
-        if len(closes) < 40:
-            raise RuntimeError(f"Not enough bars to train ML model for {symbol}: got {len(closes)}")
-
-        feature_rows: list[list[float]] = []
-        labels: list[int] = []
-        max_index = len(closes) - 2
-        for index in range(19, max_index + 1):
-            features = self._build_feature_vector(closes, volumes, index)
-            next_close = closes[index + 1]
-            label = 1 if next_close > closes[index] else 0
-            feature_rows.append(features)
-            labels.append(label)
-
-        if len(feature_rows) < 20:
-            raise RuntimeError(f"Not enough ML training rows for {symbol}: got {len(feature_rows)}")
-
-        (
-            train_features,
-            train_labels,
-            calibration_features,
-            calibration_labels,
-            validation_features,
-            validation_labels,
-        ) = self._split_ml_datasets(feature_rows, labels)
-        model_estimator, model_name = self._fit_calibrated_model(
-            train_features,
-            train_labels,
-            calibration_features,
-            calibration_labels,
-        )
-        validation_probabilities = [
-            float(probability_row[1])
-            for probability_row in cast(list[list[float]], model_estimator.predict_proba(validation_features))
-        ]
-        buy_threshold, sell_threshold = self._select_validation_thresholds(
-            validation_probabilities,
-            validation_labels,
-        )
-
-        model = TrainedSignalModel(
-            estimator=model_estimator,
-            trained_at_unix=time.time(),
-            training_rows=len(train_features) + len(calibration_features),
-            feature_names=FEATURE_NAMES,
-            buy_threshold=buy_threshold,
-            sell_threshold=sell_threshold,
-            validation_rows=len(validation_features),
-            model_name=model_name,
-        )
-        self._model_cache[symbol] = model
-        return model
-
     def get_ml_signal(self, symbol: str, decision_timestamp: datetime | None = None) -> MlSignal:
         if self._ml_disabled_reason is not None:
             raise RuntimeError(f"ML trading disabled: {self._ml_disabled_reason}")
@@ -978,19 +773,39 @@ class AlpacaTradingBot:
         print(f"Daily PnL: {pnl:.2f}")
         return pnl <= -self.config.max_daily_loss_usd
 
-    def build_snapshot(self) -> BotSnapshot:
+    def build_snapshot(
+        self,
+        decision_timestamp: datetime | None = None,
+        evaluate_signals: bool = True,
+    ) -> BotSnapshot:
         account = self.get_account()
         positions = self.get_positions_by_symbol()
+        aligned_decision_timestamp = decision_timestamp or self.get_decision_timestamp()
+        self._update_position_holding_state(positions, aligned_decision_timestamp)
         symbols: list[SymbolSnapshot] = []
-        decision_timestamp = self.get_decision_timestamp()
 
         for symbol in self.config.symbols:
             position = positions.get(symbol)
+            holding = position is not None
+            quantity = float(position.qty) if position is not None else 0.0
+            market_value = float(position.market_value) if position is not None else 0.0
+            holding_minutes = self._position_holding_minutes(symbol, aligned_decision_timestamp)
             try:
-                holding = position is not None
-                evaluation = self.evaluate_symbol(symbol, position, decision_timestamp=decision_timestamp)
-                quantity = float(position.qty) if position is not None else 0.0
-                market_value = float(position.market_value) if position is not None else 0.0
+                if not evaluate_signals:
+                    symbols.append(
+                        SymbolSnapshot(
+                            symbol=symbol,
+                            price=None,
+                            sma=None,
+                            action="SNAPSHOT_ONLY",
+                            holding=holding,
+                            quantity=quantity,
+                            market_value=market_value,
+                            holding_minutes=holding_minutes,
+                        )
+                    )
+                    continue
+                evaluation = self.evaluate_symbol(symbol, position, decision_timestamp=aligned_decision_timestamp)
 
                 symbols.append(
                     SymbolSnapshot(
@@ -1007,6 +822,7 @@ class AlpacaTradingBot:
                         ml_buy_threshold=evaluation.ml_signal.buy_threshold,
                         ml_sell_threshold=evaluation.ml_signal.sell_threshold,
                         ml_model_name=evaluation.ml_signal.model_name,
+                        holding_minutes=holding_minutes,
                     )
                 )
             except Exception as exc:
@@ -1016,16 +832,17 @@ class AlpacaTradingBot:
                         price=None,
                         sma=None,
                         action="ERROR",
-                        holding=position is not None,
-                        quantity=float(position.qty) if position is not None else 0.0,
-                        market_value=float(position.market_value) if position is not None else 0.0,
+                        holding=holding,
+                        quantity=quantity,
+                        market_value=market_value,
+                        holding_minutes=holding_minutes,
                         error=str(exc),
                     )
                 )
 
         daily_pnl = float(account.equity) - float(account.last_equity)
         return BotSnapshot(
-            timestamp_utc=decision_timestamp.isoformat(),
+            timestamp_utc=aligned_decision_timestamp.isoformat(),
             cash=float(account.cash),
             buying_power=float(account.buying_power),
             equity=float(account.equity),
@@ -1122,8 +939,12 @@ class AlpacaTradingBot:
         self.storage.save_snapshot(snapshot, orders)
         return orders
 
-    def capture_state(self, orders_limit: int = 20) -> tuple[BotSnapshot, list[OrderSnapshot]]:
-        snapshot = self.build_snapshot()
+    def capture_state(
+        self,
+        orders_limit: int = 20,
+        evaluate_signals: bool = True,
+    ) -> tuple[BotSnapshot, list[OrderSnapshot]]:
+        snapshot = self.build_snapshot(evaluate_signals=evaluate_signals)
         orders = self.record_state(snapshot, orders_limit=orders_limit)
         return snapshot, orders
 
@@ -1174,6 +995,8 @@ class AlpacaTradingBot:
             print(f"Skip SELL {symbol}: non-positive quantity {position.qty}")
             return None
 
+        holding_minutes = self._position_holding_minutes(symbol, datetime.now(timezone.utc))
+
         order = cast(
             Any,
             self.trading.submit_order(
@@ -1185,7 +1008,8 @@ class AlpacaTradingBot:
                 )
             ),
         )
-        print(f"Submitted SELL {symbol} qty={qty}")
+        holding_text = f" holding_minutes={holding_minutes:.1f}" if holding_minutes is not None else ""
+        print(f"Submitted SELL {symbol} qty={qty}{holding_text}")
         return order
 
     def _seconds_until_next_bar(self) -> float:
@@ -1209,13 +1033,44 @@ class AlpacaTradingBot:
     def run_once(self, execute_orders: bool = True) -> BotSnapshot:
         print("\n=== BOT TICK ===")
         now_et = self._et_now()
-        snapshot = self.build_snapshot()
+        decision_timestamp = self.get_decision_timestamp()
+        should_process = self._should_process_decision_timestamp(decision_timestamp)
+        snapshot = self.build_snapshot(
+            decision_timestamp=decision_timestamp,
+            evaluate_signals=should_process,
+        )
         print(f"Connected. Cash: {snapshot.cash} Buying power: {snapshot.buying_power}")
         print(f"Daily PnL: {snapshot.daily_pnl:.2f}")
         print(f"Strategy mode: {self.config.strategy_mode}")
 
+        if not should_process:
+            self.record_state(snapshot)
+            return snapshot
+
+        if execute_orders:
+            try:
+                market_open = self._is_market_open()
+            except Exception as exc:
+                self._log_skip("SKIP_MARKET_CLOSED", str(exc))
+                self.record_state(snapshot)
+                return snapshot
+            if not market_open:
+                self._log_skip("SKIP_MARKET_CLOSED", "Alpaca market clock reports closed")
+                self.record_state(snapshot)
+                return snapshot
+            if not self._is_regular_hours(decision_timestamp):
+                self._log_skip(
+                    "SKIP_OUTSIDE_REGULAR_HOURS",
+                    f"decision_timestamp={decision_timestamp.astimezone(_ET).strftime('%H:%M:%S')} ET",
+                )
+                self.record_state(snapshot)
+                return snapshot
+
         if execute_orders and self._is_past_flatten_deadline(now_et):
-            print(f"EOD flatten: {now_et.strftime('%H:%M:%S')} ET >= 15:55, closing all positions")
+            self._log_skip(
+                "SKIP_EOD_FLATTEN_WINDOW",
+                f"{now_et.strftime('%H:%M:%S')} ET >= 15:55, closing all positions",
+            )
             open_orders = self.get_open_orders()
             open_order_symbols = {
                 str(getattr(order, "symbol", ""))
@@ -1223,7 +1078,7 @@ class AlpacaTradingBot:
                 if getattr(order, "symbol", None)
             }
             self.flatten_positions(snapshot.positions, open_order_symbols)
-            snapshot = self.build_snapshot()
+            snapshot = self.build_snapshot(decision_timestamp=decision_timestamp, evaluate_signals=False)
             self.record_state(snapshot)
             return snapshot
 
@@ -1237,7 +1092,7 @@ class AlpacaTradingBot:
                     if getattr(order, "symbol", None)
                 }
                 self.flatten_positions(snapshot.positions, open_order_symbols)
-                snapshot = self.build_snapshot()
+                snapshot = self.build_snapshot(decision_timestamp=decision_timestamp, evaluate_signals=False)
             self.record_state(snapshot)
             return snapshot
 
@@ -1266,7 +1121,10 @@ class AlpacaTradingBot:
 
         for item in snapshot.symbols:
             if self._is_past_flatten_deadline():
-                print(f"EOD flatten triggered mid-cycle at {self._et_now().strftime('%H:%M:%S')} ET")
+                self._log_skip(
+                    "SKIP_EOD_FLATTEN_WINDOW",
+                    f"mid-cycle at {self._et_now().strftime('%H:%M:%S')} ET",
+                )
                 self.flatten_positions(snapshot.positions, open_order_symbols)
                 break
 
@@ -1282,7 +1140,12 @@ class AlpacaTradingBot:
                     if item.ml_probability_up is not None and item.ml_confidence is not None
                     else ""
                 )
-                print(f"{symbol} -> {action}{ml_text}")
+                holding_text = (
+                    f" holding_minutes={item.holding_minutes:.1f}"
+                    if item.holding_minutes is not None
+                    else ""
+                )
+                print(f"{symbol} -> {action}{ml_text}{holding_text}")
 
                 if symbol in open_order_symbols:
                     print(f"Skip {symbol}: existing open order in flight")
@@ -1343,7 +1206,7 @@ class AlpacaTradingBot:
             except Exception as exc:
                 print(f"{symbol} ERROR: {exc}")
 
-        snapshot = self.build_snapshot()
+        snapshot = self.build_snapshot(decision_timestamp=decision_timestamp)
         self.record_state(snapshot)
         return snapshot
 
@@ -1387,6 +1250,9 @@ def main() -> None:
             print("EOD flatten thread: execute_orders=False, skipping flatten")
         shutdown_event.set()
 
+    # Keep this thread even though run_once() also enforces the flatten window.
+    # The duplication is intentional: run_once() protects the decision path,
+    # while the thread is a wall-clock fail-safe if the main loop drifts.
     flatten_thread = threading.Thread(target=_eod_flatten_worker, name="eod-flatten", daemon=True)
     flatten_thread.start()
 

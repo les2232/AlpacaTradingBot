@@ -120,16 +120,6 @@ class PreparedSymbolData:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class _MlModel:
-    estimator: Any
-    buy_threshold: float
-    sell_threshold: float
-
-    def predict_up(self, features: list[float]) -> float:
-        return float(self.estimator.predict_proba([features])[0][1])
-
-
-@dataclass
 class _BacktestInputs:
     """Normalized config and loaded data produced by _prepare_backtest_inputs."""
     df: pd.DataFrame
@@ -181,8 +171,6 @@ class _SimState:
     pending_sells: set[str]
     # ML state
     ml_signals: dict[str, list[MlSignal | None]]
-    ml_cache: dict[str, _MlModel | None]
-    ml_trained_at: dict[str, int]
     # Accounting (mutated by _execute_buy / _execute_sell)
     results: dict[str, Any]
     symbol_stats: dict[str, dict[str, Any]]
@@ -220,133 +208,6 @@ def _build_feature_vector(closes: list[float], volumes: list[float], idx: int) -
         _stddev(vol_returns, avg_vol),
         (volumes[idx] / max(avg_volume_10, 1.0)) - 1.0,
     ]
-
-
-def _f1_score(true_labels: list[int], pred_labels: list[int], pos: int) -> float:
-    tp = fp = fn = 0
-    for t, p in zip(true_labels, pred_labels):
-        if p == pos and t == pos:
-            tp += 1
-        elif p == pos:
-            fp += 1
-        elif t == pos:
-            fn += 1
-    precision = tp / max(1, tp + fp)
-    recall = tp / max(1, tp + fn)
-    if precision + recall == 0:
-        return 0.0
-    return 2.0 * precision * recall / (precision + recall)
-
-
-def _select_thresholds(
-    probs: list[float],
-    labels: list[int],
-    default_buy: float,
-    default_sell: float,
-) -> tuple[float, float]:
-    """Identical threshold-selection logic to trading_bot.py._select_validation_thresholds."""
-    if len(probs) < 20:
-        return default_buy, default_sell
-
-    buy_candidates  = [round(v, 2) for v in [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66, 0.68, 0.70]]
-    sell_candidates = [round(v, 2) for v in [0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42, 0.44, 0.46, 0.48, 0.50]]
-
-    best_buy, best_sell = default_buy, default_sell
-    best_buy_score = best_sell_score = -1.0
-
-    for thr in buy_candidates:
-        predicted = [1 if p >= thr else 0 for p in probs]
-        score = _f1_score(labels, predicted, 1)
-        if score > best_buy_score or (math.isclose(score, best_buy_score) and sum(predicted) > 0):
-            best_buy_score = score
-            best_buy = thr
-
-    for thr in sell_candidates:
-        predicted = [0 if p <= thr else 1 for p in probs]
-        score = _f1_score(labels, predicted, 0)
-        if score > best_sell_score or (math.isclose(score, best_sell_score) and
-                                       sum(1 for p in probs if p <= thr) > 0):
-            best_sell_score = score
-            best_sell = thr
-
-    if best_sell > best_buy:
-        mid = (best_buy + best_sell) / 2.0
-        best_sell = min(best_sell, mid)
-        best_buy = max(best_buy, mid)
-
-    return best_buy, best_sell
-
-
-def _train_ml_model(
-    closes: list[float],
-    volumes: list[float],
-    current_idx: int,
-    ml_lookback_bars: int,
-    ml_probability_buy: float,
-    ml_probability_sell: float,
-) -> "_MlModel | None":
-    """
-    Train a logistic classifier on bars ending just before current_idx.
-
-    Training window : [max(0, current_idx - ml_lookback_bars), current_idx - 1]
-    Label for bar i : 1 if closes[i+1] > closes[i] else 0
-    Last label      : closes[current_idx] > closes[current_idx-1] — the current
-                      completed bar's close, so no look-ahead.
-
-    Exactly mirrors _get_or_train_ml_model in trading_bot.py.
-    """
-    try:
-        from sklearn.calibration import CalibratedClassifierCV
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
-    except ImportError:
-        return None
-
-    start_i = max(0, current_idx - ml_lookback_bars)
-    feature_rows: list[list[float]] = []
-    labels: list[int] = []
-
-    for i in range(max(start_i, 19), current_idx):
-        feature_rows.append(_build_feature_vector(closes, volumes, i))
-        labels.append(1 if closes[i + 1] > closes[i] else 0)
-
-    if len(feature_rows) < 80 or len(set(labels)) < 2:
-        return None
-
-    val_rows = max(20, int(len(feature_rows) * 0.2))
-    cal_rows = max(20, int(len(feature_rows) * 0.2))
-    train_rows = len(feature_rows) - val_rows - cal_rows
-    if train_rows < 40:
-        return None
-
-    X_train = feature_rows[:train_rows]
-    y_train = labels[:train_rows]
-    X_cal   = feature_rows[train_rows: train_rows + cal_rows]
-    y_cal   = labels[train_rows: train_rows + cal_rows]
-    X_val   = feature_rows[train_rows + cal_rows:]
-    y_val   = labels[train_rows + cal_rows:]
-
-    if len(set(y_train)) < 2:
-        return None
-
-    pipe = Pipeline([
-        ("scaler", StandardScaler()),
-        ("model", LogisticRegression(C=0.5, class_weight="balanced", max_iter=1000, random_state=42)),
-    ])
-    pipe.fit(X_train, y_train)
-
-    if X_cal and len(set(y_cal)) >= 2:
-        cal = CalibratedClassifierCV(pipe, method="sigmoid", cv="prefit")
-        cal.fit(X_cal, y_cal)
-        estimator: Any = cal
-    else:
-        estimator = pipe
-
-    val_probs = [float(row[1]) for row in estimator.predict_proba(X_val)]
-    buy_thr, sell_thr = _select_thresholds(val_probs, list(y_val), ml_probability_buy, ml_probability_sell)
-
-    return _MlModel(estimator=estimator, buy_threshold=buy_thr, sell_threshold=sell_thr)
 
 
 def _load_offline_model_payload(model_path: Path = OFFLINE_MODEL_PATH) -> dict[str, Any]:
@@ -988,8 +849,6 @@ def _initialize_simulation_state(
         pending_buys={},
         pending_sells=set(),
         ml_signals={s: [] for s in symbols},
-        ml_cache={s: None for s in symbols},
-        ml_trained_at={s: -999 for s in symbols},
         results=results,
         symbol_stats=symbol_stats,
         trades=[],

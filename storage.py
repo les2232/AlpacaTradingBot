@@ -39,6 +39,7 @@ class BotStorage:
                     ml_training_rows INTEGER,
                     action TEXT NOT NULL,
                     holding INTEGER NOT NULL,
+                    holding_minutes REAL,
                     quantity REAL NOT NULL,
                     market_value REAL NOT NULL,
                     error TEXT,
@@ -67,6 +68,7 @@ class BotStorage:
                 "ml_probability_up": "ALTER TABLE symbol_runs ADD COLUMN ml_probability_up REAL",
                 "ml_confidence": "ALTER TABLE symbol_runs ADD COLUMN ml_confidence REAL",
                 "ml_training_rows": "ALTER TABLE symbol_runs ADD COLUMN ml_training_rows INTEGER",
+                "holding_minutes": "ALTER TABLE symbol_runs ADD COLUMN holding_minutes REAL",
             }
             for column_name, statement in column_migrations.items():
                 if column_name not in symbol_columns:
@@ -95,8 +97,8 @@ class BotStorage:
             connection.executemany(
                 """
                 INSERT INTO symbol_runs (
-                    run_id, symbol, price, sma, ml_probability_up, ml_confidence, ml_training_rows, action, holding, quantity, market_value, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    run_id, symbol, price, sma, ml_probability_up, ml_confidence, ml_training_rows, action, holding, holding_minutes, quantity, market_value, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -109,6 +111,7 @@ class BotStorage:
                         item.ml_training_rows,
                         item.action,
                         int(item.holding),
+                        item.holding_minutes,
                         item.quantity,
                         item.market_value,
                         item.error,
@@ -180,6 +183,7 @@ class BotStorage:
                     s.ml_training_rows,
                     s.action,
                     s.holding,
+                    s.holding_minutes,
                     s.quantity,
                     s.market_value,
                     s.error

@@ -3,15 +3,27 @@ run_research.py
 ---------------
 Automated research pipeline:
   1. Fetch a fresh dataset via dataset_snapshotter.py
-  2. Locate the newest dataset folder under /datasets
-  3. Run a parameter sweep via backtest_runner.py
-  4. Save results to /results with a timestamped filename
+  2. Run a parameter sweep via backtest_runner.py
+  3. Rank results into leaderboard CSVs
+  4. Evaluate approval, stability, and market regime
+  5. Write decision artifacts to /results
 
 Usage:
     python run_research.py
 
 Edit the SNAPSHOT CONFIG and SWEEP CONFIG sections below to change parameters.
 All paths are resolved relative to this script's directory, not the shell CWD.
+
+Primary outputs written under /results:
+  - research_<window>d_<timestamp>.csv
+  - leaderboard_<window>d_<timestamp>.csv
+  - best_config_latest.json
+  - stability_report.json
+  - trade_decision.json
+
+This script is intentionally different from run_compare_suite.ps1:
+  - run_research.py is the configurable multi-window research workflow
+  - run_compare_suite.ps1 is the fixed benchmark suite for repeatable comparisons
 """
 
 import json

@@ -1,3 +1,17 @@
+# run_compare_suite.ps1
+# -----------------------------------------------------------------------
+# Fixed benchmark suite for repeatable strategy comparisons.
+#
+# This script is intentionally different from run_research.py:
+#   - run_compare_suite.ps1 uses predefined datasets and a fixed job list
+#   - run_research.py is the configurable multi-window research pipeline
+#
+# Outputs:
+#   - creates results\compare_suite_YYYYMMDD_HHMMSS\
+#   - writes the primary comparison CSVs for each job there
+#   - writes side-car CSVs produced by backtest_runner.py there
+# -----------------------------------------------------------------------
+
 $ErrorActionPreference = "Stop"
 
 Set-StrictMode -Version Latest
@@ -84,12 +98,13 @@ foreach ($buyThreshold in $buyThresholds) {
             "--output-csv", $tempOutput
         )
 
-        $rows = Import-Csv -LiteralPath $tempOutput
-        foreach ($row in $rows) {
-            $row.ml_probability_buy = $buyThreshold.ToString("0.00")
-            $row.ml_probability_sell = $sellThreshold.ToString("0.00")
-            $mlSweepRows += $row
-        }
+        $buyStr  = $buyThreshold.ToString("0.00")
+        $sellStr = $sellThreshold.ToString("0.00")
+        $rows = Import-Csv -LiteralPath $tempOutput |
+            Select-Object -Property *, `
+                @{Name="ml_probability_buy";  Expression={ $buyStr }}, `
+                @{Name="ml_probability_sell"; Expression={ $sellStr }}
+        $mlSweepRows += $rows
     }
 }
 

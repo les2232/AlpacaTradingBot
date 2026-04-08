@@ -20,7 +20,7 @@ These settings may be changed without changing the spec itself.
 - Max trade budget: `MAX_USD_PER_TRADE`
 - Max simultaneous positions: `MAX_OPEN_POSITIONS`
 - Max daily realized plus unrealized loss: `MAX_DAILY_LOSS_USD`
-- ML thresholds and retrain cadence
+- ML thresholds
 
 ## Frozen Defaults
 
@@ -134,11 +134,30 @@ These settings may be changed without changing the spec itself.
   - no trade on stale data
   - skip symbols with open orders in flight
   - persistence of ML fields to SQLite
-- Not yet enforced:
-  - regular-hours-only trading window
+  - persistence of holding duration snapshots to SQLite
+  - regular-hours-only trading window (`09:45-15:45` ET)
+  - Alpaca market-clock check before live execution
   - one-decision-per-completed-bar scheduler
-  - forced end-of-day flatten
-  - explicit max holding time tracking
+  - forced end-of-day flatten window at `15:55` ET
+  - duplicated end-of-day flatten protection in the live bot:
+    - inside the main decision path as an execution guard
+    - inside a dedicated background thread as a wall-clock fail-safe
+- Not yet enforced:
+  - a stricter holding-time exit earlier than the end-of-day flatten deadline
+
+## Research Workflow Notes
+
+- [dataset_snapshotter.py](dataset_snapshotter.py) creates versioned offline datasets under `datasets/`.
+- [backtest_runner.py](backtest_runner.py) replays those datasets through the shared strategy layer and writes result CSVs under `results/`.
+- [run_research.py](run_research.py) is the configurable research pipeline:
+  - it snapshots fresh data
+  - runs sweeps
+  - ranks results
+  - writes decision artifacts such as `best_config_latest.json`, `stability_report.json`, and `trade_decision.json`
+- [run_compare_suite.ps1](run_compare_suite.ps1) is a fixed benchmarking wrapper:
+  - it uses predefined datasets
+  - compares `sma`, `ml`, and `hybrid`
+  - writes all outputs into one timestamped folder under `results/`
 
 ## Revision Rule
 
