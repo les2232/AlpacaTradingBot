@@ -1,0 +1,15 @@
+{
+  "saved_at": "2026-04-08T00:00:00Z",
+  "source": {
+    "note": "Validated mean-reversion config: IS PF 1.189 → OOS PF 1.431 (Oct 2025–Apr 2026 / Apr–Oct 2025), 15-symbol universe"
+  },
+  "runtime": {
+    "symbols": ["AMD", "TSLA", "GOOGL", "MSFT", "QCOM", "BAC", "C", "WFC", "JPM", "ABBV", "LLY", "HON", "XOM", "COP", "HD"],
+    "bar_timeframe_minutes": 15,
+    "strategy_mode": "mean_reversion",
+    "sma_bars": 20,
+    "mean_reversion_trend_filter": true,
+    "mean_reversion_max_atr_percentile": 80.0,
+    "mean_reversion_exit_style": "sma"
+  }
+}

@@ -1,0 +1,23 @@
+﻿{
+    "timestamp":  "2026-04-08T13:30:17.5177021-06:00",
+    "launch_mode":  "live",
+    "command":  "python trading_bot.py",
+    "config_path":  "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\config\\live_config.json",
+    "strategy_mode":  "hybrid",
+    "symbols":  [
+                    "NVDA",
+                    "AMD",
+                    "TSLA"
+                ],
+    "symbol_count":  3,
+    "timeframe_minutes":  15,
+    "dataset":  "datasets\\LIQUID_SAMPLE_DATASET",
+    "symbol_source":  "dataset_metadata",
+    "saved_at":  "2026-04-08T18:30:00Z",
+    "execute_orders_effective":  true,
+    "alpaca_paper":  "false",
+    "paper_mode_enabled":  false,
+    "ready_for_paper":  true,
+    "ready_for_live":  true,
+    "git_commit":  "50583277dfad331f45b350bbb65518c46e8ae7c7"
+}

@@ -137,7 +137,12 @@ def build_dataset_id(
     feed: str,
     code_hash: str,
 ) -> str:
-    symbols_key = "-".join(sorted(symbols))
+    sorted_syms = sorted(symbols)
+    symbols_key = "-".join(sorted_syms)
+    # Windows MAX_PATH is 260 chars; hash the symbol list when it would exceed safe limits.
+    if len(symbols_key) > 100:
+        sym_hash = hashlib.sha256(symbols_key.encode()).hexdigest()[:8]
+        symbols_key = f"{len(sorted_syms)}syms_{sym_hash}"
     timeframe_key = timeframe_text.replace(" ", "")
     start_key = start.strftime("%Y%m%dT%H%M%SZ")
     end_key = end.strftime("%Y%m%dT%H%M%SZ")

@@ -1,0 +1,2 @@
+strategy_mode,threshold_mode,entry_threshold_pct,atr_multiple,atr_percentile_threshold,sma_bars,regime_filter_enabled,coverage_symbols,coverage_time_windows,avg_net_pnl,avg_sharpe,avg_win_rate,avg_profit_factor,avg_trades_per_day,avg_return_per_trade_pct,avg_pnl_stability,worst_max_drawdown_pct,net_pnl_std,robustness_score
+mean_reversion,static_pct,0.001,1.0,0.0,20,False,11,1,9.465874584216552,0.2464406255204269,77.43925055380745,1.1238207172240406,1.4017595307917885,0.012373136166806452,11.814532725914757,33.21192913237776,144.1948654741971,-276.14457399982666

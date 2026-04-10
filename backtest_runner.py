@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import math
 import pickle
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from strategy import (
     STRATEGY_MODE_HYBRID,
     STRATEGY_MODE_MEAN_REVERSION,
     STRATEGY_MODE_ML,
+    STRATEGY_MODE_ORB,
     STRATEGY_MODE_SMA,
     Strategy,
     StrategyConfig,
@@ -42,6 +44,7 @@ from strategy import (
     calculate_atr_percentile_series,
     calculate_hourly_regime_series,
     calculate_opening_range_series,
+    get_capped_breakout_stop_price,
     is_entry_window_open,
     normalize_strategy_mode,
     normalize_threshold_mode,
@@ -50,6 +53,9 @@ from strategy import (
     normalize_breakout_exit_style,
     normalize_mean_reversion_exit_style,
 )
+
+logger = logging.getLogger(__name__)
+_LOGGED_DATASET_SYMBOL_MESSAGES: set[tuple[str, str, tuple[str, ...]]] = set()
 
 
 DEFAULT_SMA_BARS = 20
@@ -133,8 +139,14 @@ class _BacktestInputs:
     orb_filter_mode: str
     breakout_exit_style: str
     breakout_tight_stop_fraction: float
+    breakout_max_stop_pct: float
+    breakout_gap_pct_min: float
+    breakout_or_range_pct_min: float
     mean_reversion_exit_style: str
     mean_reversion_max_atr_percentile: float
+    mean_reversion_stop_pct: float
+    mean_reversion_trend_filter: bool
+    mean_reversion_trend_slope_filter: bool
     regime_filter_enabled: bool
     atr_multiple: float
     atr_percentile_threshold: float
@@ -166,9 +178,14 @@ class _SimState:
     signal_reference_price: dict[str, float]
     breakout_trailing_high: dict[str, float]
     breakout_range_at_entry: dict[str, float]
+    breakout_stored_stop: dict[str, float]
     mean_reversion_target_price: dict[str, float]
     pending_buys: dict[str, tuple[float, pd.Timestamp]]
     pending_sells: set[str]
+    # ORB per-day state (one trade per symbol per day)
+    orb_entry_taken: dict[str, bool]
+    orb_last_day: dict[str, pd.Timestamp | None]
+    breakout_day_gap_pct: dict[str, float]
     # ML state
     ml_signals: dict[str, list[MlSignal | None]]
     # Accounting (mutated by _execute_buy / _execute_sell)
@@ -299,6 +316,45 @@ def _precompute_ml_signals(
     return precomputed
 
 
+def _summarize_ml_signals(
+    ml_signals: dict[str, list[MlSignal | None]],
+    symbol_strategies: dict[str, Strategy],
+) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for symbol, signals in ml_signals.items():
+        mode = symbol_strategies[symbol].config.strategy_mode
+        if mode not in (STRATEGY_MODE_ML, STRATEGY_MODE_HYBRID):
+            continue
+        valid_signals = [signal for signal in signals if signal is not None]
+        if not valid_signals:
+            summary[symbol] = {
+                "count": 0,
+                "min_prob": None,
+                "max_prob": None,
+                "mean_prob": None,
+                "buy_threshold": None,
+                "sell_threshold": None,
+                "above_buy_count": 0,
+                "below_sell_count": 0,
+            }
+            continue
+
+        probabilities = [signal.probability_up for signal in valid_signals]
+        buy_threshold = valid_signals[0].buy_threshold
+        sell_threshold = valid_signals[0].sell_threshold
+        summary[symbol] = {
+            "count": len(valid_signals),
+            "min_prob": min(probabilities),
+            "max_prob": max(probabilities),
+            "mean_prob": _mean(probabilities),
+            "buy_threshold": buy_threshold,
+            "sell_threshold": sell_threshold,
+            "above_buy_count": sum(probability >= buy_threshold for probability in probabilities),
+            "below_sell_count": sum(probability <= sell_threshold for probability in probabilities),
+        }
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Dataset I/O
 # ---------------------------------------------------------------------------
@@ -307,9 +363,48 @@ def load_dataset(dataset_path: Path) -> tuple[pd.DataFrame, dict]:
     bars_path = dataset_path / "bars.parquet"
     manifest_path = dataset_path / "manifest.json"
     df = pd.read_parquet(bars_path)
-    with open(manifest_path) as f:
-        manifest = json.load(f)
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    else:
+        manifest = {}
+        logger.warning("Dataset manifest not found at %s; symbol discovery will fall back to dataset content.", manifest_path)
     return df, manifest
+
+
+def _normalize_symbol_list(symbols: list[str] | None) -> list[str]:
+    if symbols is None:
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        normalized.append(symbol)
+    return normalized
+
+
+def _discover_dataset_symbols(
+    manifest: dict,
+    df: pd.DataFrame,
+    cli_symbols: list[str] | None,
+) -> tuple[list[str], str]:
+    available_symbols = _normalize_symbol_list(df["symbol"].dropna().astype(str).tolist())
+    if not available_symbols:
+        raise ValueError("Dataset contains no symbol rows after the requested date filtering.")
+
+    requested_symbols = _normalize_symbol_list(cli_symbols)
+    if requested_symbols:
+        return requested_symbols, "cli_override"
+
+    manifest_symbols = _normalize_symbol_list(manifest.get("symbols"))
+    if manifest_symbols:
+        return manifest_symbols, "dataset_metadata"
+
+    return available_symbols, "dataset_content"
 
 
 def _load_filtered_dataset(
@@ -339,10 +434,44 @@ def _load_filtered_dataset(
     if end_ts is not None:
         df = df[df["timestamp"] <= end_ts]
 
-    requested_symbols = symbols if symbols is not None else manifest["symbols"]
-    active_symbols = [symbol for symbol in requested_symbols if symbol in set(df["symbol"].unique())]
+    requested_symbols, symbol_source = _discover_dataset_symbols(manifest, df, symbols)
+    available_symbols = _normalize_symbol_list(df["symbol"].dropna().astype(str).tolist())
+    missing_symbols = [symbol for symbol in requested_symbols if symbol not in available_symbols]
+    active_symbols = [symbol for symbol in requested_symbols if symbol in available_symbols]
+
+    if missing_symbols and symbol_source == "cli_override":
+        raise ValueError(
+            "CLI symbol override contains symbols that are unavailable in the dataset/date range: "
+            f"{', '.join(missing_symbols)}. Available symbols: {', '.join(available_symbols)}"
+        )
     if not active_symbols:
-        raise ValueError("No symbols remain after filtering the dataset.")
+        raise ValueError(
+            "No symbols remain after filtering the dataset. "
+            f"Source={symbol_source}; requested={requested_symbols}; available={available_symbols}"
+        )
+
+    if missing_symbols:
+        logger.warning(
+            "Some %s symbols were unavailable after dataset/date filtering and will be skipped: %s",
+            symbol_source,
+            ", ".join(missing_symbols),
+        )
+    message_key = (str(dataset_path), symbol_source, tuple(active_symbols))
+    if message_key not in _LOGGED_DATASET_SYMBOL_MESSAGES:
+        logger.info(
+            "Loaded dataset symbols source=%s count=%d symbols=%s",
+            symbol_source,
+            len(active_symbols),
+            ", ".join(active_symbols),
+        )
+        print(
+            f"[dataset] symbol source={symbol_source} count={len(active_symbols)} symbols={', '.join(active_symbols)}"
+        )
+        if missing_symbols:
+            print(
+                f"[dataset] symbol source={symbol_source} skipped_unavailable={', '.join(missing_symbols)}"
+            )
+        _LOGGED_DATASET_SYMBOL_MESSAGES.add(message_key)
     df = df[df["symbol"].isin(active_symbols)].copy()
     return df, manifest, active_symbols
 
@@ -502,6 +631,7 @@ def _execute_sell(
     entry_cost: dict[str, float],
     breakout_trailing_high: dict[str, float],
     breakout_range_at_entry: dict[str, float],
+    breakout_stored_stop: dict[str, float],
     mean_reversion_target_price: dict[str, float],
     latest_mark_price: dict[str, float],
     position: dict[str, bool],
@@ -536,6 +666,7 @@ def _execute_sell(
     entry_cost[symbol] = 0.0
     breakout_trailing_high[symbol] = 0.0
     breakout_range_at_entry[symbol] = 0.0
+    breakout_stored_stop[symbol] = 0.0
     mean_reversion_target_price[symbol] = 0.0
     results["symbol_trade_counts"][symbol] += 1
     results["total_trades"] += 1
@@ -652,8 +783,14 @@ def _prepare_backtest_inputs(
     orb_filter_mode: str,
     breakout_exit_style: str,
     breakout_tight_stop_fraction: float,
+    breakout_max_stop_pct: float,
+    breakout_gap_pct_min: float,
+    breakout_or_range_pct_min: float,
     mean_reversion_exit_style: str,
     mean_reversion_max_atr_percentile: float,
+    mean_reversion_stop_pct: float,
+    mean_reversion_trend_filter: bool,
+    mean_reversion_trend_slope_filter: bool,
     ml_probability_buy: float,
     ml_probability_sell: float,
     entry_threshold_pct: float,
@@ -696,8 +833,14 @@ def _prepare_backtest_inputs(
             orb_filter_mode=orb_filter_mode,
             breakout_exit_style=breakout_exit_style,
             breakout_tight_stop_fraction=breakout_tight_stop_fraction,
+            breakout_max_stop_pct=breakout_max_stop_pct,
+            breakout_gap_pct_min=breakout_gap_pct_min,
+            breakout_or_range_pct_min=breakout_or_range_pct_min,
             mean_reversion_exit_style=mean_reversion_exit_style,
             mean_reversion_max_atr_percentile=mean_reversion_max_atr_percentile,
+            mean_reversion_stop_pct=mean_reversion_stop_pct,
+            mean_reversion_trend_filter=mean_reversion_trend_filter,
+            mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
         ))
         for symbol in resolved_symbols
     }
@@ -721,8 +864,14 @@ def _prepare_backtest_inputs(
         orb_filter_mode=orb_filter_mode,
         breakout_exit_style=breakout_exit_style,
         breakout_tight_stop_fraction=breakout_tight_stop_fraction,
+        breakout_max_stop_pct=breakout_max_stop_pct,
+        breakout_gap_pct_min=breakout_gap_pct_min,
+        breakout_or_range_pct_min=breakout_or_range_pct_min,
         mean_reversion_exit_style=mean_reversion_exit_style,
         mean_reversion_max_atr_percentile=mean_reversion_max_atr_percentile,
+        mean_reversion_stop_pct=mean_reversion_stop_pct,
+        mean_reversion_trend_filter=mean_reversion_trend_filter,
+        mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
         regime_filter_enabled=regime_filter_enabled,
         atr_multiple=atr_multiple,
         atr_percentile_threshold=atr_percentile_threshold,
@@ -743,6 +892,7 @@ def _initialize_simulation_state(
     results: dict[str, Any] = {
         "strategy_mode": inputs.strategy_mode,
         "symbol_strategy_modes": {s: inputs.symbol_strategies[s].config.strategy_mode for s in symbols},
+        "symbols": list(symbols),
         "time_window_mode": inputs.time_window_mode,
         "regime_filter_enabled": inputs.regime_filter_enabled,
         "orb_filter_mode": inputs.orb_filter_mode,
@@ -751,6 +901,10 @@ def _initialize_simulation_state(
         "mean_reversion_exit_style": inputs.mean_reversion_exit_style,
         "mean_reversion_max_atr_percentile": inputs.mean_reversion_max_atr_percentile,
         "threshold_mode": inputs.threshold_mode,
+        "sma_bars": None,
+        "entry_threshold_pct": inputs.entry_threshold_pct,
+        "ml_probability_buy": inputs.dummy_ml.buy_threshold,
+        "ml_probability_sell": inputs.dummy_ml.sell_threshold,
         "total_trades": 0,
         "realized_pnl": 0.0,
         "starting_capital": starting_capital,
@@ -845,9 +999,13 @@ def _initialize_simulation_state(
         signal_reference_price={s: 0.0 for s in symbols},
         breakout_trailing_high={s: 0.0 for s in symbols},
         breakout_range_at_entry={s: 0.0 for s in symbols},
+        breakout_stored_stop={s: 0.0 for s in symbols},
         mean_reversion_target_price={s: 0.0 for s in symbols},
         pending_buys={},
         pending_sells=set(),
+        orb_entry_taken={s: False for s in symbols},
+        orb_last_day={s: None for s in symbols},
+        breakout_day_gap_pct={s: 0.0 for s in symbols},
         ml_signals={s: [] for s in symbols},
         results=results,
         symbol_stats=symbol_stats,
@@ -939,6 +1097,7 @@ def _handle_pending_orders_at_time(
             entry_cost=state.entry_cost,
             breakout_trailing_high=state.breakout_trailing_high,
             breakout_range_at_entry=state.breakout_range_at_entry,
+            breakout_stored_stop=state.breakout_stored_stop,
             mean_reversion_target_price=state.mean_reversion_target_price,
             latest_mark_price=state.latest_mark_price,
             position=state.position,
@@ -985,10 +1144,20 @@ def _handle_pending_orders_at_time(
         symbol_strategy = symbol_strategies[symbol]
         if symbol_strategy.config.strategy_mode == STRATEGY_MODE_BREAKOUT:
             state.breakout_trailing_high[symbol] = fill_price
+            or_low = state.opening_range_low_arrs[symbol][p] or fill_price
             state.breakout_range_at_entry[symbol] = max(
                 0.0,
-                (state.opening_range_high_arrs[symbol][p] or fill_price)
-                - (state.opening_range_low_arrs[symbol][p] or fill_price),
+                (state.opening_range_high_arrs[symbol][p] or fill_price) - or_low,
+            )
+            state.breakout_stored_stop[symbol] = get_capped_breakout_stop_price(
+                fill_price,
+                or_low,
+                symbol_strategy.config.breakout_max_stop_pct,
+            )
+            logger.info(
+                "breakout entry symbol=%s entry=%.4f or_low=%.4f capped_stop=%.4f dist_pct=%.2f%%",
+                symbol, fill_price, or_low, state.breakout_stored_stop[symbol],
+                (fill_price - state.breakout_stored_stop[symbol]) / fill_price * 100,
             )
         elif symbol_strategy.config.strategy_mode == STRATEGY_MODE_MEAN_REVERSION:
             current_sma = (
@@ -997,6 +1166,8 @@ def _handle_pending_orders_at_time(
                 else fill_price
             )
             state.mean_reversion_target_price[symbol] = (fill_price + current_sma) / 2.0
+        elif symbol_strategy.config.strategy_mode == STRATEGY_MODE_ORB:
+            state.orb_entry_taken[symbol] = True
         state.results["max_concurrent_positions"] = max(
             state.results["max_concurrent_positions"], sum(state.position.values())
         )
@@ -1029,11 +1200,32 @@ def _process_bar(
     effective_strategy_mode = symbol_strategy.config.strategy_mode
     state.latest_mark_price[symbol] = float(row["close"])
 
-    min_history_bars = 2 if effective_strategy_mode == STRATEGY_MODE_BREAKOUT else sma_bars
+    min_history_bars = 2 if effective_strategy_mode in (STRATEGY_MODE_BREAKOUT, STRATEGY_MODE_ORB) else sma_bars
     if p < min_history_bars - 1:
         return cash
 
+    # Reset ORB one-trade-per-day flag at the start of each new trading day.
+    current_day = state.day_key_arrs[symbol][p]
+    if current_day != state.orb_last_day[symbol]:
+        state.orb_entry_taken[symbol] = False
+        state.orb_last_day[symbol] = current_day
+        if p > 0:
+            prev_close = closes[p - 1]
+            state.breakout_day_gap_pct[symbol] = (
+                (float(row["open"]) - prev_close) / prev_close if prev_close > 0 else 0.0
+            )
+        else:
+            state.breakout_day_gap_pct[symbol] = 0.0
+
     sma = _mean(closes[p - sma_bars + 1: p + 1]) if p >= sma_bars - 1 else closes[p]
+    trend_sma = _mean(closes[p - 49: p + 1]) if p >= 49 else None
+    # Slope = SMA_50 now minus SMA_50 five bars ago (75 min on 15-min bars).
+    # Positive means the 50-bar average is rising; negative means it's falling.
+    trend_sma_slope = (
+        trend_sma - _mean(closes[p - 54: p - 4])
+        if p >= 54 and trend_sma is not None
+        else None
+    )
     price = closes[p]
 
     if state.position[symbol] and effective_strategy_mode == STRATEGY_MODE_BREAKOUT:
@@ -1093,6 +1285,11 @@ def _process_bar(
         volatility_ratio=volatility_ratio,
         trailing_stop_price=trailing_stop_price,
         mean_reversion_target_price=state.mean_reversion_target_price[symbol] if state.position[symbol] else None,
+        breakout_already_taken=state.orb_entry_taken[symbol],
+        effective_stop_price=state.breakout_stored_stop[symbol] if state.position[symbol] and state.breakout_stored_stop[symbol] > 0 else None,
+        gap_pct=state.breakout_day_gap_pct[symbol],
+        trend_sma=trend_sma,
+        trend_sma_slope=trend_sma_slope,
     )
 
     has_next_bar = p + 1 < len(state.symbols_dfs[symbol])
@@ -1115,7 +1312,7 @@ def _process_bar(
         ) or (
             effective_strategy_mode == STRATEGY_MODE_MEAN_REVERSION
             and symbol_strategy.config.mean_reversion_exit_style == MEAN_REVERSION_EXIT_EOD
-        ):
+        ) or effective_strategy_mode == STRATEGY_MODE_ORB:
             fill_price = float(row["close"]) - slippage
             cash = _execute_sell(
                 results=state.results,
@@ -1129,6 +1326,7 @@ def _process_bar(
                 entry_cost=state.entry_cost,
                 breakout_trailing_high=state.breakout_trailing_high,
                 breakout_range_at_entry=state.breakout_range_at_entry,
+                breakout_stored_stop=state.breakout_stored_stop,
                 mean_reversion_target_price=state.mean_reversion_target_price,
                 latest_mark_price=state.latest_mark_price,
                 position=state.position,
@@ -1170,6 +1368,7 @@ def _finalize_simulation(
                 entry_cost=state.entry_cost,
                 breakout_trailing_high=state.breakout_trailing_high,
                 breakout_range_at_entry=state.breakout_range_at_entry,
+                breakout_stored_stop=state.breakout_stored_stop,
                 mean_reversion_target_price=state.mean_reversion_target_price,
                 latest_mark_price=state.latest_mark_price,
                 position=state.position,
@@ -1272,8 +1471,14 @@ def run_backtest(
     orb_filter_mode: str = ORB_FILTER_NONE,
     breakout_exit_style: str = BREAKOUT_EXIT_TARGET_1X_STOP_LOW,
     breakout_tight_stop_fraction: float = 0.5,
+    breakout_max_stop_pct: float = 0.03,
+    breakout_gap_pct_min: float = 0.0,
+    breakout_or_range_pct_min: float = 0.0,
     mean_reversion_exit_style: str = MEAN_REVERSION_EXIT_SMA,
     mean_reversion_max_atr_percentile: float = 0.0,
+    mean_reversion_stop_pct: float = 0.0,
+    mean_reversion_trend_filter: bool = False,
+    mean_reversion_trend_slope_filter: bool = False,
     starting_capital: float = DEFAULT_STARTING_CAPITAL,
     position_size: float = DEFAULT_POSITION_SIZE,
     start_date: str | None = None,
@@ -1300,8 +1505,14 @@ def run_backtest(
         orb_filter_mode=orb_filter_mode,
         breakout_exit_style=breakout_exit_style,
         breakout_tight_stop_fraction=breakout_tight_stop_fraction,
+        breakout_max_stop_pct=breakout_max_stop_pct,
+        breakout_gap_pct_min=breakout_gap_pct_min,
+        breakout_or_range_pct_min=breakout_or_range_pct_min,
         mean_reversion_exit_style=mean_reversion_exit_style,
         mean_reversion_max_atr_percentile=mean_reversion_max_atr_percentile,
+        mean_reversion_stop_pct=mean_reversion_stop_pct,
+        mean_reversion_trend_filter=mean_reversion_trend_filter,
+        mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
         ml_probability_buy=ml_probability_buy,
         ml_probability_sell=ml_probability_sell,
         entry_threshold_pct=entry_threshold_pct,
@@ -1332,6 +1543,20 @@ def run_backtest(
         ml_probability_sell,
     )
     ml_precompute_seconds = perf_counter() - ml_precompute_start
+    ml_signal_summary = _summarize_ml_signals(state.ml_signals, inputs.symbol_strategies)
+    for symbol, summary in ml_signal_summary.items():
+        logger.info(
+            "ML precompute symbol=%s count=%s min=%.3f max=%.3f mean=%.3f buy_thr=%.3f sell_thr=%.3f above_buy=%s below_sell=%s",
+            symbol,
+            summary["count"],
+            summary["min_prob"] if summary["min_prob"] is not None else float("nan"),
+            summary["max_prob"] if summary["max_prob"] is not None else float("nan"),
+            summary["mean_prob"] if summary["mean_prob"] is not None else float("nan"),
+            summary["buy_threshold"] if summary["buy_threshold"] is not None else float("nan"),
+            summary["sell_threshold"] if summary["sell_threshold"] is not None else float("nan"),
+            summary["above_buy_count"],
+            summary["below_sell_count"],
+        )
 
     cash = starting_capital
     skipped_trades = 0
@@ -1432,6 +1657,7 @@ def run_backtest(
         "finalize": perf_counter() - finalize_start,
         "total": perf_counter() - total_start,
     }
+    results["ml_signal_summary"] = ml_signal_summary
     timing = results["timing_seconds"]
     print(
         "[timing] "
@@ -1443,6 +1669,7 @@ def run_backtest(
         f"finalize={timing['finalize']:.3f}s "
         f"total={timing['total']:.3f}s"
     )
+    results["sma_bars"] = sma_bars
     return results
 
 
@@ -1456,6 +1683,7 @@ def extract_clean_columns(result_dict: dict) -> dict:
         "strategy_mode", "time_window_mode", "regime_filter_enabled", "threshold_mode",
         "entry_threshold_pct", "atr_multiple", "atr_percentile_threshold", "sma_bars", "orb_filter_mode",
         "breakout_exit_style", "breakout_tight_stop_fraction", "mean_reversion_exit_style", "mean_reversion_max_atr_percentile",
+        "ml_probability_buy", "ml_probability_sell",
         "total_return_pct", "max_drawdown_pct",
         "total_trades", "total_buy_candidates", "skipped_trades",
         "competing_timestamps", "max_concurrent_positions",
@@ -2212,6 +2440,26 @@ def _print_single_result(results: dict) -> None:
     print(f"Avg Move Captured:      {results['avg_move_captured_pct']:.2f}%")
     print(f"Average Winning Trade:  ${results['avg_winning_trade']:.2f}")
     print(f"Average Losing Trade:   ${results['avg_losing_trade']:.2f}")
+    if results.get("ml_signal_summary"):
+        print("ML Signal Summary:")
+        for symbol, summary in results["ml_signal_summary"].items():
+            min_prob = summary["min_prob"]
+            max_prob = summary["max_prob"]
+            mean_prob = summary["mean_prob"]
+            buy_threshold = summary["buy_threshold"]
+            sell_threshold = summary["sell_threshold"]
+            min_text = f"{min_prob:.3f}" if min_prob is not None else "n/a"
+            max_text = f"{max_prob:.3f}" if max_prob is not None else "n/a"
+            mean_text = f"{mean_prob:.3f}" if mean_prob is not None else "n/a"
+            buy_text = f"{buy_threshold:.3f}" if buy_threshold is not None else "n/a"
+            sell_text = f"{sell_threshold:.3f}" if sell_threshold is not None else "n/a"
+            print(
+                f"  {symbol}: "
+                f"count={summary['count']} "
+                f"min={min_text} max={max_text} mean={mean_text} "
+                f"buy_thr={buy_text} sell_thr={sell_text} "
+                f"above_buy={summary['above_buy_count']} below_sell={summary['below_sell_count']}"
+            )
     if results.get("timing_seconds"):
         timing = results["timing_seconds"]
         print(
@@ -2251,7 +2499,11 @@ def _print_regime_results(results_list: list[dict]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a backtest on a historical dataset.")
     parser.add_argument("--dataset", required=True, help="Path to dataset directory")
-    parser.add_argument("--symbols", nargs="*", help="Symbols to backtest (default: all in manifest)")
+    parser.add_argument(
+        "--symbols",
+        nargs="*",
+        help="Optional symbol override for debugging. Default: discover from manifest metadata, then dataset content.",
+    )
     parser.add_argument("--strategy-mode", default=STRATEGY_MODE_HYBRID,
                         help=f"Strategy mode (default: {STRATEGY_MODE_HYBRID})")
     parser.add_argument("--strategy-mode-list",
@@ -2285,11 +2537,23 @@ def main() -> None:
     parser.add_argument("--breakout-exit-style-list",
                         help="Comma-separated breakout exit styles to compare")
     parser.add_argument("--breakout-tight-stop-fraction", type=float, default=0.5)
+    parser.add_argument("--breakout-max-stop-pct", type=float, default=0.03,
+                        help="Cap breakout stop as fraction of entry price (default: 0.03 = 3%%)")
+    parser.add_argument("--breakout-gap-pct-min", type=float, default=0.0,
+                        help="Min gap-up %% required for breakout entry (default: 0 = off)")
+    parser.add_argument("--breakout-or-range-pct-min", type=float, default=0.0,
+                        help="Min OR range %% of OR low required for breakout entry (default: 0 = off)")
     parser.add_argument("--mean-reversion-exit-style", default=MEAN_REVERSION_EXIT_SMA,
                         help="Mean reversion exit style")
     parser.add_argument("--mean-reversion-exit-style-list",
                         help="Comma-separated mean reversion exit styles to compare")
     parser.add_argument("--mean-reversion-max-atr-percentile", type=float, default=0.0)
+    parser.add_argument("--mean-reversion-stop-pct", type=float, default=0.0,
+                        help="Exit if price falls N%% below entry (default: 0 = disabled, e.g. 0.02 = 2%%)")
+    parser.add_argument("--mean-reversion-trend-filter", action="store_true", default=False,
+                        help="Only enter mean reversion trades when price >= 50-bar SMA (uptrend filter)")
+    parser.add_argument("--mean-reversion-trend-slope-filter", action="store_true", default=False,
+                        help="Only enter mean reversion trades when SMA_50 slope >= 0 (rising trend filter)")
     parser.add_argument("--mean-reversion-max-atr-percentile-list",
                         help="Comma-separated max ATR percentile values for mean reversion entry")
     parser.add_argument("--ml-lookback-bars", type=int, default=DEFAULT_ML_LOOKBACK_BARS)
@@ -2423,8 +2687,14 @@ def main() -> None:
         orb_filter_mode=args.orb_filter_mode,
         breakout_exit_style=args.breakout_exit_style,
         breakout_tight_stop_fraction=args.breakout_tight_stop_fraction,
+        breakout_max_stop_pct=args.breakout_max_stop_pct,
+        breakout_gap_pct_min=args.breakout_gap_pct_min,
+        breakout_or_range_pct_min=args.breakout_or_range_pct_min,
         mean_reversion_exit_style=args.mean_reversion_exit_style,
         mean_reversion_max_atr_percentile=args.mean_reversion_max_atr_percentile,
+        mean_reversion_stop_pct=args.mean_reversion_stop_pct,
+        mean_reversion_trend_filter=args.mean_reversion_trend_filter,
+        mean_reversion_trend_slope_filter=args.mean_reversion_trend_slope_filter,
         ml_lookback_bars=args.ml_lookback_bars,
         ml_retrain_every_bars=args.ml_retrain_every_bars,
         ml_probability_buy=args.ml_probability_buy,

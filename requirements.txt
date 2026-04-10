@@ -5,3 +5,4 @@ streamlit
 pandas
 pyarrow
 scikit-learn
+plotly

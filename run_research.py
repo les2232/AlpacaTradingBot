@@ -10,6 +10,7 @@ Automated research pipeline:
 
 Usage:
     python run_research.py
+    python run_research.py --dataset datasets\\YOUR_DATASET
 
 Edit the SNAPSHOT CONFIG and SWEEP CONFIG sections below to change parameters.
 All paths are resolved relative to this script's directory, not the shell CWD.
@@ -26,6 +27,7 @@ This script is intentionally different from run_compare_suite.ps1:
   - run_compare_suite.ps1 is the fixed benchmark suite for repeatable comparisons
 """
 
+import argparse
 import json
 import subprocess
 import sys
@@ -42,9 +44,28 @@ import pandas as pd
 SCRIPT_DIR           = Path(__file__).resolve().parent
 DATASETS_DIR         = SCRIPT_DIR / "datasets"
 RESULTS_DIR          = SCRIPT_DIR / "results"
+CONFIG_DIR           = SCRIPT_DIR / "config"
 BEST_CONFIG_PATH      = RESULTS_DIR / "best_config_latest.json"
 STABILITY_REPORT_PATH = RESULTS_DIR / "stability_report.json"
 TRADE_DECISION_PATH   = RESULTS_DIR / "trade_decision.json"
+LIVE_CONFIG_PATH      = CONFIG_DIR / "live_config.json"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the research workflow with fresh snapshots by default, or reuse an existing "
+            "dataset with --dataset."
+        )
+    )
+    parser.add_argument(
+        "--dataset",
+        help=(
+            "Optional existing dataset directory. When provided, run research directly against "
+            "that dataset instead of creating fresh snapshots."
+        ),
+    )
+    return parser.parse_args()
 
 # ---------------------------------------------------------------------------
 # SNAPSHOT CONFIG
@@ -138,7 +159,7 @@ def _log(msg: str) -> None:
 
 def _section(title: str) -> None:
     """Print a visible section header to break up dense subprocess output."""
-    bar = "─" * 60
+    bar = "-" * 60
     print(f"\n{bar}", flush=True)
     print(f"  {title}", flush=True)
     print(bar, flush=True)
@@ -297,12 +318,18 @@ CONFIG_COLS = [
     "strategy_mode",
     "sma_bars",
     "entry_threshold_pct",
+    "ml_probability_buy",
+    "ml_probability_sell",
     "threshold_mode",
+    "atr_multiple",
+    "atr_percentile_threshold",
     "time_window_mode",
     "regime_filter_enabled",
     "orb_filter_mode",
     "breakout_exit_style",
+    "breakout_tight_stop_fraction",
     "mean_reversion_exit_style",
+    "mean_reversion_max_atr_percentile",
 ]
 
 METRIC_COLS = [
@@ -478,6 +505,163 @@ def step_save_best_config(
     _ensure_dir(output_path.parent)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     _log(f"Best config : {output_path}")
+
+
+def _load_dataset_manifest_and_bars(dataset_path: Path) -> tuple[dict, pd.DataFrame]:
+    manifest_path = dataset_path / "manifest.json"
+    bars_path = dataset_path / "bars.parquet"
+    manifest: dict = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not bars_path.exists():
+        raise RuntimeError(f"Dataset bars file not found: {bars_path}")
+    df = pd.read_parquet(bars_path, columns=["symbol"])
+    return manifest, df
+
+
+def _normalize_symbols(symbols: list[str] | None) -> list[str]:
+    if symbols is None:
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        normalized.append(symbol)
+    return normalized
+
+
+def _coerce_boolish(value: object, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    raise RuntimeError(f"Expected boolean-like value for {field_name}, got {value!r}")
+
+
+def _resolve_dataset_symbols(dataset_path: Path) -> tuple[list[str], str, dict]:
+    manifest, df = _load_dataset_manifest_and_bars(dataset_path)
+    manifest_symbols = _normalize_symbols(manifest.get("symbols"))
+    if manifest_symbols:
+        return manifest_symbols, "dataset_metadata", manifest
+
+    content_symbols = _normalize_symbols(df["symbol"].dropna().astype(str).tolist())
+    if content_symbols:
+        return content_symbols, "dataset_content", manifest
+
+    raise RuntimeError(f"Unable to resolve symbols from dataset at {dataset_path}")
+
+
+def _parse_timeframe_to_minutes(timeframe_text: str) -> int:
+    normalized = timeframe_text.strip().lower()
+    suffix_to_minutes = {
+        "minutes": 1,
+        "minute": 1,
+        "mins": 1,
+        "min": 1,
+        "hours": 60,
+        "hour": 60,
+        "days": 390,
+        "day": 390,
+    }
+    for suffix, multiplier in suffix_to_minutes.items():
+        if normalized.endswith(suffix):
+            amount_text = normalized[: -len(suffix)].strip()
+            if amount_text.isdigit() and int(amount_text) > 0:
+                return int(amount_text) * multiplier
+    raise RuntimeError(f"Unsupported dataset timeframe for live config: {timeframe_text!r}")
+
+
+def _log_dataset_details(dataset_path: Path, *, context: str) -> None:
+    symbols, symbol_source, manifest = _resolve_dataset_symbols(dataset_path)
+    timeframe = manifest.get("timeframe", "unknown")
+    _log(f"{context} dataset    : {dataset_path}")
+    _log(f"{context} symbols    : {', '.join(symbols)}")
+    _log(f"{context} sym source : {symbol_source}")
+    _log(f"{context} timeframe  : {timeframe}")
+
+
+def step_write_live_config(
+    best_row: dict,
+    dataset_path: Path,
+    output_path: Path,
+    approved: bool,
+    rejection_reasons: list[str],
+) -> None:
+    symbols, symbol_source, manifest = _resolve_dataset_symbols(dataset_path)
+    timeframe_text = str(manifest.get("timeframe") or "").strip()
+    if not timeframe_text:
+        raise RuntimeError(f"Dataset manifest is missing timeframe: {dataset_path / 'manifest.json'}")
+
+    required = [
+        "strategy_mode",
+        "threshold_mode",
+        "time_window_mode",
+        "regime_filter_enabled",
+        "orb_filter_mode",
+        "breakout_exit_style",
+        "breakout_tight_stop_fraction",
+        "mean_reversion_exit_style",
+        "mean_reversion_max_atr_percentile",
+        "atr_multiple",
+        "atr_percentile_threshold",
+        "ml_probability_buy",
+        "ml_probability_sell",
+    ]
+    missing = [key for key in required if key not in best_row]
+    if missing:
+        raise RuntimeError(f"Cannot write live config; best result is missing fields: {missing}")
+
+    runtime = {
+        "symbols": symbols,
+        "bar_timeframe_minutes": _parse_timeframe_to_minutes(timeframe_text),
+        "strategy_mode": best_row["strategy_mode"],
+        "sma_bars": int(best_row["sma_bars"]) if pd.notna(best_row.get("sma_bars")) else None,
+        "entry_threshold_pct": (
+            float(best_row["entry_threshold_pct"])
+            if pd.notna(best_row.get("entry_threshold_pct"))
+            else None
+        ),
+        "ml_probability_buy": float(best_row["ml_probability_buy"]),
+        "ml_probability_sell": float(best_row["ml_probability_sell"]),
+        "threshold_mode": best_row["threshold_mode"],
+        "atr_multiple": float(best_row["atr_multiple"]),
+        "atr_percentile_threshold": float(best_row["atr_percentile_threshold"]),
+        "time_window_mode": best_row["time_window_mode"],
+        "regime_filter_enabled": _coerce_boolish(best_row["regime_filter_enabled"], "regime_filter_enabled"),
+        "orb_filter_mode": best_row["orb_filter_mode"],
+        "breakout_exit_style": best_row["breakout_exit_style"],
+        "breakout_tight_stop_fraction": float(best_row["breakout_tight_stop_fraction"]),
+        "mean_reversion_exit_style": best_row["mean_reversion_exit_style"],
+        "mean_reversion_max_atr_percentile": float(best_row["mean_reversion_max_atr_percentile"]),
+    }
+
+    payload = {
+        "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": {
+            "dataset": str(dataset_path),
+            "dataset_symbol_source": symbol_source,
+            "approved": approved,
+            "rejection_reasons": rejection_reasons,
+        },
+        "runtime": runtime,
+    }
+
+    _ensure_dir(output_path.parent)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _log(
+        f"Live config  : {output_path} "
+        f"(symbols from {symbol_source}: {', '.join(symbols)})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -814,46 +998,82 @@ def _report_outputs(output_csv: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    args = parse_args()
     _section("run_research.py  —  starting")
 
-    n = len(VALIDATION_WINDOWS)
-    _log(f"Validation windows : {VALIDATION_WINDOWS} days ({n} windows)")
     _log(f"Best config target : {BEST_CONFIG_PATH}")
     _log(f"Stability report   : {STABILITY_REPORT_PATH}")
     _log(f"Trade decision     : {TRADE_DECISION_PATH}")
+    _log(f"Live config target : {LIVE_CONFIG_PATH}")
 
     window_results: list[dict] = []
-    primary_sweep_csv: Path | None = None   # longest window — used for _report_outputs
+    primary_sweep_csv: Path | None = None
 
     try:
-        # ── Phase 1: run snapshot + backtest + rank for every window ──────
-        for i, days in enumerate(VALIDATION_WINDOWS, 1):
-            _section(f"Window {i} of {n} ({days} days) — Snapshot")
-            dataset_path = step_snapshot(days)
+        if args.dataset:
+            dataset_path = Path(args.dataset)
+            if not dataset_path.exists() or not dataset_path.is_dir():
+                raise RuntimeError(f"Provided dataset path does not exist or is not a directory: {dataset_path}")
 
-            sweep_csv       = _timestamped_csv(RESULTS_DIR, f"research_{days}d")
-            leaderboard_csv = _timestamped_csv(RESULTS_DIR, f"leaderboard_{days}d")
+            _log("Research mode      : existing dataset")
+            _log_dataset_details(dataset_path, context="Existing")
 
-            _section(f"Window {i} of {n} ({days} days) — Backtest")
+            sweep_csv = _timestamped_csv(RESULTS_DIR, "research_dataset")
+            leaderboard_csv = _timestamped_csv(RESULTS_DIR, "leaderboard_dataset")
+
+            _section("Existing Dataset — Backtest")
             step_backtest(sweep_csv, dataset_path)
 
-            _section(f"Window {i} of {n} ({days} days) — Rank")
+            _section("Existing Dataset — Rank")
             best_row = step_rank_results(sweep_csv, leaderboard_csv)
 
             window_results.append({
-                "lookback_days": days,
-                "dataset":       dataset_path,
-                "sweep_csv":     sweep_csv,
-                "best_row":      best_row,
+                "lookback_days": 0,
+                "dataset": dataset_path,
+                "sweep_csv": sweep_csv,
+                "best_row": best_row,
             })
+            primary_sweep_csv = sweep_csv
+        else:
+            n = len(VALIDATION_WINDOWS)
+            _log("Research mode      : fresh snapshots")
+            _log(f"Validation windows : {VALIDATION_WINDOWS} days ({n} windows)")
+            _log(f"Snapshot symbols   : {', '.join(SNAPSHOT_SYMBOLS)}")
 
-            if days == VALIDATION_WINDOWS[-1]:
-                primary_sweep_csv = sweep_csv
+            # ── Phase 1: run snapshot + backtest + rank for every window ──────
+            for i, days in enumerate(VALIDATION_WINDOWS, 1):
+                _section(f"Window {i} of {n} ({days} days) — Snapshot")
+                dataset_path = step_snapshot(days)
+                _log_dataset_details(dataset_path, context=f"Window {days}d")
+
+                sweep_csv = _timestamped_csv(RESULTS_DIR, f"research_{days}d")
+                leaderboard_csv = _timestamped_csv(RESULTS_DIR, f"leaderboard_{days}d")
+
+                _section(f"Window {i} of {n} ({days} days) — Backtest")
+                step_backtest(sweep_csv, dataset_path)
+
+                _section(f"Window {i} of {n} ({days} days) — Rank")
+                best_row = step_rank_results(sweep_csv, leaderboard_csv)
+
+                window_results.append({
+                    "lookback_days": days,
+                    "dataset": dataset_path,
+                    "sweep_csv": sweep_csv,
+                    "best_row": best_row,
+                })
+
+                if days == VALIDATION_WINDOWS[-1]:
+                    primary_sweep_csv = sweep_csv
 
         # ── Phase 2: approve using the longest (most data-rich) window ────
         primary = window_results[-1]
+        approval_label = (
+            f"{primary['lookback_days']}-day window (primary)"
+            if primary["lookback_days"] > 0
+            else "existing dataset (primary)"
+        )
 
-        _section(f"Approval — {primary['lookback_days']}-day window (primary)")
+        _section(f"Approval — {approval_label}")
         approved, rejection_reasons = step_approve_config(primary["best_row"])
 
         _section("Save best config")
@@ -863,6 +1083,12 @@ def main() -> None:
         )
 
         # ── Phase 3: stability evaluation across all windows ──────────────
+        _section("Promote runtime config")
+        step_write_live_config(
+            primary["best_row"], primary["dataset"],
+            LIVE_CONFIG_PATH, approved, rejection_reasons,
+        )
+
         _section("Stability evaluation")
         stability = step_evaluate_stability(window_results)
 

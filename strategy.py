@@ -17,12 +17,14 @@ STRATEGY_MODE_ML = "ml"
 STRATEGY_MODE_HYBRID = "hybrid"
 STRATEGY_MODE_BREAKOUT = "breakout"
 STRATEGY_MODE_MEAN_REVERSION = "mean_reversion"
+STRATEGY_MODE_ORB = "orb"
 STRATEGY_MODE_CHOICES = (
     STRATEGY_MODE_SMA,
     STRATEGY_MODE_ML,
     STRATEGY_MODE_HYBRID,
     STRATEGY_MODE_BREAKOUT,
     STRATEGY_MODE_MEAN_REVERSION,
+    STRATEGY_MODE_ORB,
 )
 ORB_FILTER_NONE = "none"
 ORB_FILTER_VOLUME_OR_VOLATILITY = "volume_or_volatility"
@@ -218,6 +220,28 @@ def calculate_hourly_regime_series(
     return [None if pd.isna(value) else bool(value) for value in merged["bullish"]]
 
 
+def get_capped_breakout_stop_price(
+    entry_price: float,
+    opening_range_low: float,
+    breakout_max_stop_pct: float,
+) -> float:
+    """Return the effective breakout stop price.
+
+    The stop is OR low, raised to a floor of entry_price * (1 - breakout_max_stop_pct)
+    so that a very wide opening range cannot produce an outsized loss.
+
+    Args:
+        entry_price: actual fill price at entry.
+        opening_range_low: low of the opening range for this day.
+        breakout_max_stop_pct: maximum tolerated loss as a fraction (e.g. 0.03 = 3%).
+
+    Returns:
+        max(opening_range_low, entry_price * (1 - breakout_max_stop_pct))
+    """
+    max_stop_floor = entry_price * (1.0 - breakout_max_stop_pct)
+    return max(opening_range_low, max_stop_floor)
+
+
 def calculate_opening_range_series(
     timestamps: list[pd.Timestamp],
     highs: list[float],
@@ -327,10 +351,21 @@ class StrategyConfig:
     regime_filter_enabled: bool = False
     orb_target_multiple: float = 1.0
     orb_filter_mode: str = ORB_FILTER_NONE
+    # ORB mode parameters
+    orb_entry_buffer_pct: float = 0.0015   # 0.15% above OR high required before entry
+    orb_min_or_size_pct: float = 0.003     # skip if OR is narrower than 0.3% (flat open)
+    orb_max_or_size_pct: float = 0.03      # skip if OR is wider than 3% (binary event)
+    orb_hard_stop_pct: float = 0.015       # exit if price drops 1.5% below entry
     breakout_exit_style: str = BREAKOUT_EXIT_TARGET_1X_STOP_LOW
     breakout_tight_stop_fraction: float = 0.5
+    breakout_max_stop_pct: float = 0.03    # cap per-trade stop at 3% of entry price
+    breakout_gap_pct_min: float = 0.0     # 0 = off; require gap-up >= N% (e.g. 0.003 = 0.3%)
+    breakout_or_range_pct_min: float = 0.0  # 0 = off; require OR width >= N% of OR low
     mean_reversion_exit_style: str = MEAN_REVERSION_EXIT_SMA
     mean_reversion_max_atr_percentile: float = 0.0
+    mean_reversion_stop_pct: float = 0.0   # 0 = disabled; e.g. 0.02 = exit if price falls 2% below entry
+    mean_reversion_trend_filter: bool = False       # when True, skip entries where price < 50-bar SMA
+    mean_reversion_trend_slope_filter: bool = False # when True, skip entries where SMA_50 slope < 0
 
 
 @dataclass(frozen=True)
@@ -408,6 +443,24 @@ class Strategy:
             )
         raise ValueError(f"Unsupported ORB filter mode: {self.config.orb_filter_mode}")
 
+    def _breakout_gap_allows_entry(self, gap_pct: float | None) -> bool:
+        threshold = self.config.breakout_gap_pct_min
+        if threshold <= 0:
+            return True
+        return gap_pct is not None and gap_pct >= threshold
+
+    def _breakout_or_range_allows_entry(
+        self,
+        opening_range_high: float | None,
+        opening_range_low: float | None,
+    ) -> bool:
+        threshold = self.config.breakout_or_range_pct_min
+        if threshold <= 0:
+            return True
+        if opening_range_high is None or opening_range_low is None or opening_range_low <= 0:
+            return False
+        return (opening_range_high - opening_range_low) / opening_range_low >= threshold
+
     def _mean_reversion_entry_allowed(self, atr_percentile: float | None) -> bool:
         max_threshold = self.config.mean_reversion_max_atr_percentile
         if max_threshold <= 0:
@@ -431,6 +484,11 @@ class Strategy:
         volatility_ratio: float | None = None,
         trailing_stop_price: float | None = None,
         mean_reversion_target_price: float | None = None,
+        breakout_already_taken: bool = False,
+        effective_stop_price: float | None = None,
+        gap_pct: float | None = None,
+        trend_sma: float | None = None,
+        trend_sma_slope: float | None = None,
     ) -> str:
         mode = normalize_strategy_mode(self.config.strategy_mode)
 
@@ -487,6 +545,8 @@ class Strategy:
                 and time_window_open
                 and self._regime_allows_entry(bullish_regime)
                 and self._orb_filter_allows_entry(volume_ratio, volatility_ratio)
+                and self._breakout_gap_allows_entry(gap_pct)
+                and self._breakout_or_range_allows_entry(opening_range_high, opening_range_low)
             ):
                 return "BUY"
             if holding and position_entry_price is not None and orb_range is not None and orb_range > 0:
@@ -495,9 +555,9 @@ class Strategy:
                 stop_price = None
                 if breakout_exit_style == BREAKOUT_EXIT_TARGET_1_5X_STOP_LOW:
                     target_multiple = 1.5
-                    stop_price = opening_range_low
+                    stop_price = effective_stop_price if effective_stop_price is not None else opening_range_low
                 elif breakout_exit_style == BREAKOUT_EXIT_TARGET_1X_STOP_LOW:
-                    stop_price = opening_range_low
+                    stop_price = effective_stop_price if effective_stop_price is not None else opening_range_low
                 elif breakout_exit_style == BREAKOUT_EXIT_TARGET_1X_TIGHT_STOP:
                     stop_price = position_entry_price - (self.config.breakout_tight_stop_fraction * orb_range)
                 elif breakout_exit_style == BREAKOUT_EXIT_EOD_ONLY:
@@ -519,6 +579,16 @@ class Strategy:
 
         if mode == STRATEGY_MODE_MEAN_REVERSION:
             reversion_entry_price = self._reversion_threshold_price(sma, atr_pct)
+            trend_filter_ok = (
+                not self.config.mean_reversion_trend_filter
+                or trend_sma is None
+                or price >= trend_sma
+            )
+            slope_filter_ok = (
+                not self.config.mean_reversion_trend_slope_filter
+                or trend_sma_slope is None
+                or trend_sma_slope >= 0
+            )
             if (
                 reversion_entry_price is not None
                 and price < reversion_entry_price
@@ -527,9 +597,17 @@ class Strategy:
                 and self._mean_reversion_entry_allowed(atr_percentile)
                 and time_window_open
                 and self._regime_allows_entry(bullish_regime)
+                and trend_filter_ok
+                and slope_filter_ok
             ):
                 return "BUY"
             if holding:
+                if (
+                    self.config.mean_reversion_stop_pct > 0
+                    and position_entry_price is not None
+                    and price <= position_entry_price * (1.0 - self.config.mean_reversion_stop_pct)
+                ):
+                    return "SELL"
                 mean_reversion_exit_style = normalize_mean_reversion_exit_style(self.config.mean_reversion_exit_style)
                 if mean_reversion_exit_style == MEAN_REVERSION_EXIT_SMA and price >= sma:
                     return "SELL"
@@ -545,6 +623,31 @@ class Strategy:
                     raise ValueError(
                         f"Unsupported mean reversion exit style: {self.config.mean_reversion_exit_style}"
                     )
+            return "HOLD"
+
+        if mode == STRATEGY_MODE_ORB:
+            if opening_range_high is None or opening_range_low is None:
+                return "HOLD"
+
+            orb_range = opening_range_high - opening_range_low
+            orb_range_pct = orb_range / opening_range_low if opening_range_low > 0 else 0.0
+            or_size_ok = self.config.orb_min_or_size_pct <= orb_range_pct <= self.config.orb_max_or_size_pct
+
+            if not holding and not breakout_already_taken and or_size_ok:
+                entry_level = opening_range_high * (1.0 + self.config.orb_entry_buffer_pct)
+                if (
+                    price > entry_level
+                    and time_window_open
+                    and self._regime_allows_entry(bullish_regime)
+                    and self._orb_filter_allows_entry(volume_ratio, volatility_ratio)
+                ):
+                    return "BUY"
+
+            if holding and position_entry_price is not None:
+                hard_stop = position_entry_price * (1.0 - self.config.orb_hard_stop_pct)
+                if price <= hard_stop:
+                    return "SELL"
+
             return "HOLD"
 
         # hybrid mode: require SMA trend confirmation for buys, allow either risk signal for sells

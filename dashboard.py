@@ -2,106 +2,186 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
 from trading_bot import AlpacaTradingBot, load_config
 
+st.set_page_config(page_title="Alpaca Bot", layout="wide")
 
-st.set_page_config(page_title="Alpaca Trading Bot", layout="wide")
 
-st.markdown(
-    """
-    <style>
-    .stApp {
-        background:
-            radial-gradient(circle at top left, rgba(166, 201, 255, 0.22), transparent 28%),
-            radial-gradient(circle at top right, rgba(89, 166, 127, 0.18), transparent 25%),
-            linear-gradient(180deg, #f6f4ee 0%, #ece6db 100%);
-        color: #1d2a1f;
-    }
-    .hero {
-        padding: 1.4rem 1.6rem;
-        border: 1px solid rgba(29, 42, 31, 0.08);
-        border-radius: 24px;
-        background: rgba(255, 252, 245, 0.82);
-        box-shadow: 0 18px 50px rgba(69, 58, 42, 0.10);
-        margin-bottom: 1rem;
-    }
-    .eyebrow {
-        font-size: 0.8rem;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        color: #6a6f57;
-        margin-bottom: 0.45rem;
-    }
-    .hero h1 {
-        margin: 0;
-        font-size: 2.6rem;
-        line-height: 1;
-        color: #1d2a1f;
-    }
-    .hero p {
-        margin: 0.7rem 0 0;
-        max-width: 48rem;
-        color: #435244;
-        font-size: 1rem;
-    }
-    .status-pill {
-        display: inline-block;
-        margin-top: 1rem;
-        padding: 0.4rem 0.7rem;
-        border-radius: 999px;
-        background: #e6f2e8;
-        color: #245233;
-        font-size: 0.9rem;
-        font-weight: 600;
-    }
-    .status-pill.danger {
-        background: #fde9e2;
-        color: #8c2f1d;
-    }
-    .panel-title {
-        font-size: 0.82rem;
-        text-transform: uppercase;
-        letter-spacing: 0.12em;
-        color: #6f725d;
-        margin-bottom: 0.35rem;
-    }
-    .metric-card {
-        padding: 0.9rem 1rem;
-        border-radius: 18px;
-        background: rgba(255, 250, 240, 0.90);
-        border: 1px solid rgba(29, 42, 31, 0.08);
-        min-height: 6.4rem;
-    }
-    .metric-value {
-        font-size: 1.65rem;
-        font-weight: 700;
-        color: #1d2a1f;
-    }
-    .metric-delta {
-        color: #5d6b5f;
-        font-size: 0.92rem;
-    }
-    .section-card {
-        padding: 1rem 1rem 0.8rem;
-        border-radius: 22px;
-        background: rgba(255, 252, 246, 0.88);
-        border: 1px solid rgba(29, 42, 31, 0.08);
-        box-shadow: 0 12px 36px rgba(69, 58, 42, 0.06);
-        height: 100%;
-    }
-    .section-card h3 {
-        margin-top: 0.1rem;
-        margin-bottom: 0.8rem;
-        color: #1d2a1f;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# ── CSS ───────────────────────────────────────────────────────────────────────
 
+def _inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        html, body, [class*="css"] { font-family: 'Segoe UI', Tahoma, sans-serif; }
+        code, pre, .mono { font-family: 'Consolas', 'Courier New', monospace; }
+
+        .stApp { background: #0f1117; color: #e2e8f0; }
+
+        /* Kill switch banner */
+        .ks-banner {
+            background: #7f1d1d;
+            border: 1px solid #dc2626;
+            border-radius: 8px;
+            padding: 0.6rem 1rem;
+            color: #fca5a5;
+            font-weight: 600;
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+            letter-spacing: 0.03em;
+        }
+
+        /* Metric cards */
+        .m-card {
+            background: #1e2130;
+            border: 1px solid #2d3148;
+            border-radius: 12px;
+            padding: 0.85rem 1rem;
+            min-height: 5.5rem;
+        }
+        .m-label {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: #94a3b8;
+            margin-bottom: 0.3rem;
+        }
+        .m-value {
+            font-size: 1.55rem;
+            font-weight: 700;
+            color: #f1f5f9;
+            line-height: 1.1;
+        }
+        .m-delta { font-size: 0.82rem; color: #64748b; margin-top: 0.2rem; }
+        .m-pos   { color: #4ade80; }
+        .m-neg   { color: #f87171; }
+
+        /* Feed status dot */
+        .dot {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+        .dot-live  { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
+        .dot-rest  { background: #facc15; }
+        .dot-error { background: #f87171; }
+
+        /* Symbol cards */
+        .sym-card {
+            background: #1a1d2e;
+            border: 1px solid #2d3148;
+            border-radius: 14px;
+            padding: 1rem 1.1rem;
+            margin-bottom: 0.75rem;
+        }
+        .sym-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+        .sym-ticker {
+            font-size: 1.05rem;
+            font-weight: 700;
+            color: #f1f5f9;
+            font-family: 'DM Mono', monospace;
+            letter-spacing: 0.05em;
+        }
+        .sym-price { font-size: 0.95rem; color: #94a3b8; font-family: 'DM Mono', monospace; }
+        .badge {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 0.2rem 0.6rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+        }
+        .b-buy  { background: #14532d; color: #86efac; }
+        .b-sell { background: #7f1d1d; color: #fca5a5; }
+        .b-hold { background: #1e3a5f; color: #93c5fd; }
+        .b-err  { background: #451a03; color: #fed7aa; }
+
+        /* ML probability bar */
+        .ml-wrap { margin: 0.5rem 0 0.25rem; }
+        .ml-label {
+            font-size: 0.72rem;
+            color: #64748b;
+            margin-bottom: 0.25rem;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+        .ml-track {
+            position: relative;
+            height: 10px;
+            background: #2d3148;
+            border-radius: 5px;
+            overflow: visible;
+        }
+        .ml-fill { height: 100%; border-radius: 5px; }
+        .ml-tick {
+            position: absolute;
+            top: -3px;
+            width: 2px;
+            height: 16px;
+            background: #f8fafc;
+            border-radius: 1px;
+            opacity: 0.7;
+        }
+        .ml-axis {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.65rem;
+            color: #475569;
+            margin-top: 0.15rem;
+            font-family: 'DM Mono', monospace;
+        }
+
+        /* Proximity bar */
+        .prox-wrap { margin: 0.4rem 0; }
+        .prox-label {
+            font-size: 0.72rem;
+            color: #64748b;
+            margin-bottom: 0.2rem;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+        .prox-track { position: relative; height: 6px; background: #2d3148; border-radius: 3px; }
+        .prox-fill  { height: 100%; border-radius: 3px; }
+        .prox-above { background: linear-gradient(90deg, #166534, #4ade80); }
+        .prox-below { background: linear-gradient(90deg, #7f1d1d, #f87171); }
+
+        /* KV config layout */
+        .kv {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            padding: 0.45rem 0;
+            border-bottom: 1px solid #1e2130;
+        }
+        .kv-key { font-size: 0.82rem; color: #64748b; }
+        .kv-val { font-size: 0.85rem; font-family: 'DM Mono', monospace; color: #e2e8f0; }
+
+        /* Section headings */
+        .sec-head {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #475569;
+            margin: 1.2rem 0 0.5rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ── Bot singleton ─────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def get_bot() -> AlpacaTradingBot:
@@ -109,9 +189,7 @@ def get_bot() -> AlpacaTradingBot:
     return AlpacaTradingBot(load_config())
 
 
-def format_money(value: float) -> str:
-    return f"${value:,.2f}"
-
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
 def parse_mixed_iso_timestamps(values: pd.Series) -> pd.Series:
     try:
@@ -123,67 +201,431 @@ def parse_mixed_iso_timestamps(values: pd.Series) -> pd.Series:
     return parsed
 
 
-def render_metric_card(label: str, value: str, delta: str | None = None) -> None:
-    delta_html = f"<div class='metric-delta'>{delta}</div>" if delta else ""
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="panel-title">{label}</div>
-            <div class="metric-value">{value}</div>
-            {delta_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
+def _fmt_money(v: float) -> str:
+    return f"${v:,.2f}"
+
+
+def _pnl_cls(v: float) -> str:
+    return "m-pos" if v >= 0 else "m-neg"
+
+
+# ── HTML builders ─────────────────────────────────────────────────────────────
+
+def _metric_html(label: str, value: str, delta: str = "", delta_cls: str = "") -> str:
+    delta_part = f"<div class='m-delta {delta_cls}'>{delta}</div>" if delta else ""
+    return f"<div class='m-card'><div class='m-label'>{label}</div><div class='m-value'>{value}</div>{delta_part}</div>"
+
+
+def _ml_bar_html(
+    prob: float | None,
+    buy_thr: float | None,
+    sell_thr: float | None,
+    confidence: float | None,
+) -> str:
+    if prob is None:
+        return "<div class='ml-wrap'><div class='ml-label'>ML Probability — n/a</div></div>"
+    pct = min(max(prob * 100, 0), 100)
+    if buy_thr is not None and prob >= buy_thr:
+        fill_color = "#4ade80"
+    elif sell_thr is not None and prob <= sell_thr:
+        fill_color = "#f87171"
+    else:
+        fill_color = "#64748b"
+    buy_tick = (
+        f"<div class='ml-tick' style='left:{buy_thr * 100:.1f}%'></div>"
+        if buy_thr is not None
+        else ""
+    )
+    sell_tick = (
+        f"<div class='ml-tick' style='left:{sell_thr * 100:.1f}%'></div>"
+        if sell_thr is not None
+        else ""
+    )
+    conf_str = f"&nbsp;&nbsp;conf {confidence:.2f}" if confidence is not None else ""
+    return (
+        f"<div class='ml-wrap'>"
+        f"<div class='ml-label'>ML Probability &nbsp;"
+        f"<span style=\"font-family:'DM Mono',monospace\">{prob:.3f}{conf_str}</span></div>"
+        f"<div class='ml-track'>"
+        f"<div class='ml-fill' style='width:{pct:.1f}%;background:{fill_color}'></div>"
+        f"{sell_tick}{buy_tick}"
+        f"</div>"
+        f"<div class='ml-axis'><span>0.0</span><span>0.5</span><span>1.0</span></div>"
+        f"</div>"
     )
 
 
-def render_section_title(title: str) -> None:
-    st.markdown(
-        f"""
-        <div class="section-card">
-            <h3>{title}</h3>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def _prox_bar_html(price: float | None, sma: float | None) -> str:
+    if price is None or sma is None or sma == 0:
+        return ""
+    diff_pct = (price - sma) / sma * 100
+    above = diff_pct >= 0
+    bar_pct = min(abs(diff_pct) * 10, 100)
+    fill_cls = "prox-above" if above else "prox-below"
+    sign = "+" if above else ""
+    label = (
+        f"Price vs SMA &nbsp;"
+        f"<span style=\"font-family:'DM Mono',monospace\">{sign}{diff_pct:.2f}%</span>"
+    )
+    return (
+        f"<div class='prox-wrap'>"
+        f"<div class='prox-label'>{label}</div>"
+        f"<div class='prox-track'>"
+        f"<div class='prox-fill {fill_cls}' style='width:{bar_pct:.1f}%'></div>"
+        f"</div></div>"
     )
 
+
+def _badge_html(action: str) -> str:
+    cls = {"BUY": "b-buy", "SELL": "b-sell", "ERROR": "b-err"}.get(
+        (action or "").upper(), "b-hold"
+    )
+    return f"<span class='badge {cls}'>{action}</span>"
+
+
+def _sym_card_html(item) -> str:
+    price_str = f"${item.price:,.2f}" if item.price is not None else "—"
+    sma_str = f"SMA {item.sma:,.2f}" if item.sma is not None else ""
+    held_str = (
+        f"held {item.holding_minutes:.0f} min"
+        if item.holding and item.holding_minutes is not None
+        else ""
+    )
+    meta = "  ·  ".join(filter(None, [sma_str, held_str]))
+    badge = _badge_html(item.action or "HOLD")
+    ml_bar = _ml_bar_html(
+        item.ml_probability_up,
+        getattr(item, "ml_buy_threshold", None),
+        getattr(item, "ml_sell_threshold", None),
+        item.ml_confidence,
+    )
+    prox_bar = _prox_bar_html(item.price, item.sma)
+    error_html = (
+        f"<div style='font-size:0.78rem;color:#f87171;margin-top:0.4rem'>{item.error}</div>"
+        if item.error
+        else ""
+    )
+    return (
+        f"<div class='sym-card'>"
+        f"<div class='sym-header'><span class='sym-ticker'>{item.symbol}</span>{badge}</div>"
+        f"<div style='display:flex;justify-content:space-between;align-items:baseline'>"
+        f"<span class='sym-price'>{price_str}</span>"
+        f"<span style='font-size:0.78rem;color:#475569'>{meta}</span>"
+        f"</div>"
+        f"{prox_bar}{ml_bar}{error_html}"
+        f"</div>"
+    )
+
+
+def _kv(key: str, val: str) -> str:
+    return (
+        f"<div class='kv'>"
+        f"<span class='kv-key'>{key}</span>"
+        f"<span class='kv-val'>{val}</span>"
+        f"</div>"
+    )
+
+
+# ── Error page ────────────────────────────────────────────────────────────────
 
 def render_startup_error(exc: Exception) -> None:
     st.markdown(
-        """
-        <div class="hero">
-            <div class="eyebrow">Startup Error</div>
-            <h1>Dashboard Unavailable</h1>
-            <p>The dashboard loaded, but the trading bot could not be initialized.</p>
-            <div class="status-pill danger">Initialization Failed</div>
-        </div>
-        """,
+        "<div class='ks-banner'>Bot initialization failed — see details below</div>",
         unsafe_allow_html=True,
     )
     st.error(f"{type(exc).__name__}: {exc}")
     st.markdown(
-        """
-        **Common causes**
-
-        - Missing or invalid `ALPACA_API_KEY` / `ALPACA_API_SECRET`
-        - Missing Python packages after recent code changes
-        - Alpaca API or network connectivity issues during startup
-        """
-    )
-    st.markdown(
-        """
-        **Next checks**
-
-        - Run `python -m pip install -r requirements.txt`
-        - Confirm `.env` contains valid Alpaca credentials
-        - Re-run `python -m streamlit run dashboard.py` from the project root
-        """
+        "**Common fixes**\n"
+        "- Run `pip install -r requirements.txt`\n"
+        "- Confirm `.env` contains `ALPACA_API_KEY` and `ALPACA_API_SECRET`\n"
+        "- Relaunch with `python -m streamlit run dashboard.py`"
     )
     with st.expander("Traceback"):
         st.exception(exc)
 
 
+# ── Orders helper ─────────────────────────────────────────────────────────────
+
+def _orders_dataframe(recent_orders: list) -> pd.DataFrame:
+    if not recent_orders:
+        return pd.DataFrame()
+    df = pd.DataFrame([asdict(o) for o in recent_orders])
+    cols = [
+        c
+        for c in ["submitted_at", "symbol", "side", "status", "qty", "filled_qty", "filled_avg_price", "notional"]
+        if c in df.columns
+    ]
+    return df[cols]
+
+
+# ── Tab: Live ─────────────────────────────────────────────────────────────────
+
+def _render_live(bot, snapshot, recent_orders: list) -> None:
+    if snapshot.kill_switch_triggered:
+        st.markdown(
+            "<div class='ks-banner'>Kill Switch Active — daily loss limit reached, no new entries</div>",
+            unsafe_allow_html=True,
+        )
+
+    pnl_cls = _pnl_cls(snapshot.daily_pnl)
+    eq_delta = f"Prev close {_fmt_money(snapshot.last_equity)}"
+    action_counts: dict[str, int] = {}
+    for item in snapshot.symbols:
+        action_counts[item.action] = action_counts.get(item.action, 0) + 1
+    open_pos = len(snapshot.positions)
+    decision_str = f"{action_counts.get('BUY', 0)} buy · {action_counts.get('SELL', 0)} sell"
+
+    cols = st.columns(5)
+    cols[0].markdown(_metric_html("Cash", _fmt_money(snapshot.cash)), unsafe_allow_html=True)
+    cols[1].markdown(_metric_html("Buying Power", _fmt_money(snapshot.buying_power)), unsafe_allow_html=True)
+    cols[2].markdown(_metric_html("Equity", _fmt_money(snapshot.equity), eq_delta), unsafe_allow_html=True)
+    cols[3].markdown(
+        _metric_html(
+            "Daily PnL",
+            _fmt_money(snapshot.daily_pnl),
+            "Kill switch active" if snapshot.kill_switch_triggered else "Within limit",
+            pnl_cls,
+        ),
+        unsafe_allow_html=True,
+    )
+    cols[4].markdown(
+        _metric_html("Positions / Signals", f"{open_pos} open", decision_str),
+        unsafe_allow_html=True,
+    )
+
+    try:
+        feed_status = bot.get_price_feed_status()
+        dot_cls = "dot-live" if "live" in feed_status.lower() else "dot-rest"
+    except Exception:
+        feed_status = "unavailable"
+        dot_cls = "dot-error"
+    st.markdown(
+        f"<div style='margin:0.6rem 0 1rem'>"
+        f"<span class='dot {dot_cls}'></span>"
+        f"<span style='font-size:0.82rem;color:#64748b'>"
+        f"{feed_status} &nbsp;·&nbsp; {snapshot.timestamp_utc}"
+        f"</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    if not snapshot.symbols:
+        st.info("No symbol data in snapshot.")
+        return
+
+    st.markdown("<div class='sec-head'>Symbol Signals</div>", unsafe_allow_html=True)
+    card_cols = st.columns(3)
+    for idx, item in enumerate(snapshot.symbols):
+        card_cols[idx % 3].markdown(_sym_card_html(item), unsafe_allow_html=True)
+
+    if snapshot.positions:
+        st.markdown("<div class='sec-head'>Open Positions</div>", unsafe_allow_html=True)
+        rows = []
+        for sym, pos in snapshot.positions.items():
+            match = next((s for s in snapshot.symbols if s.symbol == sym), None)
+            rows.append(
+                {
+                    "symbol": sym,
+                    "qty": float(pos.qty) if pos.qty is not None else 0.0,
+                    "market_value": float(pos.market_value) if pos.market_value is not None else 0.0,
+                    "avg_entry": float(pos.avg_entry_price) if pos.avg_entry_price is not None else 0.0,
+                    "unrealized_pl": float(pos.unrealized_pl) if pos.unrealized_pl is not None else 0.0,
+                    "held_mins": (
+                        round(float(match.holding_minutes), 1)
+                        if match and match.holding_minutes is not None
+                        else None
+                    ),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    orders_df = _orders_dataframe(recent_orders)
+    if not orders_df.empty:
+        st.markdown("<div class='sec-head'>Recent Orders</div>", unsafe_allow_html=True)
+        st.dataframe(orders_df, use_container_width=True, hide_index=True)
+
+
+# ── Tab: History ──────────────────────────────────────────────────────────────
+
+def _render_history(bot, snapshot) -> None:
+    selected = st.radio("Symbol", bot.config.symbols, horizontal=True)
+
+    try:
+        run_history = pd.DataFrame(bot.storage.get_run_history(limit=200))
+        symbol_history = pd.DataFrame(bot.storage.get_symbol_history(selected, limit=200))
+    except Exception as exc:
+        st.error(f"Could not load history: {exc}")
+        return
+
+    left, right = st.columns([1.4, 1])
+
+    with left:
+        st.markdown("<div class='sec-head'>Account Equity</div>", unsafe_allow_html=True)
+        if run_history.empty:
+            st.info("No run history yet.")
+        else:
+            rh = run_history.copy()
+            rh["ts"] = parse_mixed_iso_timestamps(rh["timestamp_utc"])
+            rh = rh.dropna(subset=["ts"]).sort_values("ts")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=rh["ts"], y=rh["equity"], name="Equity", line=dict(color="#60a5fa", width=2)))
+            fig.add_trace(
+                go.Scatter(
+                    x=rh["ts"], y=rh["daily_pnl"], name="Daily PnL",
+                    line=dict(color="#4ade80", width=1.5), yaxis="y2",
+                )
+            )
+            fig.update_layout(
+                paper_bgcolor="#1a1d2e", plot_bgcolor="#1a1d2e",
+                font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=11),
+                margin=dict(l=0, r=0, t=20, b=0),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, bgcolor="rgba(0,0,0,0)"),
+                xaxis=dict(gridcolor="#2d3148"),
+                yaxis=dict(gridcolor="#2d3148", title="Equity"),
+                yaxis2=dict(overlaying="y", side="right", title="Daily PnL", gridcolor="rgba(0,0,0,0)"),
+                height=260,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown(f"<div class='sec-head'>{selected} — Price vs SMA</div>", unsafe_allow_html=True)
+        if symbol_history.empty:
+            st.info("No symbol history yet.")
+        else:
+            sh = symbol_history.copy()
+            sh["ts"] = parse_mixed_iso_timestamps(sh["timestamp_utc"])
+            sh = sh.dropna(subset=["ts", "price", "sma"]).sort_values("ts")
+            if sh.empty:
+                st.info("No price/SMA data saved yet.")
+            else:
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(x=sh["ts"], y=sh["price"], name="Price", line=dict(color="#f1f5f9", width=2)))
+                fig2.add_trace(
+                    go.Scatter(x=sh["ts"], y=sh["sma"], name="SMA", line=dict(color="#facc15", width=1.5, dash="dot"))
+                )
+                fig2.update_layout(
+                    paper_bgcolor="#1a1d2e", plot_bgcolor="#1a1d2e",
+                    font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=11),
+                    margin=dict(l=0, r=0, t=20, b=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, bgcolor="rgba(0,0,0,0)"),
+                    xaxis=dict(gridcolor="#2d3148"),
+                    yaxis=dict(gridcolor="#2d3148"),
+                    height=240,
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+
+            if "ml_probability_up" in symbol_history.columns:
+                ml_sh = sh.dropna(subset=["ml_probability_up"]) if not sh.empty else pd.DataFrame()
+                if not ml_sh.empty:
+                    fig3 = go.Figure()
+                    fig3.add_trace(
+                        go.Scatter(x=ml_sh["ts"], y=ml_sh["ml_probability_up"], name="ML Prob", line=dict(color="#a78bfa", width=2))
+                    )
+                    if "ml_confidence" in ml_sh.columns:
+                        fig3.add_trace(
+                            go.Scatter(
+                                x=ml_sh["ts"], y=ml_sh["ml_confidence"], name="Confidence",
+                                line=dict(color="#64748b", width=1, dash="dot"),
+                            )
+                        )
+                    fig3.add_hline(y=0.5, line=dict(color="#475569", dash="dash"), annotation_text="0.5")
+                    fig3.update_layout(
+                        paper_bgcolor="#1a1d2e", plot_bgcolor="#1a1d2e",
+                        font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=11),
+                        margin=dict(l=0, r=0, t=20, b=0),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, bgcolor="rgba(0,0,0,0)"),
+                        xaxis=dict(gridcolor="#2d3148"),
+                        yaxis=dict(gridcolor="#2d3148", range=[0, 1]),
+                        height=200,
+                    )
+                    st.plotly_chart(fig3, use_container_width=True)
+
+    with right:
+        st.markdown(f"<div class='sec-head'>{selected} — Decision Mix</div>", unsafe_allow_html=True)
+        if not symbol_history.empty and "action" in symbol_history.columns:
+            mix = symbol_history["action"].value_counts().rename_axis("action").reset_index(name="count")
+            st.dataframe(mix, use_container_width=True, hide_index=True)
+
+        st.markdown(f"<div class='sec-head'>{selected} — Latest Rows</div>", unsafe_allow_html=True)
+        if not symbol_history.empty:
+            latest = symbol_history.tail(10).copy()
+            if "holding_minutes" in latest.columns:
+                latest["holding_minutes"] = pd.to_numeric(latest["holding_minutes"], errors="coerce").round(1)
+            st.dataframe(latest, use_container_width=True, hide_index=True)
+
+
+# ── Tab: Config ───────────────────────────────────────────────────────────────
+
+def _render_config(bot, snapshot) -> None:
+    cfg = bot.config
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("<div class='sec-head'>Strategy</div>", unsafe_allow_html=True)
+        st.markdown(
+            "".join(
+                _kv(k, v)
+                for k, v in [
+                    ("Mode", cfg.strategy_mode),
+                    ("Symbols", ", ".join(cfg.symbols)),
+                    ("Bar timeframe", f"{cfg.bar_timeframe_minutes} min"),
+                    ("SMA bars", str(cfg.sma_bars)),
+                    ("Paper mode", str(cfg.paper)),
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("<div class='sec-head'>Session</div>", unsafe_allow_html=True)
+        session_rows = [
+            ("Snapshot time", str(snapshot.timestamp_utc)),
+            ("History DB", str(bot.storage.db_path)),
+        ]
+        try:
+            session_rows.append(("Price feed", bot.get_price_feed_status()))
+        except Exception:
+            pass
+        st.markdown("".join(_kv(k, v) for k, v in session_rows), unsafe_allow_html=True)
+
+    with right:
+        st.markdown("<div class='sec-head'>Risk Controls</div>", unsafe_allow_html=True)
+        st.markdown(
+            "".join(
+                _kv(k, v)
+                for k, v in [
+                    ("Max per trade", _fmt_money(cfg.max_usd_per_trade)),
+                    ("Max symbol exposure", _fmt_money(cfg.max_symbol_exposure_usd)),
+                    ("Max open positions", str(cfg.max_open_positions)),
+                    ("Max daily loss", _fmt_money(cfg.max_daily_loss_usd)),
+                    ("Max orders/min", str(cfg.max_orders_per_minute)),
+                    ("Price collar", f"{cfg.max_price_deviation_bps:.0f} bps"),
+                    ("Max live price age", f"{cfg.max_live_price_age_seconds}s"),
+                    ("Max bar delay", f"{cfg.max_data_delay_seconds}s"),
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("<div class='sec-head'>ML Thresholds</div>", unsafe_allow_html=True)
+        model_names = sorted(
+            {getattr(item, "ml_model_name", None) for item in snapshot.symbols} - {None}
+        )
+        if model_names:
+            st.markdown(_kv("Model", ", ".join(model_names)), unsafe_allow_html=True)
+        ml_rows = [
+            f"{item.symbol}: buy ≥ {item.ml_buy_threshold:.2f}  sell ≤ {item.ml_sell_threshold:.2f}"
+            for item in snapshot.symbols
+            if getattr(item, "ml_buy_threshold", None) is not None
+        ]
+        if ml_rows:
+            st.markdown("".join(_kv("Threshold", r) for r in ml_rows), unsafe_allow_html=True)
+        else:
+            st.markdown(_kv("Thresholds", "n/a"), unsafe_allow_html=True)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main() -> None:
+    _inject_css()
+
     try:
         bot = get_bot()
     except Exception as exc:
@@ -197,208 +639,78 @@ def main() -> None:
             render_startup_error(exc)
             return
 
-    kill_switch_class = "status-pill danger" if st.session_state.snapshot.kill_switch_triggered else "status-pill"
-    kill_switch_text = "Kill Switch Active" if st.session_state.snapshot.kill_switch_triggered else "Kill Switch Clear"
-    st.markdown(
-        f"""
-        <div class="hero">
-            <div class="eyebrow">Paper Trading Control Surface</div>
-            <h1>Alpaca Bot Dashboard</h1>
-            <p>Monitor account health, inspect per-symbol decisions, and review recent order flow without digging through terminal output.</p>
-            <div class="{kill_switch_class}">{kill_switch_text}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if "execute_orders" not in st.session_state:
+        st.session_state.execute_orders = False
+    if "run_pending" not in st.session_state:
+        st.session_state.run_pending = False
 
-    controls_col, actions_col = st.columns([1.1, 1.4])
-    with controls_col:
-        execute_orders = st.toggle("Enable order execution", value=False)
-        if execute_orders:
-            st.warning("Running a bot cycle will submit paper orders.")
-        st.caption("Keep this off while validating strategy output and dashboard state.")
+    snapshot = st.session_state.snapshot
+    recent_orders = st.session_state.get("recent_orders", [])
 
-    with actions_col:
-        button_cols = st.columns(2)
-        refresh = button_cols[0].button("Refresh snapshot", type="primary", use_container_width=True)
-        run_cycle = button_cols[1].button("Run bot cycle", use_container_width=True)
+    # Header row
+    hdr_l, hdr_r = st.columns([2, 1.8])
+    with hdr_l:
+        st.markdown(
+            "<div style='font-size:1.4rem;font-weight:700;color:#f1f5f9;margin-bottom:0.1rem'>Alpaca Bot</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div style='font-size:0.8rem;color:#475569'>"
+            f"{bot.config.strategy_mode} · {len(bot.config.symbols)} symbols · "
+            f"{'paper' if bot.config.paper else 'live'}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    with hdr_r:
+        ctl_a, ctl_b, ctl_c = st.columns([1, 1, 1])
+        refresh = ctl_a.button("Refresh", use_container_width=True, type="primary")
+        execute_orders = ctl_b.toggle("Execute orders", value=st.session_state.execute_orders)
+        st.session_state.execute_orders = execute_orders
+
+        if not st.session_state.run_pending:
+            if ctl_c.button("Run cycle", use_container_width=True):
+                st.session_state.run_pending = True
+                st.rerun()
+        else:
+            mode_label = "with order execution" if execute_orders else "preview — no orders"
+            st.warning(f"Run one cycle ({mode_label}). Confirm?")
+            conf_l, conf_r = st.columns(2)
+            if conf_l.button("Confirm", type="primary", use_container_width=True):
+                try:
+                    st.session_state.snapshot = bot.run_once(execute_orders=execute_orders)
+                    st.session_state.recent_orders = bot.get_recent_orders(limit=12)
+                except Exception as exc:
+                    render_startup_error(exc)
+                    return
+                finally:
+                    st.session_state.run_pending = False
+                st.rerun()
+            if conf_r.button("Cancel", use_container_width=True):
+                st.session_state.run_pending = False
+                st.rerun()
 
     if refresh:
         try:
             st.session_state.snapshot, st.session_state.recent_orders = bot.capture_state()
+            snapshot = st.session_state.snapshot
+            recent_orders = st.session_state.recent_orders
         except Exception as exc:
             render_startup_error(exc)
             return
 
-    if run_cycle:
-        try:
-            st.session_state.snapshot = bot.run_once(execute_orders=execute_orders)
-            st.session_state.recent_orders = bot.get_recent_orders(limit=12)
-        except Exception as exc:
-            render_startup_error(exc)
-            return
+    st.divider()
 
-    snapshot = st.session_state.snapshot
-    try:
-        recent_orders = st.session_state.get("recent_orders", bot.get_recent_orders(limit=12))
-        run_history = pd.DataFrame(bot.storage.get_run_history(limit=120))
-        selected_symbol = st.selectbox("History symbol", bot.config.symbols, index=0)
-        symbol_history = pd.DataFrame(bot.storage.get_symbol_history(selected_symbol, limit=120))
-    except Exception as exc:
-        render_startup_error(exc)
-        return
+    live_tab, history_tab, config_tab = st.tabs(["Live", "History", "Config"])
 
-    metric_cols = st.columns(5)
-    with metric_cols[0]:
-        render_metric_card("Cash", format_money(snapshot.cash))
-    with metric_cols[1]:
-        render_metric_card("Buying Power", format_money(snapshot.buying_power))
-    with metric_cols[2]:
-        render_metric_card("Equity", format_money(snapshot.equity), f"Prev close {format_money(snapshot.last_equity)}")
-    with metric_cols[3]:
-        pnl_delta = "Loss limit reached" if snapshot.kill_switch_triggered else "Within daily limit"
-        render_metric_card("Daily PnL", format_money(snapshot.daily_pnl), pnl_delta)
-    with metric_cols[4]:
-        render_metric_card("Tracked Symbols", str(len(snapshot.symbols)), ", ".join(item.symbol for item in snapshot.symbols))
+    with live_tab:
+        _render_live(bot, snapshot, recent_orders)
 
-    symbols_df = pd.DataFrame([asdict(item) for item in snapshot.symbols])
-    if not symbols_df.empty:
-        symbols_df = symbols_df[
-            [
-                "symbol",
-                "price",
-                "sma",
-                "ml_probability_up",
-                "ml_confidence",
-                "ml_training_rows",
-                "ml_buy_threshold",
-                "ml_sell_threshold",
-                "ml_model_name",
-                "action",
-                "holding",
-                "quantity",
-                "market_value",
-                "error",
-            ]
-        ]
-        symbols_df = symbols_df.rename(
-            columns={
-                "price": "last_price",
-                "market_value": "position_value",
-                "ml_probability_up": "ml_up_prob",
-                "ml_confidence": "ml_conf",
-                "ml_training_rows": "ml_rows",
-                "ml_buy_threshold": "ml_buy_thr",
-                "ml_sell_threshold": "ml_sell_thr",
-                "ml_model_name": "ml_model",
-            }
-        )
+    with history_tab:
+        _render_history(bot, snapshot)
 
-    positions_rows = []
-    for symbol, position in snapshot.positions.items():
-        positions_rows.append(
-            {
-                "symbol": symbol,
-                "qty": float(position.qty) if position.qty is not None else 0.0,
-                "market_value": float(position.market_value) if position.market_value is not None else 0.0,
-                "avg_entry_price": float(position.avg_entry_price) if position.avg_entry_price is not None else 0.0,
-                "unrealized_pl": float(position.unrealized_pl) if position.unrealized_pl is not None else 0.0,
-            }
-        )
-
-    positions_df = pd.DataFrame(positions_rows)
-    orders_df = pd.DataFrame([asdict(order) for order in recent_orders])
-    if not orders_df.empty:
-        orders_df = orders_df[
-            ["submitted_at", "symbol", "side", "status", "qty", "filled_qty", "filled_avg_price", "notional"]
-        ]
-
-    history_left, history_right = st.columns([1.3, 1])
-    with history_left:
-        render_section_title("Account History")
-        if run_history.empty:
-            st.info("No saved run history yet.")
-        else:
-            account_chart = run_history[["timestamp_utc", "equity", "cash", "daily_pnl"]].copy()
-            account_chart["timestamp_utc"] = parse_mixed_iso_timestamps(account_chart["timestamp_utc"])
-            account_chart = account_chart.dropna(subset=["timestamp_utc"])
-            account_chart = account_chart.set_index("timestamp_utc")
-            st.line_chart(account_chart)
-    with history_right:
-        render_section_title(f"{selected_symbol} Trend")
-        if symbol_history.empty:
-            st.info("No symbol history yet.")
-        else:
-            symbol_chart = symbol_history[["timestamp_utc", "price", "sma"]].copy()
-            symbol_chart = symbol_chart.dropna(how="any", subset=["price", "sma"])
-            symbol_chart["timestamp_utc"] = parse_mixed_iso_timestamps(symbol_chart["timestamp_utc"])
-            symbol_chart = symbol_chart.dropna(subset=["timestamp_utc"])
-            symbol_chart = symbol_chart.set_index("timestamp_utc")
-            if symbol_chart.empty:
-                st.info("No price/SMA points saved yet for this symbol.")
-            else:
-                st.line_chart(symbol_chart)
-            if "ml_probability_up" in symbol_history.columns:
-                ml_chart = symbol_history[["timestamp_utc", "ml_probability_up", "ml_confidence"]].copy()
-                ml_chart = ml_chart.dropna(how="all", subset=["ml_probability_up", "ml_confidence"])
-                if not ml_chart.empty:
-                    ml_chart["timestamp_utc"] = parse_mixed_iso_timestamps(ml_chart["timestamp_utc"])
-                    ml_chart = ml_chart.dropna(subset=["timestamp_utc"])
-                    ml_chart = ml_chart.set_index("timestamp_utc")
-                    st.line_chart(ml_chart)
-            action_counts = symbol_history["action"].value_counts().rename_axis("action").reset_index(name="count")
-            st.dataframe(action_counts, use_container_width=True, hide_index=True)
-
-    left_col, right_col = st.columns([1.5, 1])
-    with left_col:
-        render_section_title("Symbol Decisions")
-        st.dataframe(symbols_df, use_container_width=True, hide_index=True)
-    with right_col:
-        render_section_title("Open Positions")
-        if positions_df.empty:
-            st.info("No open positions.")
-        else:
-            st.dataframe(positions_df, use_container_width=True, hide_index=True)
-
-    render_section_title("Recent Orders")
-    if orders_df.empty:
-        st.info("No recent order activity returned by Alpaca.")
-    else:
-        st.dataframe(orders_df, use_container_width=True, hide_index=True)
-
-    risk_col, notes_col = st.columns([1, 1])
-    with risk_col:
-        render_section_title("Risk Guardrails")
-        st.write(f"Max per trade: {format_money(bot.config.max_usd_per_trade)}")
-        st.write(f"Max per symbol: {format_money(bot.config.max_symbol_exposure_usd)}")
-        st.write(f"Max open positions: {bot.config.max_open_positions}")
-        st.write(f"Max daily loss: {format_money(bot.config.max_daily_loss_usd)}")
-        st.write(f"Max orders per minute: {bot.config.max_orders_per_minute}")
-        st.write(f"Price collar: {bot.config.max_price_deviation_bps:.0f} bps")
-        st.write(f"Max live price age: {bot.config.max_live_price_age_seconds}s")
-        st.write(f"Max completed-bar delay: {bot.config.max_data_delay_seconds}s")
-        st.write(
-            f"SMA window: {bot.config.sma_bars} x {bot.config.bar_timeframe_minutes}-minute bars"
-        )
-    with notes_col:
-        render_section_title("Session Notes")
-        learned_thresholds = [
-            f"{item.symbol}: buy >= {item.ml_buy_threshold:.2f}, sell <= {item.ml_sell_threshold:.2f}"
-            for item in snapshot.symbols
-            if item.ml_buy_threshold is not None and item.ml_sell_threshold is not None
-        ]
-        model_names = sorted({item.ml_model_name for item in snapshot.symbols if item.ml_model_name})
-        st.write(f"Snapshot time: `{snapshot.timestamp_utc}`")
-        st.write(f"Paper mode: `{bot.config.paper}`")
-        st.write(f"Strategy mode: `{bot.config.strategy_mode}`")
-        if model_names:
-            st.write(f"ML model(s): `{', '.join(model_names)}`")
-        if learned_thresholds:
-            st.write(f"Validation thresholds: `{'; '.join(learned_thresholds)}`")
-        st.write(f"Price feed: `{bot.get_price_feed_status()}`")
-        st.write(f"Watched symbols: `{', '.join(bot.config.symbols)}`")
-        st.write(f"Recent order count shown: `{len(recent_orders)}`")
-        st.write(f"History database: `{bot.storage.db_path}`")
+    with config_tab:
+        _render_config(bot, snapshot)
 
 
 if __name__ == "__main__":

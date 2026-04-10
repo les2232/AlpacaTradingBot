@@ -3,7 +3,8 @@ import os
 import math
 import threading
 import time
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
@@ -32,12 +33,17 @@ else:
 
 from storage import BotStorage
 from strategy import (
+    BREAKOUT_EXIT_CHOICES,
+    BREAKOUT_EXIT_TARGET_1X_STOP_LOW,
+    MEAN_REVERSION_EXIT_CHOICES,
+    MEAN_REVERSION_EXIT_SMA,
     ORB_FILTER_CHOICES,
     ORB_FILTER_NONE,
     STRATEGY_MODE_BREAKOUT,
     STRATEGY_MODE_CHOICES,
     STRATEGY_MODE_HYBRID,
     STRATEGY_MODE_ML,
+    STRATEGY_MODE_ORB,
     Strategy,
     StrategyConfig,
     MlSignal,
@@ -46,11 +52,14 @@ from strategy import (
     calculate_opening_range_series,
     calculate_atr_pct_values,
     calculate_atr_percentile_series,
+    get_capped_breakout_stop_price,
     REGIME_SMA_PERIOD,
     REGIME_TIMEFRAME_MINUTES,
     estimate_atr_percentile_lookback_bars,
     estimate_regime_lookback_bars,
     is_entry_window_open,
+    normalize_breakout_exit_style,
+    normalize_mean_reversion_exit_style,
     normalize_orb_filter_mode,
     normalize_strategy_mode,
     normalize_threshold_mode,
@@ -84,6 +93,12 @@ class BotConfig:
     time_window_mode: str = TIME_WINDOW_FULL_DAY
     regime_filter_enabled: bool = False
     orb_filter_mode: str = ORB_FILTER_NONE
+    breakout_exit_style: str = BREAKOUT_EXIT_TARGET_1X_STOP_LOW
+    breakout_tight_stop_fraction: float = 0.5
+    breakout_max_stop_pct: float = 0.03
+    mean_reversion_exit_style: str = MEAN_REVERSION_EXIT_SMA
+    mean_reversion_max_atr_percentile: float = 0.0
+    mean_reversion_trend_filter: bool = False
     max_orders_per_minute: int = 6
     max_price_deviation_bps: float = 75.0
     max_data_delay_seconds: int = 1800
@@ -148,6 +163,7 @@ _ET = pytz.timezone("America/New_York")
 _SESSION_ENTRY_START = dt_time(9, 45)   # no new entries before this
 _SESSION_ENTRY_END   = dt_time(15, 45)  # no new entries after this
 _SESSION_FLATTEN_AT  = dt_time(15, 55)  # forced EOD flatten deadline
+DEFAULT_RUNTIME_CONFIG_PATH = Path("config") / "live_config.json"
 
 
 def _safe_float(value: str | None, default: float) -> float:
@@ -179,6 +195,139 @@ def _parse_symbol_strategy_map(raw_value: str | None) -> dict[str, str]:
     return parsed
 
 
+def _normalize_runtime_symbols(raw_symbols: Any) -> list[str]:
+    if not isinstance(raw_symbols, list):
+        raise RuntimeError("Runtime config field 'symbols' must be a list of ticker strings.")
+
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in raw_symbols:
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+    if not symbols:
+        raise RuntimeError("Runtime config field 'symbols' must contain at least one ticker.")
+    return symbols
+
+
+def _coerce_runtime_float(runtime: dict[str, Any], key: str) -> float:
+    value = runtime.get(key)
+    if value is None:
+        raise RuntimeError(f"Runtime config is missing required numeric field: {key}")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Runtime config field {key!r} must be numeric, got {value!r}.") from exc
+
+
+def _coerce_runtime_int(runtime: dict[str, Any], key: str) -> int:
+    value = runtime.get(key)
+    if value is None:
+        raise RuntimeError(f"Runtime config is missing required integer field: {key}")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Runtime config field {key!r} must be an integer, got {value!r}.") from exc
+
+
+def _coerce_runtime_bool(runtime: dict[str, Any], key: str) -> bool:
+    value = runtime.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    raise RuntimeError(f"Runtime config field {key!r} must be a boolean, got {value!r}.")
+
+
+def _load_runtime_config_payload() -> tuple[Path | None, dict[str, Any] | None]:
+    runtime_path = Path(os.getenv("BOT_RUNTIME_CONFIG_PATH", str(DEFAULT_RUNTIME_CONFIG_PATH)))
+    if not runtime_path.exists():
+        return None, None
+
+    try:
+        payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Runtime config is not valid JSON: {runtime_path}") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Runtime config must contain a JSON object at top level: {runtime_path}")
+
+    runtime = payload.get("runtime", payload)
+    if not isinstance(runtime, dict):
+        raise RuntimeError(f"Runtime config field 'runtime' must be a JSON object: {runtime_path}")
+
+    return runtime_path, runtime
+
+
+def _apply_runtime_config(base_config: BotConfig, runtime_path: Path | None, runtime: dict[str, Any] | None) -> BotConfig:
+    if runtime_path is None or runtime is None:
+        return base_config
+
+    overrides: dict[str, Any] = {}
+    if "symbols" in runtime:
+        overrides["symbols"] = _normalize_runtime_symbols(runtime["symbols"])
+    if "bar_timeframe_minutes" in runtime:
+        overrides["bar_timeframe_minutes"] = _coerce_runtime_int(runtime, "bar_timeframe_minutes")
+    if "strategy_mode" in runtime:
+        overrides["strategy_mode"] = normalize_strategy_mode(str(runtime["strategy_mode"]))
+    if "sma_bars" in runtime and runtime["sma_bars"] is not None:
+        overrides["sma_bars"] = _coerce_runtime_int(runtime, "sma_bars")
+    if "ml_probability_buy" in runtime and runtime["ml_probability_buy"] is not None:
+        overrides["ml_probability_buy"] = _coerce_runtime_float(runtime, "ml_probability_buy")
+    if "ml_probability_sell" in runtime and runtime["ml_probability_sell"] is not None:
+        overrides["ml_probability_sell"] = _coerce_runtime_float(runtime, "ml_probability_sell")
+    if "entry_threshold_pct" in runtime and runtime["entry_threshold_pct"] is not None:
+        overrides["entry_threshold_pct"] = _coerce_runtime_float(runtime, "entry_threshold_pct")
+    if "threshold_mode" in runtime:
+        overrides["threshold_mode"] = normalize_threshold_mode(str(runtime["threshold_mode"]))
+    if "atr_multiple" in runtime and runtime["atr_multiple"] is not None:
+        overrides["atr_multiple"] = _coerce_runtime_float(runtime, "atr_multiple")
+    if "atr_percentile_threshold" in runtime and runtime["atr_percentile_threshold"] is not None:
+        overrides["atr_percentile_threshold"] = _coerce_runtime_float(runtime, "atr_percentile_threshold")
+    if "time_window_mode" in runtime:
+        overrides["time_window_mode"] = normalize_time_window_mode(str(runtime["time_window_mode"]))
+    if "regime_filter_enabled" in runtime:
+        overrides["regime_filter_enabled"] = _coerce_runtime_bool(runtime, "regime_filter_enabled")
+    if "orb_filter_mode" in runtime:
+        overrides["orb_filter_mode"] = normalize_orb_filter_mode(str(runtime["orb_filter_mode"]))
+    if "breakout_exit_style" in runtime:
+        overrides["breakout_exit_style"] = normalize_breakout_exit_style(str(runtime["breakout_exit_style"]))
+    if "breakout_tight_stop_fraction" in runtime and runtime["breakout_tight_stop_fraction"] is not None:
+        overrides["breakout_tight_stop_fraction"] = _coerce_runtime_float(runtime, "breakout_tight_stop_fraction")
+    if "mean_reversion_exit_style" in runtime:
+        overrides["mean_reversion_exit_style"] = normalize_mean_reversion_exit_style(
+            str(runtime["mean_reversion_exit_style"])
+        )
+    if "mean_reversion_max_atr_percentile" in runtime and runtime["mean_reversion_max_atr_percentile"] is not None:
+        overrides["mean_reversion_max_atr_percentile"] = _coerce_runtime_float(
+            runtime,
+            "mean_reversion_max_atr_percentile",
+        )
+    if "mean_reversion_trend_filter" in runtime:
+        overrides["mean_reversion_trend_filter"] = _coerce_runtime_bool(runtime, "mean_reversion_trend_filter")
+    if "symbol_strategy_modes" in runtime:
+        if not isinstance(runtime["symbol_strategy_modes"], dict):
+            raise RuntimeError("Runtime config field 'symbol_strategy_modes' must be an object mapping SYMBOL to mode.")
+        overrides["symbol_strategy_modes"] = {
+            str(symbol).strip().upper(): normalize_strategy_mode(str(mode))
+            for symbol, mode in runtime["symbol_strategy_modes"].items()
+            if str(symbol).strip()
+        }
+
+    config = replace(base_config, **overrides)
+    runtime_symbols = ", ".join(config.symbols)
+    logger.info("Loaded runtime config from %s", runtime_path)
+    print(f"Runtime config loaded from {runtime_path}")
+    print(f"Runtime config symbols: {runtime_symbols}")
+    return config
+
+
 def load_config() -> BotConfig:
     # Live execution config is intentionally sourced from environment variables
     # and normalized into BotConfig here. Offline tools use their own CLI args.
@@ -190,7 +339,7 @@ def load_config() -> BotConfig:
     sma_bars_raw = os.getenv("SMA_BARS") or os.getenv("SMA_DAYS", "20")
     bar_timeframe_minutes = int(os.getenv("BAR_TIMEFRAME_MINUTES", "15"))
 
-    return BotConfig(
+    base_config = BotConfig(
         symbols=symbols,
         max_usd_per_trade=float(os.getenv("MAX_USD_PER_TRADE", "200")),
         max_symbol_exposure_usd=float(
@@ -220,11 +369,24 @@ def load_config() -> BotConfig:
         ),
         regime_filter_enabled=os.getenv("REGIME_FILTER_ENABLED", "false").lower() == "true",
         orb_filter_mode=normalize_orb_filter_mode(os.getenv("ORB_FILTER_MODE", ORB_FILTER_NONE)),
+        breakout_exit_style=normalize_breakout_exit_style(
+            os.getenv("BREAKOUT_EXIT_STYLE", BREAKOUT_EXIT_TARGET_1X_STOP_LOW)
+        ),
+        breakout_tight_stop_fraction=_safe_float(os.getenv("BREAKOUT_TIGHT_STOP_FRACTION"), 0.5),
+        breakout_max_stop_pct=_safe_float(os.getenv("BREAKOUT_MAX_STOP_PCT"), 0.03),
+        mean_reversion_exit_style=normalize_mean_reversion_exit_style(
+            os.getenv("MEAN_REVERSION_EXIT_STYLE", MEAN_REVERSION_EXIT_SMA)
+        ),
+        mean_reversion_max_atr_percentile=_safe_float(os.getenv("MEAN_REVERSION_MAX_ATR_PERCENTILE"), 0.0),
+        mean_reversion_trend_filter=os.getenv("MEAN_REVERSION_TREND_FILTER", "false").lower() == "true",
         max_orders_per_minute=int(os.getenv("MAX_ORDERS_PER_MINUTE", "6")),
         max_price_deviation_bps=_safe_float(os.getenv("MAX_PRICE_DEVIATION_BPS"), 75.0),
         max_data_delay_seconds=int(os.getenv("MAX_DATA_DELAY_SECONDS", "1800")),
         max_live_price_age_seconds=int(os.getenv("MAX_LIVE_PRICE_AGE_SECONDS", "30")),
     )
+
+    runtime_path, runtime = _load_runtime_config_payload()
+    return _apply_runtime_config(base_config, runtime_path, runtime)
 
 
 class AlpacaTradingBot:
@@ -270,9 +432,16 @@ class AlpacaTradingBot:
                 time_window_mode=config.time_window_mode,
                 regime_filter_enabled=config.regime_filter_enabled,
                 orb_filter_mode=config.orb_filter_mode,
+                breakout_exit_style=config.breakout_exit_style,
+                breakout_tight_stop_fraction=config.breakout_tight_stop_fraction,
+                breakout_max_stop_pct=config.breakout_max_stop_pct,
+                mean_reversion_exit_style=config.mean_reversion_exit_style,
+                mean_reversion_max_atr_percentile=config.mean_reversion_max_atr_percentile,
+                mean_reversion_trend_filter=config.mean_reversion_trend_filter,
             )
         )
         self._symbol_strategy_modes = config.symbol_strategy_modes or {}
+        self._breakout_stored_stop: dict[str, float] = {}
         invalid_symbol_modes = [
             mode for mode in self._symbol_strategy_modes.values()
             if mode not in STRATEGY_MODE_CHOICES
@@ -301,6 +470,16 @@ class AlpacaTradingBot:
             raise RuntimeError(
                 f"Unsupported ORB_FILTER_MODE={config.orb_filter_mode}. "
                 f"Choose from {', '.join(ORB_FILTER_CHOICES)}."
+            )
+        if config.breakout_exit_style not in BREAKOUT_EXIT_CHOICES:
+            raise RuntimeError(
+                f"Unsupported BREAKOUT_EXIT_STYLE={config.breakout_exit_style}. "
+                f"Choose from {', '.join(BREAKOUT_EXIT_CHOICES)}."
+            )
+        if config.mean_reversion_exit_style not in MEAN_REVERSION_EXIT_CHOICES:
+            raise RuntimeError(
+                f"Unsupported MEAN_REVERSION_EXIT_STYLE={config.mean_reversion_exit_style}. "
+                f"Choose from {', '.join(MEAN_REVERSION_EXIT_CHOICES)}."
             )
         if offline_to_ml_signal is None and any(
             mode in {STRATEGY_MODE_ML, STRATEGY_MODE_HYBRID}
@@ -331,6 +510,12 @@ class AlpacaTradingBot:
                 time_window_mode=self.config.time_window_mode,
                 regime_filter_enabled=self.config.regime_filter_enabled,
                 orb_filter_mode=self.config.orb_filter_mode,
+                breakout_exit_style=self.config.breakout_exit_style,
+                breakout_tight_stop_fraction=self.config.breakout_tight_stop_fraction,
+                breakout_max_stop_pct=self.config.breakout_max_stop_pct,
+                mean_reversion_exit_style=self.config.mean_reversion_exit_style,
+                mean_reversion_max_atr_percentile=self.config.mean_reversion_max_atr_percentile,
+                mean_reversion_trend_filter=self.config.mean_reversion_trend_filter,
             )
         )
 
@@ -357,6 +542,7 @@ class AlpacaTradingBot:
         for symbol in list(self._position_first_seen_utc):
             if symbol not in positions:
                 del self._position_first_seen_utc[symbol]
+                self._breakout_stored_stop.pop(symbol, None)
 
     def _should_process_decision_timestamp(self, timestamp: datetime) -> bool:
         last_processed = self._last_processed_decision_timestamp
@@ -668,6 +854,7 @@ class AlpacaTradingBot:
         bars_needed = max(
             self.config.sma_bars,
             25,
+            50,  # minimum for trend_sma (50-bar SMA used by mean_reversion_trend_filter)
             estimate_atr_percentile_lookback_bars(self.config.bar_timeframe_minutes),
             estimate_regime_lookback_bars(self.config.bar_timeframe_minutes),
         )
@@ -680,7 +867,7 @@ class AlpacaTradingBot:
         highs = [float(bar.high) for bar in intraday_bars]
         lows = [float(bar.low) for bar in intraday_bars]
         timestamps = [pd.Timestamp(getattr(bar, "timestamp")) for bar in intraday_bars]
-        min_history_bars = 2 if effective_strategy_mode == STRATEGY_MODE_BREAKOUT else max(20, self.config.sma_bars)
+        min_history_bars = 2 if effective_strategy_mode in (STRATEGY_MODE_BREAKOUT, STRATEGY_MODE_ORB) else max(20, self.config.sma_bars)
         if len(closes) < min_history_bars:
             raise RuntimeError(
                 f"Not enough completed bars for {symbol} at {aligned_decision_timestamp.isoformat()}: got {len(closes)}"
@@ -698,6 +885,7 @@ class AlpacaTradingBot:
             if len(closes) >= self.config.sma_bars
             else price
         )
+        trend_sma = sum(closes[-50:]) / 50 if len(closes) >= 50 else None
         ml_signal = (
             self.get_ml_signal(symbol, decision_timestamp=aligned_decision_timestamp)
             if effective_strategy_mode in (STRATEGY_MODE_ML, STRATEGY_MODE_HYBRID)
@@ -733,6 +921,27 @@ class AlpacaTradingBot:
             else None
         )
         bullish_regime = self._get_hourly_regime(symbol, aligned_decision_timestamp)
+
+        # Compute and cache the capped breakout stop at entry time (BREAKOUT mode only).
+        # If we're now holding and have no stored stop yet, compute it now.
+        or_low = opening_range_lows[-1] if opening_range_lows else None
+        if (
+            holding
+            and effective_strategy_mode == STRATEGY_MODE_BREAKOUT
+            and symbol not in self._breakout_stored_stop
+            and or_low is not None
+            and position is not None
+        ):
+            entry = float(position.avg_entry_price)
+            capped_stop = get_capped_breakout_stop_price(entry, or_low, strategy.config.breakout_max_stop_pct)
+            self._breakout_stored_stop[symbol] = capped_stop
+            logger.info(
+                "breakout entry symbol=%s entry=%.4f or_low=%.4f capped_stop=%.4f dist_pct=%.2f%%",
+                symbol, entry, or_low, capped_stop, (entry - capped_stop) / entry * 100,
+            )
+
+        effective_stop_price = self._breakout_stored_stop.get(symbol) if holding else None
+
         action = strategy.decide_action(
             price,
             sma,
@@ -743,10 +952,12 @@ class AlpacaTradingBot:
             time_window_open=self._is_in_entry_window(aligned_decision_timestamp.astimezone(_ET)),
             bullish_regime=bullish_regime,
             opening_range_high=opening_range_highs[-1] if opening_range_highs else None,
-            opening_range_low=opening_range_lows[-1] if opening_range_lows else None,
+            opening_range_low=or_low,
             position_entry_price=float(position.avg_entry_price) if position is not None else None,
             volume_ratio=volume_ratio,
             volatility_ratio=volatility_ratio,
+            effective_stop_price=effective_stop_price,
+            trend_sma=trend_sma,
         )
         return SymbolEvaluation(
             price=price,

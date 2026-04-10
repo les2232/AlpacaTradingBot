@@ -16,7 +16,19 @@
       "Bash(powershell:*)",
       "Bash(Test-Path \"C:\\\\Users\\\\lesco\\\\Desktop\\\\AlpacaTradingBot-1\\\\run_research.ps1\")",
       "Bash(Get-Item \"C:\\\\Users\\\\lesco\\\\Desktop\\\\AlpacaTradingBot-1\\\\run_research.ps1\")",
-      "Bash(Select-Object Name, LastWriteTime, Length)"
+      "Bash(Select-Object Name, LastWriteTime, Length)",
+      "Bash(pip install:*)",
+      "Bash(find \"C:\\\\Users\\\\lesco\\\\Desktop\\\\AlpacaTradingBot-1\\\\results\" -type f -name \"*.csv\" -exec ls -lh {} \\\\;)",
+      "Bash(sort -k5 -hr)",
+      "Bash(ls -ldt \"C:\\\\Users\\\\lesco\\\\Desktop\\\\AlpacaTradingBot-1\\\\results\"/compare_suite*)",
+      "Bash(wc:*)",
+      "Bash(xargs -I {} sh -c 'echo \"=== {} ===\" && head -3 \"{}\"')",
+      "Bash(sed -n '149,180p' backtest_runner.py)",
+      "Bash(sed -n '1037,1240p' backtest_runner.py)",
+      "Bash(ls -t C:/Users/lesco/Desktop/AlpacaTradingBot-1/results/compare_suite_*)",
+      "Bash(ls -lt C:/Users/lesco/Desktop/AlpacaTradingBot-1/results/*.csv)",
+      "Bash(dir /c/Users/lesco/Desktop/AlpacaTradingBot-1/datasets)",
+      "Bash(wait)"
     ]
   }
 }
