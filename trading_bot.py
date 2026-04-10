@@ -31,6 +31,7 @@ except Exception as exc:
 else:
     _ML_PREDICT_IMPORT_ERROR = None
 
+from botlog import BotLogger
 from storage import BotStorage
 from strategy import (
     BREAKOUT_EXIT_CHOICES,
@@ -102,7 +103,7 @@ class BotConfig:
     max_orders_per_minute: int = 6
     max_price_deviation_bps: float = 75.0
     max_data_delay_seconds: int = 1800
-    max_live_price_age_seconds: int = 30
+    max_live_price_age_seconds: int = 1200
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,7 @@ class BotSnapshot:
 class OrderSnapshot:
     order_id: str
     submitted_at: str | None
+    filled_at: str | None
     symbol: str
     side: str
     status: str
@@ -159,11 +161,48 @@ class OrderSnapshot:
     notional: float | None
 
 
+@dataclass(frozen=True)
+class ExecutionPreview:
+    symbol: str
+    action: str
+    status: str
+    reason: str | None = None
+    detail: str | None = None
+    live_price: float | None = None
+    signal_price: float | None = None
+    price_deviation_bps: float | None = None
+    live_price_age_s: float | None = None
+
+
+@dataclass(frozen=True)
+class RunCycleReport:
+    decision_timestamp: str
+    execute_orders: bool
+    processed_bar: bool
+    skip_reason: str
+    buy_signals: int
+    sell_signals: int
+    hold_signals: int
+    error_signals: int
+    orders_submitted: int
+
+
 _ET = pytz.timezone("America/New_York")
 _SESSION_ENTRY_START = dt_time(9, 45)   # no new entries before this
 _SESSION_ENTRY_END   = dt_time(15, 45)  # no new entries after this
 _SESSION_FLATTEN_AT  = dt_time(15, 55)  # forced EOD flatten deadline
 DEFAULT_RUNTIME_CONFIG_PATH = Path("config") / "live_config.json"
+_PRICE_STREAM_FEED_BY_NAME = {
+    "iex": DataFeed.IEX,
+    "sip": DataFeed.SIP,
+    "delayed_sip": DataFeed.DELAYED_SIP,
+}
+
+
+def _minutes_to_timeframe(minutes: int) -> TimeFrame:
+    if minutes >= 60 and minutes % 60 == 0:
+        return TimeFrame(minutes // 60, TimeFrameUnit.Hour)
+    return TimeFrame(minutes, TimeFrameUnit.Minute)
 
 
 def _safe_float(value: str | None, default: float) -> float:
@@ -171,6 +210,13 @@ def _safe_float(value: str | None, default: float) -> float:
         return float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def _normalize_enum_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text.lower()
 
 
 def _parse_symbol_strategy_map(raw_value: str | None) -> dict[str, str]:
@@ -382,7 +428,7 @@ def load_config() -> BotConfig:
         max_orders_per_minute=int(os.getenv("MAX_ORDERS_PER_MINUTE", "6")),
         max_price_deviation_bps=_safe_float(os.getenv("MAX_PRICE_DEVIATION_BPS"), 75.0),
         max_data_delay_seconds=int(os.getenv("MAX_DATA_DELAY_SECONDS", "1800")),
-        max_live_price_age_seconds=int(os.getenv("MAX_LIVE_PRICE_AGE_SECONDS", "30")),
+        max_live_price_age_seconds=int(os.getenv("MAX_LIVE_PRICE_AGE_SECONDS", "1200")),
     )
 
     runtime_path, runtime = _load_runtime_config_payload()
@@ -407,6 +453,17 @@ class AlpacaTradingBot:
         self._api_secret = api_secret
         db_path = Path(os.getenv("BOT_DB_PATH", "bot_history.db"))
         self.storage = BotStorage(db_path)
+        self.blog = BotLogger(log_root="logs")
+        # Fill-tracking state (keyed by order_id)
+        self._order_submission_ts: dict[str, str] = {}    # order_id → decision_ts at submit time
+        self._order_submission_side: dict[str, str] = {}  # order_id → "buy" | "sell"
+        self._order_exit_reason: dict[str, str] = {}      # order_id → exit reason for sell orders
+        self._logged_fills: set[tuple[str, float]] = set() # (order_id, filled_qty) — prevents duplicates
+        self._kill_switch_warned_pcts: set[int] = set()   # tracks which % thresholds already logged (50, 75)
+        # Position lifecycle state (keyed by symbol)
+        self._position_entry_price: dict[str, float] = {} # symbol → fill price at entry
+        self._position_entry_ts: dict[str, str] = {}      # symbol → decision_ts at entry
+        self._position_qty: dict[str, float] = {}         # symbol → qty at entry
         self._latest_prices: dict[str, float] = {}
         self._latest_price_times: dict[str, float] = {}
         self._latest_trade_times: dict[str, float] = {}
@@ -416,10 +473,12 @@ class AlpacaTradingBot:
         self.data_stream: StockDataStream | None = None
         self._stream_thread: threading.Thread | None = None
         self._ml_disabled_reason: str | None = None
+        self._order_signal_price: dict[str, float] = {}
         self._last_processed_decision_timestamp: datetime | None = None
         self._position_first_seen_utc: dict[str, datetime] = {}
         self._bars_cache: dict[tuple[str, int, int, str], list[Any]] = {}
         self._hourly_regime_cache: dict[tuple[str, str], bool | None] = {}
+        self._last_run_cycle_report: RunCycleReport | None = None
         self.strategy = Strategy(
             StrategyConfig(
                 strategy_mode=config.strategy_mode,
@@ -526,6 +585,18 @@ class AlpacaTradingBot:
         logger.info("%s %s", reason, detail)
         print(f"{reason}: {detail}")
 
+    def _preferred_price_stream_feed(self) -> DataFeed:
+        raw = os.getenv("PRICE_STREAM_FEED", "iex").strip().lower()
+        return _PRICE_STREAM_FEED_BY_NAME.get(raw, DataFeed.IEX)
+
+    def _latest_trade_feeds(self) -> list[DataFeed]:
+        preferred = self._preferred_price_stream_feed()
+        feeds: list[DataFeed] = []
+        for feed in (preferred, DataFeed.IEX, DataFeed.SIP):
+            if feed not in feeds:
+                feeds.append(feed)
+        return feeds
+
     def _position_holding_minutes(self, symbol: str, now_utc: datetime) -> float | None:
         first_seen = self._position_first_seen_utc.get(symbol)
         if first_seen is None:
@@ -587,10 +658,17 @@ class AlpacaTradingBot:
         if not self._stream_enabled or self._stream_thread is not None:
             return
 
-        self.data_stream = StockDataStream(self._api_key, self._api_secret, feed=DataFeed.IEX)
-        self.data_stream.subscribe_trades(self._handle_trade, *self.config.symbols)
-        self._stream_thread = threading.Thread(target=self._run_price_stream, daemon=True)
-        self._stream_thread.start()
+        try:
+            stream_feed = self._preferred_price_stream_feed()
+            self.data_stream = StockDataStream(self._api_key, self._api_secret, feed=stream_feed)
+            self.data_stream.subscribe_trades(self._handle_trade, *self.config.symbols)
+            self._stream_thread = threading.Thread(target=self._run_price_stream, daemon=True)
+            self._stream_thread.start()
+            self._stream_error = None
+        except Exception as exc:
+            self._stream_error = str(exc)
+            self.data_stream = None
+            self._stream_thread = None
 
     def _run_price_stream(self) -> None:
         try:
@@ -633,26 +711,35 @@ class AlpacaTradingBot:
                 return cached_price, max(0.0, time.time() - cached_trade_at)
             return cached_price, time.time() - cached_at
 
-        request = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
-        latest = cast(dict[str, Any], cast(Any, self.data).get_stock_latest_trade(request))
-        trade = latest[symbol]
-        price = float(trade.price)
-        timestamp = getattr(trade, "timestamp", None)
-        if isinstance(timestamp, datetime):
-            if timestamp.tzinfo is None:
-                trade_timestamp = timestamp.replace(tzinfo=timezone.utc)
-            else:
-                trade_timestamp = timestamp.astimezone(timezone.utc)
-            age_seconds = max(0.0, (datetime.now(timezone.utc) - trade_timestamp).total_seconds())
-        else:
-            age_seconds = 0.0
+        last_exc: Exception | None = None
+        for feed in self._latest_trade_feeds():
+            try:
+                request = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=feed)
+                latest = cast(dict[str, Any], cast(Any, self.data).get_stock_latest_trade(request))
+                trade = latest[symbol]
+                price = float(trade.price)
+                timestamp = getattr(trade, "timestamp", None)
+                if isinstance(timestamp, datetime):
+                    if timestamp.tzinfo is None:
+                        trade_timestamp = timestamp.replace(tzinfo=timezone.utc)
+                    else:
+                        trade_timestamp = timestamp.astimezone(timezone.utc)
+                    age_seconds = max(0.0, (datetime.now(timezone.utc) - trade_timestamp).total_seconds())
+                else:
+                    age_seconds = 0.0
 
-        with self._price_lock:
-            self._latest_prices[symbol] = price
-            self._latest_price_times[symbol] = time.time()
-            self._latest_trade_times[symbol] = time.time() - age_seconds
+                with self._price_lock:
+                    self._latest_prices[symbol] = price
+                    self._latest_price_times[symbol] = time.time()
+                    self._latest_trade_times[symbol] = time.time() - age_seconds
 
-        return price, age_seconds
+                return price, age_seconds
+            except Exception as exc:
+                last_exc = exc
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"Could not resolve latest trade for {symbol}")
 
     def get_latest_price(self, symbol: str) -> float:
         price, _ = self.get_latest_price_with_age(symbol)
@@ -693,28 +780,32 @@ class AlpacaTradingBot:
         cache_key = (symbol, timeframe_minutes, bars_needed, aligned_decision_timestamp.isoformat())
         cached_bars = self._bars_cache.get(cache_key)
         if cached_bars is not None:
+            print(f"[DEBUG _get_bars] {symbol} CACHE HIT key={cache_key}")
             return cached_bars
 
         trading_minutes_per_day = 390
         trading_days_needed = max(3, math.ceil((bars_needed * timeframe_minutes) / trading_minutes_per_day))
         start = aligned_decision_timestamp - timedelta(days=trading_days_needed * 6)
         request_end = aligned_decision_timestamp + timedelta(minutes=timeframe_minutes)
+        tf = _minutes_to_timeframe(timeframe_minutes)
+        print(f"[DEBUG _get_bars] {symbol} bars_needed={bars_needed} timeframe_minutes={timeframe_minutes} tf={tf} decision_ts={aligned_decision_timestamp.isoformat()} start={start.isoformat()} end={request_end.isoformat()}")
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
-            timeframe=TimeFrame(timeframe_minutes, TimeFrameUnit.Minute),
+            timeframe=tf,
             start=start,
             end=request_end,
-            limit=bars_needed + 8,
             feed=DataFeed.IEX,
         )
 
         bars_response = cast(Any, self.data).get_stock_bars(request)
         bars = cast(list[Any], bars_response.data.get(symbol, []))
+        print(f"[DEBUG _get_bars] {symbol} API returned {len(bars)} bars | first={self._get_bar_start_time(bars[0]).isoformat() if bars else 'N/A'} | last={self._get_bar_start_time(bars[-1]).isoformat() if bars else 'N/A'}")
         completed_bars = [
             bar
             for bar in bars
             if (self._get_bar_start_time(bar) + timedelta(minutes=timeframe_minutes)) <= aligned_decision_timestamp
         ]
+        print(f"[DEBUG _get_bars] {symbol} completed_bars={len(completed_bars)} | last_completed={self._get_bar_start_time(completed_bars[-1]).isoformat() if completed_bars else 'N/A'}")
         result = completed_bars[-bars_needed:]
         self._bars_cache[cache_key] = result
         return result
@@ -874,6 +965,14 @@ class AlpacaTradingBot:
             )
         latest_bar_close = self._latest_bar_close_time(intraday_bars)
         bar_delay_seconds = max(0.0, (aligned_decision_timestamp - latest_bar_close).total_seconds())
+        self.blog.bar_received(
+            symbol=symbol,
+            bar_close=closes[-1],
+            bar_volume=float(getattr(intraday_bars[-1], "volume", 0) or 0),
+            bar_ts=self._get_bar_start_time(intraday_bars[-1]).isoformat(),
+            bar_age_s=bar_delay_seconds,
+            decision_ts=aligned_decision_timestamp.isoformat(),
+        )
         if bar_delay_seconds > self.config.max_data_delay_seconds:
             raise RuntimeError(
                 f"Stale completed bars for {symbol}: latest close {latest_bar_close.isoformat()}"
@@ -942,14 +1041,17 @@ class AlpacaTradingBot:
 
         effective_stop_price = self._breakout_stored_stop.get(symbol) if holding else None
 
+        _window_open = self._is_in_entry_window(aligned_decision_timestamp.astimezone(_ET))
+        _atr_pct_now = atr_pct_values[-1] if atr_pct_values else None
+        _atr_pct_now_val = atr_percentiles[-1]
         action = strategy.decide_action(
             price,
             sma,
             ml_signal,
             holding,
-            atr_pct_values[-1] if atr_pct_values else None,
-            atr_percentiles[-1],
-            time_window_open=self._is_in_entry_window(aligned_decision_timestamp.astimezone(_ET)),
+            _atr_pct_now,
+            _atr_pct_now_val,
+            time_window_open=_window_open,
             bullish_regime=bullish_regime,
             opening_range_high=opening_range_highs[-1] if opening_range_highs else None,
             opening_range_low=or_low,
@@ -958,6 +1060,44 @@ class AlpacaTradingBot:
             volatility_ratio=volatility_ratio,
             effective_stop_price=effective_stop_price,
             trend_sma=trend_sma,
+        )
+        # --- structured signal log ---
+        _trend_pass = (price >= trend_sma) if trend_sma is not None else None
+        _atr_pass = (
+            (_atr_pct_now_val <= self.config.mean_reversion_max_atr_percentile)
+            if (_atr_pct_now_val is not None and self.config.mean_reversion_max_atr_percentile > 0)
+            else None
+        )
+        if action in ("BUY", "SELL"):
+            _rejection = None
+        else:
+            _failing = []
+            if _trend_pass is False:
+                _failing.append("trend_filter")
+            if _atr_pass is False:
+                _failing.append("atr_filter")
+            if _failing:
+                _rejection = "|".join(_failing)
+            elif holding:
+                _rejection = "holding_no_exit"   # position open, awaiting exit signal
+            else:
+                _rejection = "no_signal"          # no entry condition met
+        self.blog.signal(
+            symbol=symbol,
+            decision_ts=aligned_decision_timestamp.isoformat(),
+            bar_close=price,
+            sma=sma,
+            trend_sma=trend_sma,
+            atr_pct=_atr_pct_now,
+            atr_percentile=_atr_pct_now_val,
+            volume_ratio=volume_ratio,
+            action=action,
+            holding=holding,
+            trend_filter_pass=_trend_pass,
+            atr_filter_pass=_atr_pass,
+            window_open=_window_open,
+            rejection=_rejection,
+            ml_prob=ml_signal.probability_up if ml_signal.probability_up != 0.5 else None,
         )
         return SymbolEvaluation(
             price=price,
@@ -1070,13 +1210,16 @@ class AlpacaTradingBot:
         snapshots: list[OrderSnapshot] = []
 
         for order in orders:
+            _filled_at_raw = getattr(order, "filled_at", None)
+            _filled_at_str = str(_filled_at_raw) if _filled_at_raw is not None else None
             snapshots.append(
                 OrderSnapshot(
                     order_id=str(getattr(order, "id", "")),
                     submitted_at=str(getattr(order, "submitted_at", None)),
+                    filled_at=_filled_at_str,
                     symbol=str(getattr(order, "symbol", "")),
-                    side=str(getattr(order, "side", "")),
-                    status=str(getattr(order, "status", "")),
+                    side=_normalize_enum_text(getattr(order, "side", "")),
+                    status=_normalize_enum_text(getattr(order, "status", "")),
                     qty=float(order.qty) if getattr(order, "qty", None) else None,
                     filled_qty=float(order.filled_qty) if getattr(order, "filled_qty", None) else None,
                     filled_avg_price=(
@@ -1135,20 +1278,339 @@ class AlpacaTradingBot:
         proposed_value = proposed_qty * live_price
         return (existing_position_value + proposed_value) > self.config.max_symbol_exposure_usd
 
-    def flatten_positions(self, positions: dict[str, Position], open_order_symbols: set[str]) -> None:
+    def get_last_run_cycle_report(self) -> RunCycleReport | None:
+        return self._last_run_cycle_report
+
+    def preview_execution(self, snapshot: BotSnapshot) -> list[ExecutionPreview]:
+        try:
+            snapshot_ts = datetime.fromisoformat(snapshot.timestamp_utc)
+        except ValueError:
+            snapshot_ts = self.get_decision_timestamp()
+        if snapshot_ts.tzinfo is None:
+            snapshot_ts = snapshot_ts.replace(tzinfo=timezone.utc)
+
+        now_et = self._et_now()
+        in_entry_window = self._is_in_entry_window(now_et)
+        open_positions = len(snapshot.positions)
+        remaining_buying_power = snapshot.buying_power
+        previews: list[ExecutionPreview] = []
+
+        try:
+            open_orders = self.get_open_orders()
+        except Exception:
+            open_orders = []
+        open_order_symbols = {
+            str(getattr(order, "symbol", ""))
+            for order in open_orders
+            if getattr(order, "symbol", None)
+        }
+        recent_order_count = self._count_recent_orders(window_seconds=60)
+
+        for item in snapshot.symbols:
+            symbol = item.symbol
+            action = item.action
+
+            if item.error:
+                previews.append(ExecutionPreview(symbol=symbol, action=action, status="ERROR", reason=item.error))
+                continue
+            if action not in ("BUY", "SELL"):
+                previews.append(ExecutionPreview(symbol=symbol, action=action, status="NO_SIGNAL"))
+                continue
+            if symbol in open_order_symbols:
+                previews.append(
+                    ExecutionPreview(symbol=symbol, action=action, status="BLOCKED", reason="open_order_in_flight")
+                )
+                continue
+            if recent_order_count >= self.config.max_orders_per_minute:
+                previews.append(
+                    ExecutionPreview(symbol=symbol, action=action, status="BLOCKED", reason="max_orders_per_minute")
+                )
+                continue
+
+            if action == "BUY":
+                if snapshot.kill_switch_triggered:
+                    previews.append(
+                        ExecutionPreview(symbol=symbol, action=action, status="BLOCKED", reason="kill_switch_active")
+                    )
+                    continue
+                if not in_entry_window:
+                    previews.append(
+                        ExecutionPreview(symbol=symbol, action=action, status="BLOCKED", reason="outside_entry_window")
+                    )
+                    continue
+                if symbol in snapshot.positions:
+                    previews.append(
+                        ExecutionPreview(symbol=symbol, action=action, status="BLOCKED", reason="already_holding")
+                    )
+                    continue
+                if open_positions >= self.config.max_open_positions:
+                    previews.append(
+                        ExecutionPreview(
+                            symbol=symbol,
+                            action=action,
+                            status="BLOCKED",
+                            reason="max_open_positions_reached",
+                        )
+                    )
+                    continue
+                try:
+                    live_price, live_price_age = self.get_latest_price_with_age(symbol)
+                except Exception as exc:
+                    previews.append(
+                        ExecutionPreview(
+                            symbol=symbol,
+                            action=action,
+                            status="ERROR",
+                            reason="live_price_unavailable",
+                            detail=str(exc),
+                        )
+                    )
+                    continue
+                signal_price = item.price or 0.0
+                deviation_bps = abs((live_price / signal_price) - 1.0) * 10_000 if signal_price > 0 else None
+                if live_price_age > self.config.max_live_price_age_seconds:
+                    previews.append(
+                        ExecutionPreview(
+                            symbol=symbol,
+                            action=action,
+                            status="BLOCKED",
+                            reason="stale_live_price",
+                            live_price=live_price,
+                            signal_price=signal_price or None,
+                            price_deviation_bps=deviation_bps,
+                            live_price_age_s=live_price_age,
+                        )
+                    )
+                    continue
+                if self._is_price_collar_breached(signal_price, live_price):
+                    previews.append(
+                        ExecutionPreview(
+                            symbol=symbol,
+                            action=action,
+                            status="BLOCKED",
+                            reason="price_collar_breached",
+                            live_price=live_price,
+                            signal_price=signal_price or None,
+                            price_deviation_bps=deviation_bps,
+                            live_price_age_s=live_price_age,
+                        )
+                    )
+                    continue
+                if self._is_symbol_exposure_exceeded(symbol, live_price, snapshot.positions):
+                    previews.append(
+                        ExecutionPreview(
+                            symbol=symbol,
+                            action=action,
+                            status="BLOCKED",
+                            reason="symbol_exposure_exceeded",
+                            live_price=live_price,
+                            signal_price=signal_price or None,
+                            price_deviation_bps=deviation_bps,
+                            live_price_age_s=live_price_age,
+                        )
+                    )
+                    continue
+                trade_budget = min(self.config.max_usd_per_trade, remaining_buying_power)
+                if trade_budget < live_price:
+                    previews.append(
+                        ExecutionPreview(
+                            symbol=symbol,
+                            action=action,
+                            status="BLOCKED",
+                            reason="insufficient_buying_power",
+                            live_price=live_price,
+                            signal_price=signal_price or None,
+                            price_deviation_bps=deviation_bps,
+                            live_price_age_s=live_price_age,
+                        )
+                    )
+                    continue
+                previews.append(
+                    ExecutionPreview(
+                        symbol=symbol,
+                        action=action,
+                        status="READY",
+                        live_price=live_price,
+                        signal_price=signal_price or None,
+                        price_deviation_bps=deviation_bps,
+                        live_price_age_s=live_price_age,
+                    )
+                )
+                recent_order_count += 1
+                open_positions += 1
+                estimated_cost = int(self.config.max_usd_per_trade // live_price) * live_price
+                remaining_buying_power = max(0.0, remaining_buying_power - estimated_cost)
+                continue
+
+            if symbol not in snapshot.positions:
+                previews.append(
+                    ExecutionPreview(symbol=symbol, action=action, status="BLOCKED", reason="not_holding")
+                )
+                continue
+            try:
+                live_price, live_price_age = self.get_latest_price_with_age(symbol)
+            except Exception as exc:
+                previews.append(
+                    ExecutionPreview(
+                        symbol=symbol,
+                        action=action,
+                        status="ERROR",
+                        reason="live_price_unavailable",
+                        detail=str(exc),
+                    )
+                )
+                continue
+            signal_price = item.price or 0.0
+            deviation_bps = abs((live_price / signal_price) - 1.0) * 10_000 if signal_price > 0 else None
+            if live_price_age > self.config.max_live_price_age_seconds:
+                previews.append(
+                    ExecutionPreview(
+                        symbol=symbol,
+                        action=action,
+                        status="BLOCKED",
+                        reason="stale_live_price",
+                        live_price=live_price,
+                        signal_price=signal_price or None,
+                        price_deviation_bps=deviation_bps,
+                        live_price_age_s=live_price_age,
+                    )
+                )
+                continue
+            if self._is_price_collar_breached(signal_price, live_price):
+                previews.append(
+                    ExecutionPreview(
+                        symbol=symbol,
+                        action=action,
+                        status="BLOCKED",
+                        reason="price_collar_breached",
+                        live_price=live_price,
+                        signal_price=signal_price or None,
+                        price_deviation_bps=deviation_bps,
+                        live_price_age_s=live_price_age,
+                    )
+                )
+                continue
+            previews.append(
+                ExecutionPreview(
+                    symbol=symbol,
+                    action=action,
+                    status="READY",
+                    live_price=live_price,
+                    signal_price=signal_price or None,
+                    price_deviation_bps=deviation_bps,
+                    live_price_age_s=live_price_age,
+                )
+            )
+            recent_order_count += 1
+
+        return previews
+
+    def flatten_positions(self, positions: dict[str, Position], open_order_symbols: set[str], exit_reason: str = "eod_flatten") -> None:
         for symbol, position in positions.items():
             if symbol in open_order_symbols:
                 print(f"Skip flatten {symbol}: existing open order in flight")
                 continue
             try:
-                self.place_market_sell(symbol, position)
+                self.place_market_sell(symbol, position, exit_reason=exit_reason)
             except Exception as exc:
                 print(f"Flatten {symbol} ERROR: {exc}")
 
-    def record_state(self, snapshot: BotSnapshot, orders_limit: int = 20) -> list[OrderSnapshot]:
+    def record_state(self, snapshot: BotSnapshot, orders_limit: int = 50) -> list[OrderSnapshot]:
         orders = self.get_recent_orders(limit=orders_limit)
         self.storage.save_snapshot(snapshot, orders)
+        self._log_fills_from_orders(orders)
         return orders
+
+    def _log_fills_from_orders(self, orders: list[OrderSnapshot]) -> None:
+        """
+        Emit fill log events for any new fill states not yet logged.
+
+        Cache key is (order_id, filled_qty) so that a partial fill and the
+        subsequent final fill are each logged exactly once.
+        """
+        for order in orders:
+            status = _normalize_enum_text(order.status)
+            side = _normalize_enum_text(order.side)
+            if status not in ("filled", "partially_filled"):
+                continue
+            if order.filled_avg_price is None or order.filled_qty is None:
+                continue
+
+            fill_qty = float(order.filled_qty)
+            cache_key = (order.order_id, round(fill_qty, 6))
+            if cache_key in self._logged_fills:
+                continue
+            self._logged_fills.add(cache_key)
+
+            # Use the decision_ts from submission time, not the current bar.
+            dec_ts = self._order_submission_ts.get(
+                order.order_id, self.get_decision_timestamp().isoformat()
+            )
+            signal_price = self._order_signal_price.get(order.order_id)
+            fill_price = float(order.filled_avg_price)
+            requested_qty = float(order.qty or fill_qty)
+
+            # Partial fill — always log it, even if the order later completes.
+            if status == "partially_filled" or fill_qty < requested_qty:
+                self.blog.order_partial_fill(
+                    symbol=order.symbol,
+                    decision_ts=dec_ts,
+                    fill_price=fill_price,
+                    filled_qty=fill_qty,
+                    requested_qty=requested_qty,
+                    order_id=order.order_id,
+                )
+
+            # Final fill — log order.filled and update position lifecycle.
+            if status == "filled":
+                self.blog.order_filled(
+                    symbol=order.symbol,
+                    decision_ts=dec_ts,
+                    side=side,
+                    fill_price=fill_price,
+                    fill_qty=fill_qty,
+                    order_id=order.order_id,
+                    submitted_at=order.submitted_at or dec_ts,
+                    filled_at=order.filled_at or order.submitted_at or dec_ts,
+                    signal_bar_close=signal_price,
+                )
+
+                if side == "buy":
+                    # Record entry state so we can compute PnL when the position closes.
+                    self._position_entry_price[order.symbol] = fill_price
+                    self._position_entry_ts[order.symbol] = dec_ts
+                    self._position_qty[order.symbol] = fill_qty
+                    self.blog.position_opened(
+                        symbol=order.symbol,
+                        decision_ts=dec_ts,
+                        entry_price=fill_price,
+                        qty=fill_qty,
+                        strategy_mode=self.config.strategy_mode,
+                    )
+
+                elif side == "sell":
+                    entry_price = self._position_entry_price.pop(order.symbol, fill_price)
+                    self._position_entry_ts.pop(order.symbol, None)
+                    self._position_qty.pop(order.symbol, None)
+                    holding_minutes = (
+                        self._position_holding_minutes(order.symbol, datetime.now(timezone.utc)) or 0.0
+                    )
+                    holding_bars = max(1, round(holding_minutes / self.config.bar_timeframe_minutes))
+                    exit_reason = self._order_exit_reason.get(order.order_id, "sell_signal")
+                    self.blog.position_closed(
+                        symbol=order.symbol,
+                        decision_ts=dec_ts,
+                        entry_price=entry_price,
+                        exit_price=fill_price,
+                        qty=fill_qty,
+                        holding_bars=holding_bars,
+                        holding_minutes=holding_minutes,
+                        exit_reason=exit_reason,
+                    )
+                self._order_submission_ts.pop(order.order_id, None)
+                self._order_submission_side.pop(order.order_id, None)
+                self._order_exit_reason.pop(order.order_id, None)
+                self._order_signal_price.pop(order.order_id, None)
 
     def capture_state(
         self,
@@ -1164,6 +1626,8 @@ class AlpacaTradingBot:
         symbol: str,
         buying_power_available: float | None = None,
         price: float | None = None,
+        decision_ts: str | None = None,
+        signal_price: float | None = None,
     ) -> Any | None:
         execution_price = price if price is not None else self.get_latest_price(symbol)
         available_buying_power = buying_power_available
@@ -1198,9 +1662,33 @@ class AlpacaTradingBot:
             ),
         )
         print(f"Submitted BUY {symbol} qty={qty} approx=${qty * execution_price:.2f}")
+        order_id = str(getattr(order, "id", ""))
+        dec_ts = decision_ts or self.get_decision_timestamp().isoformat()
+        if order_id:
+            self._order_submission_ts[order_id] = dec_ts
+            self._order_submission_side[order_id] = "buy"
+            if signal_price is not None:
+                self._order_signal_price[order_id] = signal_price
+        self.blog.order_submitted(
+            symbol=symbol,
+            decision_ts=dec_ts,
+            side="buy",
+            qty=qty,
+            live_price=execution_price,
+            order_id=order_id,
+            signal_bar_close=signal_price,
+        )
         return order
 
-    def place_market_sell(self, symbol: str, position: Position) -> Any | None:
+    def place_market_sell(
+        self,
+        symbol: str,
+        position: Position,
+        exit_reason: str = "sell_signal",
+        live_price: float | None = None,
+        decision_ts: str | None = None,
+        signal_price: float | None = None,
+    ) -> Any | None:
         qty = int(float(position.qty))
         if qty <= 0:
             print(f"Skip SELL {symbol}: non-positive quantity {position.qty}")
@@ -1221,6 +1709,23 @@ class AlpacaTradingBot:
         )
         holding_text = f" holding_minutes={holding_minutes:.1f}" if holding_minutes is not None else ""
         print(f"Submitted SELL {symbol} qty={qty}{holding_text}")
+        order_id = str(getattr(order, "id", ""))
+        dec_ts = decision_ts or self.get_decision_timestamp().isoformat()
+        if order_id:
+            self._order_submission_ts[order_id] = dec_ts
+            self._order_submission_side[order_id] = "sell"
+            self._order_exit_reason[order_id] = exit_reason
+            if signal_price is not None:
+                self._order_signal_price[order_id] = signal_price
+        self.blog.order_submitted(
+            symbol=symbol,
+            decision_ts=dec_ts,
+            side="sell",
+            qty=qty,
+            live_price=float(live_price if live_price is not None else (position.current_price or position.avg_entry_price)),
+            order_id=order_id,
+            signal_bar_close=signal_price,
+        )
         return order
 
     def _seconds_until_next_bar(self) -> float:
@@ -1241,11 +1746,13 @@ class AlpacaTradingBot:
         t = (now_et or self._et_now()).time()
         return t >= _SESSION_FLATTEN_AT
 
-    def run_once(self, execute_orders: bool = True) -> BotSnapshot:
+    def run_once(self, execute_orders: bool = True, force_process: bool = False) -> BotSnapshot:
         print("\n=== BOT TICK ===")
+        self._bars_cache.clear()
+        self._hourly_regime_cache.clear()
         now_et = self._et_now()
         decision_timestamp = self.get_decision_timestamp()
-        should_process = self._should_process_decision_timestamp(decision_timestamp)
+        should_process = True if force_process else self._should_process_decision_timestamp(decision_timestamp)
         snapshot = self.build_snapshot(
             decision_timestamp=decision_timestamp,
             evaluate_signals=should_process,
@@ -1253,8 +1760,49 @@ class AlpacaTradingBot:
         print(f"Connected. Cash: {snapshot.cash} Buying power: {snapshot.buying_power}")
         print(f"Daily PnL: {snapshot.daily_pnl:.2f}")
         print(f"Strategy mode: {self.config.strategy_mode}")
+        print(
+            f"[CYCLE] decision_ts={decision_timestamp.isoformat()} "
+            f"execute_orders={execute_orders} should_process={should_process} "
+            f"force_process={force_process}"
+        )
+        buy_signals = sum(1 for item in snapshot.symbols if item.action == "BUY")
+        sell_signals = sum(1 for item in snapshot.symbols if item.action == "SELL")
+        hold_signals = sum(1 for item in snapshot.symbols if item.action == "HOLD")
+        error_signals = sum(1 for item in snapshot.symbols if item.action == "ERROR")
+        orders_submitted = 0
+
+        def _set_cycle_report(processed_bar: bool, skip_reason: str) -> None:
+            self._last_run_cycle_report = RunCycleReport(
+                decision_timestamp=decision_timestamp.isoformat(),
+                execute_orders=execute_orders,
+                processed_bar=processed_bar,
+                skip_reason=skip_reason,
+                buy_signals=buy_signals,
+                sell_signals=sell_signals,
+                hold_signals=hold_signals,
+                error_signals=error_signals,
+                orders_submitted=orders_submitted,
+            )
+            self.blog.cycle_summary(
+                decision_ts=decision_timestamp.isoformat(),
+                execute_orders=execute_orders,
+                processed_bar=processed_bar,
+                skip_reason=skip_reason,
+                buy_signals=buy_signals,
+                sell_signals=sell_signals,
+                hold_signals=hold_signals,
+                error_signals=error_signals,
+                orders_submitted=orders_submitted,
+            )
+            print(
+                f"[CYCLE RESULT] processed_bar={processed_bar} reason={skip_reason} "
+                f"buy={buy_signals} sell={sell_signals} hold={hold_signals} "
+                f"errors={error_signals} orders_submitted={orders_submitted}"
+            )
 
         if not should_process:
+            print("[CYCLE] Skipping duplicate bar before execution branch")
+            _set_cycle_report(processed_bar=False, skip_reason="duplicate_bar")
             self.record_state(snapshot)
             return snapshot
 
@@ -1263,10 +1811,12 @@ class AlpacaTradingBot:
                 market_open = self._is_market_open()
             except Exception as exc:
                 self._log_skip("SKIP_MARKET_CLOSED", str(exc))
+                _set_cycle_report(processed_bar=True, skip_reason="market_clock_error")
                 self.record_state(snapshot)
                 return snapshot
             if not market_open:
                 self._log_skip("SKIP_MARKET_CLOSED", "Alpaca market clock reports closed")
+                _set_cycle_report(processed_bar=True, skip_reason="market_closed")
                 self.record_state(snapshot)
                 return snapshot
             if not self._is_regular_hours(decision_timestamp):
@@ -1274,6 +1824,7 @@ class AlpacaTradingBot:
                     "SKIP_OUTSIDE_REGULAR_HOURS",
                     f"decision_timestamp={decision_timestamp.astimezone(_ET).strftime('%H:%M:%S')} ET",
                 )
+                _set_cycle_report(processed_bar=True, skip_reason="outside_regular_hours")
                 self.record_state(snapshot)
                 return snapshot
 
@@ -1290,11 +1841,30 @@ class AlpacaTradingBot:
             }
             self.flatten_positions(snapshot.positions, open_order_symbols)
             snapshot = self.build_snapshot(decision_timestamp=decision_timestamp, evaluate_signals=False)
+            _set_cycle_report(processed_bar=True, skip_reason="eod_flatten_window")
             self.record_state(snapshot)
             return snapshot
 
+        _ks_pct = (
+            round(-snapshot.daily_pnl / self.config.max_daily_loss_usd * 100, 1)
+            if self.config.max_daily_loss_usd > 0 else 0.0
+        )
+        for _threshold in (50, 75):
+            if _ks_pct >= _threshold and _threshold not in self._kill_switch_warned_pcts:
+                self._kill_switch_warned_pcts.add(_threshold)
+                self.blog.kill_switch(
+                    daily_pnl=snapshot.daily_pnl,
+                    daily_limit=self.config.max_daily_loss_usd,
+                    trigger=False,
+                    reason=f"warning_{_threshold}pct",
+                )
         if snapshot.kill_switch_triggered:
             print("Kill switch triggered.")
+            self.blog.kill_switch(
+                daily_pnl=snapshot.daily_pnl,
+                daily_limit=self.config.max_daily_loss_usd,
+                trigger=True,
+            )
             if execute_orders:
                 open_orders = self.get_open_orders()
                 open_order_symbols = {
@@ -1302,19 +1872,26 @@ class AlpacaTradingBot:
                     for order in open_orders
                     if getattr(order, "symbol", None)
                 }
-                self.flatten_positions(snapshot.positions, open_order_symbols)
+                self.flatten_positions(snapshot.positions, open_order_symbols, exit_reason="kill_switch")
                 snapshot = self.build_snapshot(decision_timestamp=decision_timestamp, evaluate_signals=False)
+            _set_cycle_report(processed_bar=True, skip_reason="kill_switch_active")
             self.record_state(snapshot)
             return snapshot
 
         if not execute_orders:
+            print("[CYCLE] Preview-only mode; execution branch will not submit orders")
             for item in snapshot.symbols:
                 suffix = f" ml_up={item.ml_probability_up:.3f}" if item.ml_probability_up is not None else ""
                 error_suffix = f" ERROR: {item.error}" if item.error else ""
                 print(f"{item.symbol} -> {item.action}{suffix}{error_suffix}")
+            _set_cycle_report(processed_bar=True, skip_reason="preview_only")
             self.record_state(snapshot)
             return snapshot
 
+        print(
+            f"[CYCLE] Entering live execution branch buy_signals={buy_signals} "
+            f"sell_signals={sell_signals} open_positions={len(snapshot.positions)}"
+        )
         in_entry_window = self._is_in_entry_window(now_et)
         if not in_entry_window:
             print(f"Outside entry window ({now_et.strftime('%H:%M:%S')} ET): new entries suppressed, exits still active")
@@ -1367,56 +1944,139 @@ class AlpacaTradingBot:
                     break
 
                 if action == "BUY":
+                    _dec_ts = decision_timestamp.isoformat() if decision_timestamp else ""
                     if not in_entry_window:
                         print(f"Skip {symbol} BUY: outside trading window ({now_et.strftime('%H:%M:%S')} ET)")
+                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
+                            allowed=False, block_reason="outside_entry_window",
+                            open_positions=open_positions, max_positions=self.config.max_open_positions,
+                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd)
                         continue
                     if symbol in positions:
                         print(f"Already holding {symbol}")
+                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
+                            allowed=False, block_reason="already_holding",
+                            open_positions=open_positions, max_positions=self.config.max_open_positions,
+                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd)
                         continue
                     if open_positions >= self.config.max_open_positions:
                         print("Max positions reached")
+                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
+                            allowed=False, block_reason="max_open_positions_reached",
+                            open_positions=open_positions, max_positions=self.config.max_open_positions,
+                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd)
                         continue
                     live_price, live_price_age = self.get_latest_price_with_age(symbol)
                     if live_price_age > self.config.max_live_price_age_seconds:
                         print(f"Skip {symbol}: stale live price age {live_price_age:.1f}s")
+                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
+                            allowed=False, block_reason="stale_live_price",
+                            open_positions=open_positions, max_positions=self.config.max_open_positions,
+                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
+                            live_price_age_s=round(live_price_age, 1))
                         continue
-                    if self._is_price_collar_breached(item.price or 0.0, live_price):
+                    _signal_price = item.price or 0.0
+                    _dev_bps = abs((live_price / _signal_price) - 1.0) * 10_000 if _signal_price > 0 else None
+                    if self._is_price_collar_breached(_signal_price, live_price):
                         print(
-                            f"Skip {symbol}: live price {live_price:.2f} breaches collar vs decision price {item.price:.2f}"
+                            f"Skip {symbol}: live price {live_price:.2f} breaches collar vs decision price {_signal_price:.2f}"
                         )
+                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
+                            allowed=False, block_reason="price_collar_breached",
+                            open_positions=open_positions, max_positions=self.config.max_open_positions,
+                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
+                            live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
                         continue
                     if self._is_symbol_exposure_exceeded(symbol, live_price, positions):
                         print(f"Skip {symbol}: max symbol exposure would be exceeded")
+                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
+                            allowed=False, block_reason="symbol_exposure_exceeded",
+                            open_positions=open_positions, max_positions=self.config.max_open_positions,
+                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd)
                         continue
+                    # All checks passed
+                    self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
+                        allowed=True, block_reason=None,
+                        open_positions=open_positions, max_positions=self.config.max_open_positions,
+                        daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
+                        live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
                     order = self.place_market_buy(
                         symbol,
                         buying_power_available=remaining_buying_power,
                         price=live_price,
+                        decision_ts=_dec_ts,
+                        signal_price=_signal_price,
                     )
                     if order is not None:
+                        orders_submitted += 1
                         open_positions += 1
                         recent_order_count += 1
                         estimated_cost = int(self.config.max_usd_per_trade // live_price) * live_price
                         remaining_buying_power = max(0.0, remaining_buying_power - estimated_cost)
 
                 elif action == "SELL" and symbol in positions:
+                    _dec_ts = decision_timestamp.isoformat() if decision_timestamp else ""
                     live_price, live_price_age = self.get_latest_price_with_age(symbol)
                     if live_price_age > self.config.max_live_price_age_seconds:
                         print(f"Skip {symbol}: stale live price age {live_price_age:.1f}s")
+                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="SELL",
+                            allowed=False, block_reason="stale_live_price",
+                            open_positions=open_positions, max_positions=self.config.max_open_positions,
+                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
+                            live_price_age_s=round(live_price_age, 1))
                         continue
-                    if self._is_price_collar_breached(item.price or 0.0, live_price):
+                    _signal_price = item.price or 0.0
+                    _dev_bps = abs((live_price / _signal_price) - 1.0) * 10_000 if _signal_price > 0 else None
+                    if self._is_price_collar_breached(_signal_price, live_price):
                         print(
                             f"Skip {symbol}: live price {live_price:.2f} breaches collar vs decision price {item.price:.2f}"
                         )
+                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="SELL",
+                            allowed=False, block_reason="price_collar_breached",
+                            open_positions=open_positions, max_positions=self.config.max_open_positions,
+                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
+                            live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
                         continue
-                    order = self.place_market_sell(symbol, positions[symbol])
+                    self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="SELL",
+                        allowed=True, block_reason=None,
+                        open_positions=open_positions, max_positions=self.config.max_open_positions,
+                        daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
+                        live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
+                    order = self.place_market_sell(
+                        symbol,
+                        positions[symbol],
+                        live_price=live_price,
+                        decision_ts=_dec_ts,
+                        signal_price=_signal_price,
+                    )
                     if order is not None:
+                        orders_submitted += 1
                         open_positions = max(0, open_positions - 1)
                         recent_order_count += 1
 
             except Exception as exc:
+                import traceback
                 print(f"{symbol} ERROR: {exc}")
+                print(f"[DEBUG TRACEBACK] {traceback.format_exc()}")
+                try:
+                    self.blog.execution_error(
+                        symbol=symbol,
+                        decision_ts=decision_timestamp.isoformat(),
+                        action=action if "action" in locals() else "UNKNOWN",
+                        error=str(exc),
+                    )
+                except Exception:
+                    pass
 
+        final_reason = "execution_completed"
+        if orders_submitted == 0:
+            if buy_signals > 0 or sell_signals > 0:
+                print("[CYCLE] Execution branch completed with signals present but zero submitted orders")
+                final_reason = "signals_blocked_or_skipped"
+            else:
+                print("[CYCLE] Execution branch completed with no actionable BUY/SELL signals")
+                final_reason = "no_actionable_signals"
+        _set_cycle_report(processed_bar=True, skip_reason=final_reason)
         snapshot = self.build_snapshot(decision_timestamp=decision_timestamp)
         self.record_state(snapshot)
         return snapshot

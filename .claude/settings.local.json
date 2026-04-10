@@ -28,7 +28,12 @@
       "Bash(ls -t C:/Users/lesco/Desktop/AlpacaTradingBot-1/results/compare_suite_*)",
       "Bash(ls -lt C:/Users/lesco/Desktop/AlpacaTradingBot-1/results/*.csv)",
       "Bash(dir /c/Users/lesco/Desktop/AlpacaTradingBot-1/datasets)",
-      "Bash(wait)"
+      "Bash(wait)",
+      "Bash(pkill -f \"python.*trading_bot.py\")",
+      "Bash(taskkill /F /IM python.exe /FI \"WINDOWTITLE eq trading_bot*\")",
+      "Bash(pkill -f \"python.*trading_bot\")",
+      "Bash(pkill -f \"python -u trading_bot\")",
+      "Bash(taskkill /F /IM python.exe /T)"
     ]
   }
 }

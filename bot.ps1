@@ -36,6 +36,16 @@ Set-StrictMode -Version Latest
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
 
+function Get-JsonProp {
+    # StrictMode-safe property access for PSCustomObjects parsed from JSON.
+    # Returns $null when the property is absent rather than throwing.
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -ne $prop) { return $prop.Value }
+    return $null
+}
+
 function Write-Section {
     param([string]$Message)
     Write-Host ""
@@ -421,56 +431,38 @@ function Show-LiveConfig {
 
     Write-Host ""
     Write-Host "Parameters:" -ForegroundColor Cyan
-    if ($null -ne $runtime.sma_bars) {
-        Write-Host ("  - SMA Bars: {0}" -f $runtime.sma_bars)
-    }
-    if ($null -ne $runtime.entry_threshold_pct) {
-        Write-Host ("  - Entry Threshold: {0}" -f $runtime.entry_threshold_pct)
-    }
-    if ($null -ne $runtime.ml_probability_buy) {
-        Write-Host ("  - ML Buy: {0}" -f $runtime.ml_probability_buy)
-    }
-    if ($null -ne $runtime.ml_probability_sell) {
-        Write-Host ("  - ML Sell: {0}" -f $runtime.ml_probability_sell)
-    }
-    if ($null -ne $runtime.threshold_mode) {
-        Write-Host ("  - Threshold Mode: {0}" -f $runtime.threshold_mode)
-    }
-    if ($null -ne $runtime.atr_multiple) {
-        Write-Host ("  - ATR Multiple: {0}" -f $runtime.atr_multiple)
-    }
-    if ($null -ne $runtime.atr_percentile_threshold) {
-        Write-Host ("  - ATR Percentile Threshold: {0}" -f $runtime.atr_percentile_threshold)
-    }
-    if ($null -ne $runtime.time_window_mode) {
-        Write-Host ("  - Time Window: {0}" -f $runtime.time_window_mode)
-    }
-    if ($null -ne $runtime.regime_filter_enabled) {
-        Write-Host ("  - Regime Filter: {0}" -f $runtime.regime_filter_enabled)
-    }
-    if ($null -ne $runtime.orb_filter_mode) {
-        Write-Host ("  - ORB Filter: {0}" -f $runtime.orb_filter_mode)
-    }
-    if ($null -ne $runtime.breakout_exit_style) {
-        Write-Host ("  - Breakout Exit: {0}" -f $runtime.breakout_exit_style)
-    }
-    if ($null -ne $runtime.breakout_tight_stop_fraction) {
-        Write-Host ("  - Breakout Tight Stop Fraction: {0}" -f $runtime.breakout_tight_stop_fraction)
-    }
-    if ($null -ne $runtime.mean_reversion_exit_style) {
-        Write-Host ("  - Mean Reversion Exit: {0}" -f $runtime.mean_reversion_exit_style)
-    }
-    if ($null -ne $runtime.mean_reversion_max_atr_percentile) {
-        Write-Host ("  - Mean Reversion Max ATR Percentile: {0}" -f $runtime.mean_reversion_max_atr_percentile)
+    $parameterRows = @(
+        @{ Label = "SMA Bars"; Value = Get-JsonProp $runtime 'sma_bars' }
+        @{ Label = "Entry Threshold"; Value = Get-JsonProp $runtime 'entry_threshold_pct' }
+        @{ Label = "ML Buy"; Value = Get-JsonProp $runtime 'ml_probability_buy' }
+        @{ Label = "ML Sell"; Value = Get-JsonProp $runtime 'ml_probability_sell' }
+        @{ Label = "Threshold Mode"; Value = Get-JsonProp $runtime 'threshold_mode' }
+        @{ Label = "ATR Multiple"; Value = Get-JsonProp $runtime 'atr_multiple' }
+        @{ Label = "ATR Percentile Threshold"; Value = Get-JsonProp $runtime 'atr_percentile_threshold' }
+        @{ Label = "Time Window"; Value = Get-JsonProp $runtime 'time_window_mode' }
+        @{ Label = "Regime Filter"; Value = Get-JsonProp $runtime 'regime_filter_enabled' }
+        @{ Label = "ORB Filter"; Value = Get-JsonProp $runtime 'orb_filter_mode' }
+        @{ Label = "Breakout Exit"; Value = Get-JsonProp $runtime 'breakout_exit_style' }
+        @{ Label = "Breakout Tight Stop Fraction"; Value = Get-JsonProp $runtime 'breakout_tight_stop_fraction' }
+        @{ Label = "Mean Reversion Trend Filter"; Value = Get-JsonProp $runtime 'mean_reversion_trend_filter' }
+        @{ Label = "Mean Reversion Exit"; Value = Get-JsonProp $runtime 'mean_reversion_exit_style' }
+        @{ Label = "Mean Reversion Max ATR Percentile"; Value = Get-JsonProp $runtime 'mean_reversion_max_atr_percentile' }
+    )
+    foreach ($row in $parameterRows) {
+        if ($null -ne $row.Value) {
+            Write-Host ("  - {0}: {1}" -f $row.Label, $row.Value)
+        }
     }
 
     Write-Host ""
     Write-Host "Source:" -ForegroundColor Cyan
-    if ($null -ne $source.dataset) {
-        Write-Host ("  - Dataset: {0}" -f $source.dataset)
+    $showDataset = Get-JsonProp $source 'dataset'
+    if ($null -ne $showDataset) {
+        Write-Host ("  - Dataset: {0}" -f $showDataset)
     }
-    if ($null -ne $source.dataset_symbol_source) {
-        Write-Host ("  - Symbol Source: {0}" -f $source.dataset_symbol_source)
+    $showSymbolSource = Get-JsonProp $source 'dataset_symbol_source'
+    if ($null -ne $showSymbolSource) {
+        Write-Host ("  - Symbol Source: {0}" -f $showSymbolSource)
     }
     if ($null -ne $payload.saved_at) {
         Write-Host ("  - Saved At: {0}" -f $payload.saved_at)
@@ -501,8 +493,8 @@ function Invoke-Preflight {
     $symbolCount = @($symbols).Count
     $strategyMode = if ($null -ne $runtime) { $runtime.strategy_mode } else { $null }
     $timeframeMinutes = if ($null -ne $runtime) { $runtime.bar_timeframe_minutes } else { $null }
-    $datasetPath = if ($null -ne $source) { $source.dataset } else { $null }
-    $symbolSource = if ($null -ne $source) { $source.dataset_symbol_source } else { $null }
+    $datasetPath = Get-JsonProp $source 'dataset'
+    $symbolSource = Get-JsonProp $source 'dataset_symbol_source'
     $savedAt = if ($null -ne $configPayload) { $configPayload.saved_at } else { $null }
 
     $configStatus = "PASS"

@@ -50,6 +50,7 @@ class BotStorage:
                     order_id TEXT PRIMARY KEY,
                     observed_at_utc TEXT NOT NULL,
                     submitted_at TEXT,
+                    filled_at TEXT,
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -73,6 +74,13 @@ class BotStorage:
             for column_name, statement in column_migrations.items():
                 if column_name not in symbol_columns:
                     connection.execute(statement)
+
+            order_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(order_history)").fetchall()
+            }
+            if "filled_at" not in order_columns:
+                connection.execute("ALTER TABLE order_history ADD COLUMN filled_at TEXT")
 
     def save_snapshot(self, snapshot: Any, orders: list[Any]) -> int:
         with self._connect() as connection:
@@ -123,11 +131,12 @@ class BotStorage:
             connection.executemany(
                 """
                 INSERT INTO order_history (
-                    order_id, observed_at_utc, submitted_at, symbol, side, status, qty, filled_qty, filled_avg_price, notional
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    order_id, observed_at_utc, submitted_at, filled_at, symbol, side, status, qty, filled_qty, filled_avg_price, notional
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     observed_at_utc=excluded.observed_at_utc,
                     submitted_at=excluded.submitted_at,
+                    filled_at=excluded.filled_at,
                     symbol=excluded.symbol,
                     side=excluded.side,
                     status=excluded.status,
@@ -141,6 +150,7 @@ class BotStorage:
                         order.order_id,
                         snapshot.timestamp_utc,
                         order.submitted_at,
+                        getattr(order, "filled_at", None),
                         order.symbol,
                         order.side,
                         order.status,
@@ -201,7 +211,7 @@ class BotStorage:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT observed_at_utc, submitted_at, symbol, side, status, qty, filled_qty, filled_avg_price, notional
+                SELECT observed_at_utc, submitted_at, filled_at, symbol, side, status, qty, filled_qty, filled_avg_price, notional
                 FROM order_history
                 ORDER BY observed_at_utc DESC
                 LIMIT ?

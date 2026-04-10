@@ -145,6 +145,32 @@ python -m streamlit run dashboard.py
 
 Streamlit usually serves on `http://localhost:8501`.
 
+## Desktop Control Panel
+
+There is also a small Windows launcher that wraps the existing operational commands without changing the backend.
+
+Install dependencies:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+Launch the control panel:
+
+```powershell
+python launch_control_panel.py
+```
+
+Phase 1 buttons currently wrap:
+
+- `bot.ps1 setup`
+- `bot.ps1 show-config`
+- `bot.ps1 preflight`
+- `bot.ps1 paper-run`
+- `bot.ps1 dashboard`
+
+The app streams command output into an in-window console and uses the existing repo scripts as the source of truth.
+
 ## Config Flow
 
 There are three distinct config paths in this repo:
