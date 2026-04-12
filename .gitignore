@@ -1,4 +1,7 @@
 __pycache__/
+build/
+dist/
+*.egg-info/
 *.py[cod]
 bot_history.db
 .env
@@ -6,3 +9,4 @@ datasets/
 *.out.log
 *.err.log
 *.code-workspace
+results/experiments/

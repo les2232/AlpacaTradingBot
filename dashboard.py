@@ -1,5 +1,7 @@
 import os
 import inspect
+import subprocess
+import sys
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -478,6 +480,20 @@ def _render_bar_timing(bot) -> None:
 
 
 # ── Error page ────────────────────────────────────────────────────────────────
+
+def _launch_control_panel() -> tuple[bool, str]:
+    env = os.environ.copy()
+    env["ALPACA_BOT_PROJECT_ROOT"] = str(Path.cwd())
+    try:
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, "control-panel"]
+        else:
+            command = [sys.executable, "-m", "alpaca_trading_bot", "control-panel"]
+        subprocess.Popen(command, cwd=str(Path.cwd()), env=env)
+    except Exception as exc:
+        return False, str(exc)
+    return True, "Control panel opened in a separate window."
+
 
 def render_startup_error(exc: Exception) -> None:
     st.markdown(
@@ -1101,10 +1117,17 @@ def main() -> None:
     with hdr_r:
         _render_operator_status(bot, last_cycle_report)
         st.caption("Manual controls below are for debugging only.")
-        ctl_a, ctl_b, ctl_c, ctl_d = st.columns([1, 1, 1, 1])
+        ctl_a, ctl_b, ctl_c, ctl_d, ctl_e = st.columns([1, 1, 1, 1, 1.15])
         refresh = ctl_a.button("Refresh View", use_container_width=True, type="primary")
         execute_orders = ctl_b.toggle("Allow order placement", value=st.session_state.execute_orders)
         st.session_state.execute_orders = execute_orders
+        open_control_panel = ctl_e.button("Open Control Panel", use_container_width=True)
+        if open_control_panel:
+            ok, message = _launch_control_panel()
+            if ok:
+                ctl_e.caption(message)
+            else:
+                ctl_e.caption(f"Launch failed: {message}")
 
         if not st.session_state.run_pending and not st.session_state.force_run_pending:
             run_cycle = ctl_c.button(
@@ -1121,6 +1144,8 @@ def main() -> None:
             else:
                 ctl_c.caption("Normal operation should be automated.")
             ctl_d.caption("Bypasses duplicate-bar protection for debugging.")
+            if not open_control_panel:
+                ctl_e.caption("Opens the desktop operator window.")
             if run_cycle:
                 st.session_state.run_pending = True
                 st.rerun()

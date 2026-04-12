@@ -102,8 +102,8 @@ class BotConfig:
     mean_reversion_trend_filter: bool = False
     max_orders_per_minute: int = 6
     max_price_deviation_bps: float = 75.0
-    max_data_delay_seconds: int = 1800
-    max_live_price_age_seconds: int = 1200
+    max_data_delay_seconds: int = 300
+    max_live_price_age_seconds: int = 60
 
 
 @dataclass(frozen=True)
@@ -217,6 +217,20 @@ def _normalize_enum_text(value: Any) -> str:
     if "." in text:
         text = text.rsplit(".", 1)[-1]
     return text.lower()
+
+
+def _position_qty_value(position: Position | None) -> float:
+    if position is None:
+        return 0.0
+    qty = getattr(position, "qty", 0.0)
+    try:
+        return float(qty)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _has_long_position(position: Position | None) -> bool:
+    return _position_qty_value(position) > 0
 
 
 def _parse_symbol_strategy_map(raw_value: str | None) -> dict[str, str]:
@@ -427,8 +441,8 @@ def load_config() -> BotConfig:
         mean_reversion_trend_filter=os.getenv("MEAN_REVERSION_TREND_FILTER", "false").lower() == "true",
         max_orders_per_minute=int(os.getenv("MAX_ORDERS_PER_MINUTE", "6")),
         max_price_deviation_bps=_safe_float(os.getenv("MAX_PRICE_DEVIATION_BPS"), 75.0),
-        max_data_delay_seconds=int(os.getenv("MAX_DATA_DELAY_SECONDS", "1800")),
-        max_live_price_age_seconds=int(os.getenv("MAX_LIVE_PRICE_AGE_SECONDS", "1200")),
+        max_data_delay_seconds=int(os.getenv("MAX_DATA_DELAY_SECONDS", "300")),
+        max_live_price_age_seconds=int(os.getenv("MAX_LIVE_PRICE_AGE_SECONDS", "60")),
     )
 
     runtime_path, runtime = _load_runtime_config_payload()
@@ -478,6 +492,7 @@ class AlpacaTradingBot:
         self._position_first_seen_utc: dict[str, datetime] = {}
         self._bars_cache: dict[tuple[str, int, int, str], list[Any]] = {}
         self._hourly_regime_cache: dict[tuple[str, str], bool | None] = {}
+        self._strategy_cache: dict[str, Strategy] = {}
         self._last_run_cycle_report: RunCycleReport | None = None
         self.strategy = Strategy(
             StrategyConfig(
@@ -556,8 +571,11 @@ class AlpacaTradingBot:
             logger.error("ML trading disabled: %s", reason)
 
     def _strategy_for_symbol(self, symbol: str) -> Strategy:
+        cached = self._strategy_cache.get(symbol)
+        if cached is not None:
+            return cached
         strategy_mode = self._symbol_strategy_modes.get(symbol, self.config.strategy_mode)
-        return Strategy(
+        strategy = Strategy(
             StrategyConfig(
                 strategy_mode=strategy_mode,
                 ml_probability_buy=self.config.ml_probability_buy,
@@ -577,6 +595,8 @@ class AlpacaTradingBot:
                 mean_reversion_trend_filter=self.config.mean_reversion_trend_filter,
             )
         )
+        self._strategy_cache[symbol] = strategy
+        return strategy
 
     def get_account(self) -> Any:
         return cast(Any, self.trading).get_account()
@@ -780,7 +800,6 @@ class AlpacaTradingBot:
         cache_key = (symbol, timeframe_minutes, bars_needed, aligned_decision_timestamp.isoformat())
         cached_bars = self._bars_cache.get(cache_key)
         if cached_bars is not None:
-            print(f"[DEBUG _get_bars] {symbol} CACHE HIT key={cache_key}")
             return cached_bars
 
         trading_minutes_per_day = 390
@@ -788,7 +807,6 @@ class AlpacaTradingBot:
         start = aligned_decision_timestamp - timedelta(days=trading_days_needed * 6)
         request_end = aligned_decision_timestamp + timedelta(minutes=timeframe_minutes)
         tf = _minutes_to_timeframe(timeframe_minutes)
-        print(f"[DEBUG _get_bars] {symbol} bars_needed={bars_needed} timeframe_minutes={timeframe_minutes} tf={tf} decision_ts={aligned_decision_timestamp.isoformat()} start={start.isoformat()} end={request_end.isoformat()}")
         request = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=tf,
@@ -799,13 +817,11 @@ class AlpacaTradingBot:
 
         bars_response = cast(Any, self.data).get_stock_bars(request)
         bars = cast(list[Any], bars_response.data.get(symbol, []))
-        print(f"[DEBUG _get_bars] {symbol} API returned {len(bars)} bars | first={self._get_bar_start_time(bars[0]).isoformat() if bars else 'N/A'} | last={self._get_bar_start_time(bars[-1]).isoformat() if bars else 'N/A'}")
         completed_bars = [
             bar
             for bar in bars
             if (self._get_bar_start_time(bar) + timedelta(minutes=timeframe_minutes)) <= aligned_decision_timestamp
         ]
-        print(f"[DEBUG _get_bars] {symbol} completed_bars={len(completed_bars)} | last_completed={self._get_bar_start_time(completed_bars[-1]).isoformat() if completed_bars else 'N/A'}")
         result = completed_bars[-bars_needed:]
         self._bars_cache[cache_key] = result
         return result
@@ -939,7 +955,7 @@ class AlpacaTradingBot:
         decision_timestamp: datetime | None = None,
     ) -> SymbolEvaluation:
         aligned_decision_timestamp = decision_timestamp or self.get_decision_timestamp()
-        holding = position is not None
+        holding = _has_long_position(position)
         strategy = self._strategy_for_symbol(symbol)
         effective_strategy_mode = strategy.config.strategy_mode
         bars_needed = max(
@@ -1055,7 +1071,7 @@ class AlpacaTradingBot:
             bullish_regime=bullish_regime,
             opening_range_high=opening_range_highs[-1] if opening_range_highs else None,
             opening_range_low=or_low,
-            position_entry_price=float(position.avg_entry_price) if position is not None else None,
+            position_entry_price=float(position.avg_entry_price) if holding and position is not None else None,
             volume_ratio=volume_ratio,
             volatility_ratio=volatility_ratio,
             effective_stop_price=effective_stop_price,
@@ -1137,8 +1153,8 @@ class AlpacaTradingBot:
 
         for symbol in self.config.symbols:
             position = positions.get(symbol)
-            holding = position is not None
-            quantity = float(position.qty) if position is not None else 0.0
+            quantity = _position_qty_value(position)
+            holding = quantity > 0
             market_value = float(position.market_value) if position is not None else 0.0
             holding_minutes = self._position_holding_minutes(symbol, aligned_decision_timestamp)
             try:
@@ -1156,7 +1172,11 @@ class AlpacaTradingBot:
                         )
                     )
                     continue
-                evaluation = self.evaluate_symbol(symbol, position, decision_timestamp=aligned_decision_timestamp)
+                evaluation = self.evaluate_symbol(
+                    symbol,
+                    position if holding else None,
+                    decision_timestamp=aligned_decision_timestamp,
+                )
 
                 symbols.append(
                     SymbolSnapshot(
@@ -1897,7 +1917,7 @@ class AlpacaTradingBot:
             print(f"Outside entry window ({now_et.strftime('%H:%M:%S')} ET): new entries suppressed, exits still active")
 
         positions = snapshot.positions.copy()
-        open_positions = len(positions)
+        open_positions = sum(1 for position in positions.values() if _has_long_position(position))
         remaining_buying_power = snapshot.buying_power
         open_orders = self.get_open_orders()
         open_order_symbols = {
@@ -1993,6 +2013,18 @@ class AlpacaTradingBot:
                             allowed=False, block_reason="symbol_exposure_exceeded",
                             open_positions=open_positions, max_positions=self.config.max_open_positions,
                             daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd)
+                        continue
+                    trade_budget = min(self.config.max_usd_per_trade, remaining_buying_power)
+                    if trade_budget < live_price:
+                        print(
+                            f"Skip {symbol}: trade budget ${trade_budget:.2f} "
+                            f"cannot fund one share at {live_price:.2f}"
+                        )
+                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
+                            allowed=False, block_reason="insufficient_buying_power",
+                            open_positions=open_positions, max_positions=self.config.max_open_positions,
+                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
+                            live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
                         continue
                     # All checks passed
                     self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",

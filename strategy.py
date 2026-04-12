@@ -256,6 +256,10 @@ def calculate_opening_range_series(
     day_lows: list[float] = []
     range_ready = False
     bars_needed = max(1, opening_range_minutes // 15)
+    # Compute OR window end as market-open (9:30 ET) + opening_range_minutes.
+    _market_open_minutes = 9 * 60 + 30
+    _or_end_minutes = _market_open_minutes + opening_range_minutes
+    _or_end_time = dt_time(_or_end_minutes // 60, _or_end_minutes % 60)
 
     for idx, timestamp in enumerate(timestamps):
         stamp = pd.Timestamp(timestamp)
@@ -269,7 +273,7 @@ def calculate_opening_range_series(
             day_lows = []
             range_ready = False
 
-        if stamp_et.time() <= dt_time(9, 45):
+        if stamp_et.time() < _or_end_time:
             day_highs.append(highs[idx])
             day_lows.append(lows[idx])
             if len(day_highs) >= bars_needed:

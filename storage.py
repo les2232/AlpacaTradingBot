@@ -179,6 +179,50 @@ class BotStorage:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def get_latest_run(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, timestamp_utc, cash, buying_power, equity, last_equity, daily_pnl, kill_switch_triggered
+                FROM bot_runs
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_latest_symbol_snapshot(self) -> list[dict[str, Any]]:
+        latest_run = self.get_latest_run()
+        if latest_run is None:
+            return []
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    symbol,
+                    price,
+                    sma,
+                    ml_probability_up,
+                    ml_confidence,
+                    ml_training_rows,
+                    action,
+                    holding,
+                    holding_minutes,
+                    quantity,
+                    market_value,
+                    error
+                FROM symbol_runs
+                WHERE run_id = ?
+                ORDER BY
+                    holding DESC,
+                    market_value DESC,
+                    symbol ASC
+                """,
+                (latest_run["id"],),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_symbol_history(self, symbol: str, limit: int = 200) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(

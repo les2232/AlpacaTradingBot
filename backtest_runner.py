@@ -76,8 +76,8 @@ class BacktestConfig:
     dataset_path: Path
     symbols: list[str] | None = None
     sma_bars: int = DEFAULT_SMA_BARS
-    commission: float = 0.0
-    slippage: float = 0.0
+    commission: float = 0.01   # $0.01 flat per order side (~$0.005/share for ~2 shares)
+    slippage: float = 0.05     # $0.05/share per side (~0.025-0.1% at typical prices)
     entry_threshold_pct: float = DEFAULT_ENTRY_THRESHOLD_PCT
     threshold_mode: str = THRESHOLD_MODE_STATIC_PCT
     atr_multiple: float = DEFAULT_ATR_MULTIPLE
@@ -1460,8 +1460,8 @@ def run_backtest(
     dataset_path: Path,
     symbols: list[str] | None = None,
     sma_bars: int = DEFAULT_SMA_BARS,
-    commission: float = 0.0,
-    slippage: float = 0.0,
+    commission: float = 0.01,
+    slippage: float = 0.05,
     entry_threshold_pct: float = DEFAULT_ENTRY_THRESHOLD_PCT,
     threshold_mode: str = THRESHOLD_MODE_STATIC_PCT,
     atr_multiple: float = DEFAULT_ATR_MULTIPLE,
@@ -2560,8 +2560,8 @@ def main() -> None:
     parser.add_argument("--ml-retrain-every-bars", type=int, default=DEFAULT_ML_RETRAIN_EVERY_BARS)
     parser.add_argument("--ml-probability-buy", type=float, default=DEFAULT_ML_PROBABILITY_BUY)
     parser.add_argument("--ml-probability-sell", type=float, default=DEFAULT_ML_PROBABILITY_SELL)
-    parser.add_argument("--commission-per-order", type=float, default=0.0)
-    parser.add_argument("--slippage-per-share", type=float, default=0.0)
+    parser.add_argument("--commission-per-order", type=float, default=0.01)
+    parser.add_argument("--slippage-per-share", type=float, default=0.05)
     parser.add_argument("--starting-capital", type=float, default=DEFAULT_STARTING_CAPITAL)
     parser.add_argument("--position-size", type=float, default=DEFAULT_POSITION_SIZE)
     parser.add_argument("--output-csv", help="CSV output path for sweep results")

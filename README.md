@@ -4,6 +4,73 @@ Intraday Alpaca paper-trading bot with shared live, backtest, and offline-resear
 
 The current default operating rules are frozen in [TRADING_SPEC.md](TRADING_SPEC.md).
 
+## Quick Start As A Program
+
+This repo now has an installable package and a single top-level command.
+
+If you want to open it by clicking instead of using the terminal, double-click:
+
+`Open AlpacaTradingBot App.pyw`
+
+That opens the native desktop dashboard directly on Windows with no terminal window.
+
+Install it from the repo root:
+
+```powershell
+python -m pip install -e .
+```
+
+Then use the program entry point:
+
+```powershell
+alpaca-bot --help
+```
+
+Main commands:
+
+- `alpaca-bot preview` runs the live bot with order execution disabled
+- `alpaca-bot live` runs the live bot with normal execution behavior
+- `alpaca-bot backtest ...` passes arguments through to `backtest_runner.py`
+- `alpaca-bot snapshot ...` passes arguments through to `dataset_snapshotter.py`
+- `alpaca-bot research` runs the research pipeline
+- `alpaca-bot experiments ...` runs the backtest experiment batch
+- `alpaca-bot report ...` runs the daily diagnostic report
+- `alpaca-bot dashboard` launches the browser-based Streamlit dashboard
+- `alpaca-bot control-panel` launches the desktop control panel
+
+You can also run the package without installing the script wrapper:
+
+```powershell
+python -m alpaca_trading_bot --help
+```
+
+After install, Windows also gets a GUI launcher command:
+
+```powershell
+alpaca-bot-gui
+```
+
+If you want this to feel even more like a normal app, create a shortcut to [Launch AlpacaTradingBot.pyw](c:/Users/lesco/Desktop/AlpacaTradingBot-1/Launch%20AlpacaTradingBot.pyw) and pin that shortcut to Start or your taskbar.
+
+## Build A Standalone Windows App
+
+To package the native desktop dashboard as a standalone Windows `.exe`:
+
+```powershell
+python -m pip install pyinstaller
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
+```
+
+The built app will be here:
+
+`dist\AlpacaTradingBot\AlpacaTradingBot.exe`
+
+To create a desktop shortcut after building:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\create_desktop_shortcut.ps1
+```
+
 ## Current Behavior Snapshot
 
 The live bot currently enforces these behaviors:
@@ -57,7 +124,7 @@ One implementation detail is intentionally duplicated for safety:
 Install dependencies:
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 Create a `.env` file:
@@ -78,14 +145,13 @@ STRATEGY_MODE=hybrid
 Run the live bot:
 
 ```powershell
-python trading_bot.py
+alpaca-bot live
 ```
 
 Preview one or more decision cycles without placing orders:
 
 ```powershell
-$env:EXECUTE_ORDERS="false"
-python trading_bot.py
+alpaca-bot preview
 ```
 
 ### Backtests
@@ -93,13 +159,32 @@ python trading_bot.py
 Run a single backtest:
 
 ```powershell
-python backtest_runner.py --dataset datasets\YOUR_DATASET --strategy-mode sma
+alpaca-bot backtest --dataset datasets\YOUR_DATASET --strategy-mode sma
 ```
+
+Run the canned breakout comparison batch into an isolated experiment folder:
+
+```powershell
+alpaca-bot experiments --dataset datasets\YOUR_DATASET
+```
+
+Or use the wrapper with the current large breakout dataset already filled in:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File run_breakout_research.ps1
+```
+
+That writes a timestamped folder under `results\experiments\` with:
+
+- the individual backtest CSV outputs for each run
+- `comparison_summary.csv`
+- `comparison_per_symbol.csv`
+- `comparison_report.md`
 
 Compare `sma`, `ml`, and `hybrid`:
 
 ```powershell
-python backtest_runner.py --dataset datasets\YOUR_DATASET --strategy-mode-list sma,ml,hybrid
+alpaca-bot backtest --dataset datasets\YOUR_DATASET --strategy-mode-list sma,ml,hybrid
 ```
 
 Run the standard comparison suite:
@@ -113,7 +198,7 @@ powershell -ExecutionPolicy Bypass -File run_compare_suite.ps1
 Run the broader research workflow:
 
 ```powershell
-python run_research.py
+alpaca-bot research
 ```
 
 Or use the PowerShell wrapper that logs output to `logs/`:
@@ -127,7 +212,7 @@ powershell -ExecutionPolicy Bypass -File run_research.ps1
 Build a versioned dataset snapshot:
 
 ```powershell
-python dataset_snapshotter.py --symbols AAPL MSFT NVDA --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z --timeframe 15Min --feed iex
+alpaca-bot snapshot --symbols AAPL MSFT NVDA --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z --timeframe 15Min --feed iex
 ```
 
 This writes a dataset directory under `datasets/` containing:
@@ -140,7 +225,7 @@ This writes a dataset directory under `datasets/` containing:
 Run the local monitoring dashboard:
 
 ```powershell
-python -m streamlit run dashboard.py
+alpaca-bot dashboard
 ```
 
 Streamlit usually serves on `http://localhost:8501`.
@@ -152,13 +237,13 @@ There is also a small Windows launcher that wraps the existing operational comma
 Install dependencies:
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
 Launch the control panel:
 
 ```powershell
-python launch_control_panel.py
+alpaca-bot control-panel
 ```
 
 Phase 1 buttons currently wrap:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,12 @@ class CommandSpec:
     action: str = "run"
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT_OVERRIDE = os.getenv("ALPACA_BOT_PROJECT_ROOT")
+PROJECT_ROOT = (
+    Path(_PROJECT_ROOT_OVERRIDE).resolve()
+    if _PROJECT_ROOT_OVERRIDE
+    else Path(__file__).resolve().parent.parent
+)
 POWERSHELL_EXE = "powershell"
 BOT_SCRIPT = PROJECT_ROOT / "bot.ps1"
 
@@ -57,9 +63,9 @@ COMMAND_SPECS: list[CommandSpec] = [
         safety_level="Live-sensitive",
     ),
     CommandSpec(
-        label="Open Dashboard",
+        label="Open Browser Dashboard",
         command=[POWERSHELL_EXE, "-ExecutionPolicy", "Bypass", "-File", "bot.ps1", "dashboard"],
-        description="Launch the existing Streamlit dashboard.",
+        description="Launch the browser-based Streamlit dashboard.",
         safety_level="Read-only",
     ),
     CommandSpec(
@@ -105,7 +111,7 @@ PRIMARY_COMMAND_LABELS = {
     "Preflight",
     "Paper Run",
     "Live Run",
-    "Open Dashboard",
+    "Open Browser Dashboard",
 }
 
 LOG_REPORT_COMMAND_LABELS = {
@@ -244,7 +250,7 @@ class ControlPanelApp(ctk.CTk):
             "- bot.ps1 preflight\n"
             "- bot.ps1 paper-run\n"
             "- bot.ps1 live-run --confirm-live\n"
-            "- bot.ps1 dashboard\n\n"
+            "- bot.ps1 dashboard (browser)\n\n"
             "This launcher is a thin wrapper over the repo's existing workflows.\n"
             "It streams live process output below and does not change bot logic.",
         )
