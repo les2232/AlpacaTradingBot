@@ -238,6 +238,25 @@ class BotLogger:
             orders_submitted=orders_submitted,
         )
 
+    def symbol_state_mismatch(
+        self,
+        *,
+        current_symbols: list[str],
+        persisted_symbols: list[str],
+        persisted_snapshot_ts: str | None,
+        action: str,
+        session_id: str | None = None,
+    ) -> None:
+        self._emit(
+            self._risk,
+            "state.symbol_mismatch",
+            current_symbols=current_symbols,
+            persisted_symbols=persisted_symbols,
+            persisted_snapshot_ts=persisted_snapshot_ts,
+            action=action,
+            session_id=session_id,
+        )
+
     def execution_error(
         self,
         symbol: str,

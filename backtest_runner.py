@@ -87,6 +87,7 @@ class BacktestConfig:
     orb_filter_mode: str = ORB_FILTER_NONE
     breakout_exit_style: str = BREAKOUT_EXIT_TARGET_1X_STOP_LOW
     breakout_tight_stop_fraction: float = 0.5
+    sma_stop_pct: float = 0.0
     mean_reversion_exit_style: str = MEAN_REVERSION_EXIT_SMA
     mean_reversion_max_atr_percentile: float = 0.0
     starting_capital: float = DEFAULT_STARTING_CAPITAL
@@ -145,6 +146,7 @@ class _BacktestInputs:
     mean_reversion_exit_style: str
     mean_reversion_max_atr_percentile: float
     mean_reversion_stop_pct: float
+    sma_stop_pct: float
     mean_reversion_trend_filter: bool
     mean_reversion_trend_slope_filter: bool
     regime_filter_enabled: bool
@@ -789,6 +791,7 @@ def _prepare_backtest_inputs(
     mean_reversion_exit_style: str,
     mean_reversion_max_atr_percentile: float,
     mean_reversion_stop_pct: float,
+    sma_stop_pct: float,
     mean_reversion_trend_filter: bool,
     mean_reversion_trend_slope_filter: bool,
     ml_probability_buy: float,
@@ -839,6 +842,7 @@ def _prepare_backtest_inputs(
             mean_reversion_exit_style=mean_reversion_exit_style,
             mean_reversion_max_atr_percentile=mean_reversion_max_atr_percentile,
             mean_reversion_stop_pct=mean_reversion_stop_pct,
+            sma_stop_pct=sma_stop_pct,
             mean_reversion_trend_filter=mean_reversion_trend_filter,
             mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
         ))
@@ -870,6 +874,7 @@ def _prepare_backtest_inputs(
         mean_reversion_exit_style=mean_reversion_exit_style,
         mean_reversion_max_atr_percentile=mean_reversion_max_atr_percentile,
         mean_reversion_stop_pct=mean_reversion_stop_pct,
+        sma_stop_pct=sma_stop_pct,
         mean_reversion_trend_filter=mean_reversion_trend_filter,
         mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
         regime_filter_enabled=regime_filter_enabled,
@@ -1477,6 +1482,7 @@ def run_backtest(
     mean_reversion_exit_style: str = MEAN_REVERSION_EXIT_SMA,
     mean_reversion_max_atr_percentile: float = 0.0,
     mean_reversion_stop_pct: float = 0.0,
+    sma_stop_pct: float = 0.0,
     mean_reversion_trend_filter: bool = False,
     mean_reversion_trend_slope_filter: bool = False,
     starting_capital: float = DEFAULT_STARTING_CAPITAL,
@@ -1511,6 +1517,7 @@ def run_backtest(
         mean_reversion_exit_style=mean_reversion_exit_style,
         mean_reversion_max_atr_percentile=mean_reversion_max_atr_percentile,
         mean_reversion_stop_pct=mean_reversion_stop_pct,
+        sma_stop_pct=sma_stop_pct,
         mean_reversion_trend_filter=mean_reversion_trend_filter,
         mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
         ml_probability_buy=ml_probability_buy,
@@ -2550,6 +2557,8 @@ def main() -> None:
     parser.add_argument("--mean-reversion-max-atr-percentile", type=float, default=0.0)
     parser.add_argument("--mean-reversion-stop-pct", type=float, default=0.0,
                         help="Exit if price falls N%% below entry (default: 0 = disabled, e.g. 0.02 = 2%%)")
+    parser.add_argument("--sma-stop-pct", type=float, default=0.0,
+                        help="SMA mode: exit if price falls N%% below entry (default: 0 = disabled, e.g. 0.02 = 2%%)")
     parser.add_argument("--mean-reversion-trend-filter", action="store_true", default=False,
                         help="Only enter mean reversion trades when price >= 50-bar SMA (uptrend filter)")
     parser.add_argument("--mean-reversion-trend-slope-filter", action="store_true", default=False,
@@ -2693,6 +2702,7 @@ def main() -> None:
         mean_reversion_exit_style=args.mean_reversion_exit_style,
         mean_reversion_max_atr_percentile=args.mean_reversion_max_atr_percentile,
         mean_reversion_stop_pct=args.mean_reversion_stop_pct,
+        sma_stop_pct=args.sma_stop_pct,
         mean_reversion_trend_filter=args.mean_reversion_trend_filter,
         mean_reversion_trend_slope_filter=args.mean_reversion_trend_slope_filter,
         ml_lookback_bars=args.ml_lookback_bars,

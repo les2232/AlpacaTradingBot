@@ -1,11 +1,17 @@
 __pycache__/
+.pytest_cache/
 build/
 dist/
 *.egg-info/
 *.py[cod]
 bot_history.db
 .env
+.live_bot.lock
+test_live_lock_*.lock
+test_decision_claim_*.db
+test_dashboard_state_*.db
 datasets/
+logs/
 *.out.log
 *.err.log
 *.code-workspace

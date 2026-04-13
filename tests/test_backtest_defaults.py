@@ -35,3 +35,16 @@ def test_run_backtest_default_slippage():
     sig = inspect.signature(run_backtest)
     default = sig.parameters["slippage"].default
     assert default == 0.05, f"run_backtest slippage default should be 0.05, got {default}"
+
+
+def test_backtest_config_default_sma_stop_pct():
+    """BacktestConfig should expose sma_stop_pct with a disabled-by-default value."""
+    cfg = BacktestConfig(dataset_path=Path("dummy"))
+    assert cfg.sma_stop_pct == 0.0
+
+
+def test_run_backtest_default_sma_stop_pct():
+    """run_backtest should expose sma_stop_pct in its public signature."""
+    sig = inspect.signature(run_backtest)
+    default = sig.parameters["sma_stop_pct"].default
+    assert default == 0.0, f"run_backtest sma_stop_pct default should be 0.0, got {default}"

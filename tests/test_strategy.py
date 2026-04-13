@@ -2,7 +2,13 @@
 import pandas as pd
 import pytest
 
-from strategy import calculate_opening_range_series
+from strategy import (
+    MlSignal,
+    STRATEGY_MODE_SMA,
+    Strategy,
+    StrategyConfig,
+    calculate_opening_range_series,
+)
 
 
 def _make_15min_timestamps(date_str: str, n_bars: int) -> list[pd.Timestamp]:
@@ -174,3 +180,55 @@ class TestOpeningRangeEdgeCases:
         ready_lows  = [l for l in or_lows  if l is not None]
         assert all(h == 101.0 for h in ready_highs)
         assert all(l == 98.0  for l in ready_lows)
+
+
+def _ml_signal() -> MlSignal:
+    return MlSignal(
+        probability_up=0.5,
+        confidence=0.0,
+        training_rows=0,
+        model_age_seconds=0.0,
+        feature_names=(),
+        buy_threshold=0.55,
+        sell_threshold=0.45,
+        validation_rows=0,
+        model_name="test",
+    )
+
+
+class TestSmaStopPct:
+    def test_sma_mode_sells_on_stop_even_above_sma(self):
+        strategy = Strategy(
+            StrategyConfig(
+                strategy_mode=STRATEGY_MODE_SMA,
+                sma_stop_pct=0.02,
+            )
+        )
+
+        action = strategy.decide_action(
+            price=97.5,
+            sma=95.0,
+            ml_signal=_ml_signal(),
+            holding=True,
+            position_entry_price=100.0,
+        )
+
+        assert action == "SELL"
+
+    def test_sma_mode_does_not_use_stop_when_disabled(self):
+        strategy = Strategy(
+            StrategyConfig(
+                strategy_mode=STRATEGY_MODE_SMA,
+                sma_stop_pct=0.0,
+            )
+        )
+
+        action = strategy.decide_action(
+            price=97.5,
+            sma=95.0,
+            ml_signal=_ml_signal(),
+            holding=True,
+            position_entry_price=100.0,
+        )
+
+        assert action == "HOLD"

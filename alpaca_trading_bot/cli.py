@@ -2,20 +2,25 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LIVE_BOT_LOCK_PATH = PROJECT_ROOT / ".live_bot.lock"
+LOG_ROOT = PROJECT_ROOT / "logs"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="alpaca-bot",
-        description="Single entry point for live trading, research, and the desktop control panel.",
+        description="Single entry point for live trading, monitoring, and research workflows.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -32,8 +37,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional Streamlit port override.",
     )
-
-    subparsers.add_parser("control-panel", help="Launch the desktop control panel.")
 
     for name, help_text in [
         ("backtest", "Run the offline backtest CLI."),
@@ -79,12 +82,197 @@ def _run_module_main(program_name: str, args: list[str], entrypoint: Callable[[]
     return 0
 
 
+def _read_live_lock_metadata() -> dict[str, object]:
+    try:
+        raw_text = LIVE_BOT_LOCK_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return {}
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _startup_artifact_dir() -> Path:
+    day_dir = LOG_ROOT / datetime.now().strftime("%Y-%m-%d")
+    day_dir.mkdir(parents=True, exist_ok=True)
+    return day_dir
+
+
+def _startup_artifact_path(started_at_utc: str) -> Path:
+    stamp = started_at_utc.replace("+00:00", "Z").replace(":", "").replace("-", "")
+    return _startup_artifact_dir() / f"startup_config.{stamp}.json"
+
+
+def _startup_artifact_latest_path() -> Path:
+    return _startup_artifact_dir() / "startup_config.json"
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def _live_instance_lock():
+    current_pid = os.getpid()
+    lock_payload = {
+        "pid": current_pid,
+        "command": "alpaca-bot live",
+        "created_at_utc": _utcnow_iso(),
+        "workspace": str(PROJECT_ROOT),
+    }
+    for _ in range(2):
+        try:
+            fd = os.open(str(LIVE_BOT_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            existing = _read_live_lock_metadata()
+            existing_pid = int(existing.get("pid", 0) or 0)
+            if existing_pid and existing_pid != current_pid and _pid_is_running(existing_pid):
+                raise RuntimeError(
+                    "Refusing to start a second live bot instance. "
+                    f"Another live process appears to be running with pid={existing_pid}. "
+                    f"Lock file: {LIVE_BOT_LOCK_PATH}"
+                )
+            if existing_pid:
+                print(
+                    f"Recovered stale live bot lock at {LIVE_BOT_LOCK_PATH} "
+                    f"(pid={existing_pid} no longer running)"
+                )
+            else:
+                print(
+                    f"Recovered malformed live bot lock at {LIVE_BOT_LOCK_PATH} "
+                    "(missing or unreadable pid)"
+                )
+            try:
+                LIVE_BOT_LOCK_PATH.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not clear stale live lock at {LIVE_BOT_LOCK_PATH}: {exc}"
+                ) from exc
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(lock_payload, handle)
+            break
+        except Exception:
+            try:
+                LIVE_BOT_LOCK_PATH.unlink()
+            except OSError:
+                pass
+            raise
+    else:
+        raise RuntimeError(f"Could not acquire live bot lock at {LIVE_BOT_LOCK_PATH}")
+
+    try:
+        print(f"Live instance lock acquired: {LIVE_BOT_LOCK_PATH} (pid={current_pid})")
+        yield LIVE_BOT_LOCK_PATH
+    finally:
+        current_lock = _read_live_lock_metadata()
+        if int(current_lock.get("pid", 0) or 0) != current_pid:
+            return
+        try:
+            LIVE_BOT_LOCK_PATH.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _render_runtime_summary(config: object, preview: bool) -> None:
+    mode = "preview" if preview else "live"
+    paper_text = "paper" if bool(getattr(config, "paper", False)) else "live-account"
+    symbols = list(getattr(config, "symbols", []))
+    execution_text = "disabled" if preview else "enabled"
+    symbols_preview = ", ".join(symbols[:5])
+    if len(symbols) > 5:
+        symbols_preview = f"{symbols_preview}, +{len(symbols) - 5} more"
+    print(
+        f"Starting {mode} mode | account={paper_text} | "
+        f"strategy={getattr(config, 'strategy_mode', 'unknown')} | "
+        f"timeframe={getattr(config, 'bar_timeframe_minutes', '?')}m | "
+        f"execution={execution_text} | symbols={len(symbols)}"
+    )
+    if symbols_preview:
+        print(f"Runtime symbols preview: {symbols_preview}")
+
+
+def _persist_startup_config(details: object, preview: bool, *, session_id: str) -> Path:
+    config = getattr(details, "config")
+    started_at_utc = _utcnow_iso()
+    payload = {
+        "session_id": session_id,
+        "started_at_utc": started_at_utc,
+        "launch_mode": "preview" if preview else "live",
+        "execution_enabled": not preview,
+        "paper": bool(getattr(config, "paper", False)),
+        "account_mode": "paper" if bool(getattr(config, "paper", False)) else "live-account",
+        "strategy_mode": getattr(config, "strategy_mode", ""),
+        "bar_timeframe_minutes": int(getattr(config, "bar_timeframe_minutes", 0) or 0),
+        "sma_bars": int(getattr(config, "sma_bars", 0) or 0),
+        "symbols": list(getattr(config, "symbols", [])),
+        "symbol_count": len(list(getattr(config, "symbols", []))),
+        "runtime_config_path": getattr(details, "runtime_config_path", None),
+        "runtime_overrides": list(getattr(details, "overridden_fields", ()) or ()),
+        "max_usd_per_trade": float(getattr(config, "max_usd_per_trade", 0.0) or 0.0),
+        "max_symbol_exposure_usd": float(getattr(config, "max_symbol_exposure_usd", 0.0) or 0.0),
+        "max_open_positions": int(getattr(config, "max_open_positions", 0) or 0),
+        "max_daily_loss_usd": float(getattr(config, "max_daily_loss_usd", 0.0) or 0.0),
+        "max_orders_per_minute": int(getattr(config, "max_orders_per_minute", 0) or 0),
+        "max_price_deviation_bps": float(getattr(config, "max_price_deviation_bps", 0.0) or 0.0),
+        "max_live_price_age_seconds": int(getattr(config, "max_live_price_age_seconds", 0) or 0),
+        "max_data_delay_seconds": int(getattr(config, "max_data_delay_seconds", 0) or 0),
+        "db_path": os.getenv("BOT_DB_PATH", "bot_history.db"),
+    }
+    artifact_text = json.dumps(payload, indent=2)
+    artifact_path = _startup_artifact_path(started_at_utc)
+    artifact_path.write_text(artifact_text, encoding="utf-8")
+    latest_path = _startup_artifact_latest_path()
+    latest_path.write_text(artifact_text, encoding="utf-8")
+    print(f"Persisted startup config: {artifact_path}")
+    return artifact_path
+
+
+def _validate_live_runtime(config: object, preview: bool) -> None:
+    if preview:
+        return
+    if bool(getattr(config, "paper", False)):
+        return
+    raise RuntimeError(
+        "Refusing to start live order execution with ALPACA_PAPER=false. "
+        "This repo is currently being operated in paper-trading mode."
+    )
+
+
 def _run_live(preview: bool) -> int:
     import trading_bot
 
+    details = trading_bot.load_config_details()
+    config = details.config
+    session_id = f"live-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+    _validate_live_runtime(config, preview=preview)
+    _render_runtime_summary(config, preview=preview)
     env_value = "false" if preview else "true"
-    with _temporary_env("EXECUTE_ORDERS", env_value):
-        trading_bot.main()
+    live_lock = contextlib.nullcontext()
+    if not preview:
+        live_lock = _live_instance_lock()
+    with live_lock:
+        if not preview:
+            _persist_startup_config(details, preview=preview, session_id=session_id)
+        with _temporary_env("EXECUTE_ORDERS", env_value):
+            trading_bot.main(config=config, session_id=session_id)
     return 0
 
 
@@ -113,11 +301,6 @@ def main(argv: list[str] | None = None) -> int:
         return _run_live(preview=True)
     if args.command == "dashboard":
         return _run_dashboard(args.port)
-    if args.command == "control-panel":
-        from desktop_app.app import main as control_panel_main
-
-        control_panel_main()
-        return 0
     if args.command == "backtest":
         from backtest_runner import main as backtest_main
 

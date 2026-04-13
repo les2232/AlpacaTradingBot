@@ -33,6 +33,12 @@ else:
 
 from botlog import BotLogger
 from storage import BotStorage
+from symbol_state import (
+    format_symbol_list,
+    normalize_symbols,
+    symbol_fingerprint,
+    symbols_match,
+)
 from strategy import (
     BREAKOUT_EXIT_CHOICES,
     BREAKOUT_EXIT_TARGET_1X_STOP_LOW,
@@ -43,6 +49,7 @@ from strategy import (
     STRATEGY_MODE_BREAKOUT,
     STRATEGY_MODE_CHOICES,
     STRATEGY_MODE_HYBRID,
+    STRATEGY_MODE_MEAN_REVERSION,
     STRATEGY_MODE_ML,
     STRATEGY_MODE_ORB,
     Strategy,
@@ -72,6 +79,10 @@ from strategy import (
 logger = logging.getLogger(__name__)
 
 
+class StaleMarketDataError(RuntimeError):
+    """Raised when the most recent completed bar is too old to trust."""
+
+
 @dataclass(frozen=True)
 class BotConfig:
     symbols: list[str]
@@ -97,13 +108,22 @@ class BotConfig:
     breakout_exit_style: str = BREAKOUT_EXIT_TARGET_1X_STOP_LOW
     breakout_tight_stop_fraction: float = 0.5
     breakout_max_stop_pct: float = 0.03
+    sma_stop_pct: float = 0.0
     mean_reversion_exit_style: str = MEAN_REVERSION_EXIT_SMA
     mean_reversion_max_atr_percentile: float = 0.0
     mean_reversion_trend_filter: bool = False
+    mean_reversion_stop_pct: float = 0.0
     max_orders_per_minute: int = 6
     max_price_deviation_bps: float = 75.0
     max_data_delay_seconds: int = 300
     max_live_price_age_seconds: int = 60
+
+
+@dataclass(frozen=True)
+class RuntimeConfigDetails:
+    config: BotConfig
+    runtime_config_path: str | None
+    overridden_fields: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -123,6 +143,7 @@ class SymbolSnapshot:
     ml_model_name: str | None = None
     holding_minutes: float | None = None
     error: str | None = None
+    hold_reason: str | None = None  # why action is HOLD: "trend_filter", "atr_filter", "no_signal", "holding_no_exit"
 
 
 @dataclass(frozen=True)
@@ -132,6 +153,7 @@ class SymbolEvaluation:
     ml_signal: MlSignal
     action: str
     latest_bar_close_utc: str
+    hold_reason: str | None = None  # populated when action == "HOLD"; e.g. "trend_filter", "atr_filter", "no_signal"
 
 
 @dataclass(frozen=True)
@@ -258,15 +280,7 @@ def _parse_symbol_strategy_map(raw_value: str | None) -> dict[str, str]:
 def _normalize_runtime_symbols(raw_symbols: Any) -> list[str]:
     if not isinstance(raw_symbols, list):
         raise RuntimeError("Runtime config field 'symbols' must be a list of ticker strings.")
-
-    symbols: list[str] = []
-    seen: set[str] = set()
-    for raw_symbol in raw_symbols:
-        symbol = str(raw_symbol).strip().upper()
-        if not symbol or symbol in seen:
-            continue
-        seen.add(symbol)
-        symbols.append(symbol)
+    symbols = normalize_symbols(raw_symbols)
     if not symbols:
         raise RuntimeError("Runtime config field 'symbols' must contain at least one ticker.")
     return symbols
@@ -325,9 +339,13 @@ def _load_runtime_config_payload() -> tuple[Path | None, dict[str, Any] | None]:
     return runtime_path, runtime
 
 
-def _apply_runtime_config(base_config: BotConfig, runtime_path: Path | None, runtime: dict[str, Any] | None) -> BotConfig:
+def _apply_runtime_config(
+    base_config: BotConfig,
+    runtime_path: Path | None,
+    runtime: dict[str, Any] | None,
+) -> tuple[BotConfig, tuple[str, ...]]:
     if runtime_path is None or runtime is None:
-        return base_config
+        return base_config, ()
 
     overrides: dict[str, Any] = {}
     if "symbols" in runtime:
@@ -382,24 +400,33 @@ def _apply_runtime_config(base_config: BotConfig, runtime_path: Path | None, run
 
     config = replace(base_config, **overrides)
     runtime_symbols = ", ".join(config.symbols)
+    changed_fields = sorted(
+        field_name
+        for field_name in overrides
+        if getattr(base_config, field_name) != getattr(config, field_name)
+    )
     logger.info("Loaded runtime config from %s", runtime_path)
     print(f"Runtime config loaded from {runtime_path}")
     print(f"Runtime config symbols: {runtime_symbols}")
-    return config
+    if changed_fields:
+        changed_text = ", ".join(changed_fields)
+        print(
+            "Runtime config overrides .env for: "
+            f"{changed_text}"
+        )
+    return config, tuple(changed_fields)
 
 
-def load_config() -> BotConfig:
-    # Live execution config is intentionally sourced from environment variables
-    # and normalized into BotConfig here. Offline tools use their own CLI args.
+def _load_base_config() -> BotConfig:
     symbols_raw = os.getenv("BOT_SYMBOLS", "AAPL,MSFT,NVDA")
-    symbols = [symbol.strip().upper() for symbol in symbols_raw.split(",") if symbol.strip()]
+    symbols = normalize_symbols(symbols_raw.split(","))
     if not symbols:
         raise RuntimeError("BOT_SYMBOLS must contain at least one ticker.")
 
     sma_bars_raw = os.getenv("SMA_BARS") or os.getenv("SMA_DAYS", "20")
     bar_timeframe_minutes = int(os.getenv("BAR_TIMEFRAME_MINUTES", "15"))
 
-    base_config = BotConfig(
+    return BotConfig(
         symbols=symbols,
         max_usd_per_trade=float(os.getenv("MAX_USD_PER_TRADE", "200")),
         max_symbol_exposure_usd=float(
@@ -434,23 +461,39 @@ def load_config() -> BotConfig:
         ),
         breakout_tight_stop_fraction=_safe_float(os.getenv("BREAKOUT_TIGHT_STOP_FRACTION"), 0.5),
         breakout_max_stop_pct=_safe_float(os.getenv("BREAKOUT_MAX_STOP_PCT"), 0.03),
+        sma_stop_pct=_safe_float(os.getenv("SMA_STOP_PCT"), 0.0),
         mean_reversion_exit_style=normalize_mean_reversion_exit_style(
             os.getenv("MEAN_REVERSION_EXIT_STYLE", MEAN_REVERSION_EXIT_SMA)
         ),
         mean_reversion_max_atr_percentile=_safe_float(os.getenv("MEAN_REVERSION_MAX_ATR_PERCENTILE"), 0.0),
         mean_reversion_trend_filter=os.getenv("MEAN_REVERSION_TREND_FILTER", "false").lower() == "true",
+        mean_reversion_stop_pct=_safe_float(os.getenv("MEAN_REVERSION_STOP_PCT"), 0.0),
         max_orders_per_minute=int(os.getenv("MAX_ORDERS_PER_MINUTE", "6")),
         max_price_deviation_bps=_safe_float(os.getenv("MAX_PRICE_DEVIATION_BPS"), 75.0),
         max_data_delay_seconds=int(os.getenv("MAX_DATA_DELAY_SECONDS", "300")),
         max_live_price_age_seconds=int(os.getenv("MAX_LIVE_PRICE_AGE_SECONDS", "60")),
     )
 
+
+def load_config_details() -> RuntimeConfigDetails:
+    base_config = _load_base_config()
     runtime_path, runtime = _load_runtime_config_payload()
-    return _apply_runtime_config(base_config, runtime_path, runtime)
+    config, changed_fields = _apply_runtime_config(base_config, runtime_path, runtime)
+    return RuntimeConfigDetails(
+        config=config,
+        runtime_config_path=str(runtime_path) if runtime_path is not None else None,
+        overridden_fields=changed_fields,
+    )
+
+
+def load_config() -> BotConfig:
+    # Live execution config is intentionally sourced from environment variables
+    # and normalized into BotConfig here. Offline tools use their own CLI args.
+    return load_config_details().config
 
 
 class AlpacaTradingBot:
-    def __init__(self, config: BotConfig) -> None:
+    def __init__(self, config: BotConfig, session_id: str | None = None) -> None:
         load_dotenv(Path.cwd() / ".env")
 
         api_key = os.getenv("ALPACA_API_KEY")
@@ -468,6 +511,9 @@ class AlpacaTradingBot:
         db_path = Path(os.getenv("BOT_DB_PATH", "bot_history.db"))
         self.storage = BotStorage(db_path)
         self.blog = BotLogger(log_root="logs")
+        self.session_id = session_id or f"session-{int(datetime.now(timezone.utc).timestamp())}"
+        self.active_symbols = normalize_symbols(config.symbols)
+        self._active_symbol_fingerprint = symbol_fingerprint(self.active_symbols)
         # Fill-tracking state (keyed by order_id)
         self._order_submission_ts: dict[str, str] = {}    # order_id → decision_ts at submit time
         self._order_submission_side: dict[str, str] = {}  # order_id → "buy" | "sell"
@@ -494,6 +540,7 @@ class AlpacaTradingBot:
         self._hourly_regime_cache: dict[tuple[str, str], bool | None] = {}
         self._strategy_cache: dict[str, Strategy] = {}
         self._last_run_cycle_report: RunCycleReport | None = None
+        self._validate_persisted_symbol_state()
         self.strategy = Strategy(
             StrategyConfig(
                 strategy_mode=config.strategy_mode,
@@ -509,9 +556,11 @@ class AlpacaTradingBot:
                 breakout_exit_style=config.breakout_exit_style,
                 breakout_tight_stop_fraction=config.breakout_tight_stop_fraction,
                 breakout_max_stop_pct=config.breakout_max_stop_pct,
+                sma_stop_pct=config.sma_stop_pct,
                 mean_reversion_exit_style=config.mean_reversion_exit_style,
                 mean_reversion_max_atr_percentile=config.mean_reversion_max_atr_percentile,
                 mean_reversion_trend_filter=config.mean_reversion_trend_filter,
+                mean_reversion_stop_pct=config.mean_reversion_stop_pct,
             )
         )
         self._symbol_strategy_modes = config.symbol_strategy_modes or {}
@@ -561,6 +610,31 @@ class AlpacaTradingBot:
         ):
             self._disable_ml_trading("ml.predict import failed", _ML_PREDICT_IMPORT_ERROR)
 
+    def _validate_persisted_symbol_state(self) -> None:
+        latest_run = self.storage.get_latest_run()
+        if latest_run is None:
+            return
+        persisted_symbols = normalize_symbols(self.storage.get_latest_snapshot_symbols())
+        if not persisted_symbols or symbols_match(self.active_symbols, persisted_symbols):
+            return
+        latest_ts = str(latest_run.get("timestamp_utc", "") or "")
+        current_text = format_symbol_list(self.active_symbols)
+        persisted_text = format_symbol_list(persisted_symbols)
+        message = (
+            "Persisted symbol state belongs to a different run and will be ignored for this session. "
+            f"current=[{current_text}] persisted=[{persisted_text}] "
+            f"persisted_snapshot_ts={latest_ts or 'unknown'} session_id={self.session_id}"
+        )
+        logger.warning(message)
+        print(f"[STATE] {message}")
+        self.blog.symbol_state_mismatch(
+            current_symbols=self.active_symbols,
+            persisted_symbols=persisted_symbols,
+            persisted_snapshot_ts=latest_ts or None,
+            action="ignore_for_current_session",
+            session_id=self.session_id,
+        )
+
     def _disable_ml_trading(self, reason: str, exc: Exception | None = None) -> None:
         if self._ml_disabled_reason is not None:
             return
@@ -590,6 +664,7 @@ class AlpacaTradingBot:
                 breakout_exit_style=self.config.breakout_exit_style,
                 breakout_tight_stop_fraction=self.config.breakout_tight_stop_fraction,
                 breakout_max_stop_pct=self.config.breakout_max_stop_pct,
+                sma_stop_pct=self.config.sma_stop_pct,
                 mean_reversion_exit_style=self.config.mean_reversion_exit_style,
                 mean_reversion_max_atr_percentile=self.config.mean_reversion_max_atr_percentile,
                 mean_reversion_trend_filter=self.config.mean_reversion_trend_filter,
@@ -645,6 +720,19 @@ class AlpacaTradingBot:
             return False
         self._last_processed_decision_timestamp = timestamp
         return True
+
+    def _claim_global_decision_execution(self, timestamp: datetime) -> bool:
+        decision_ts = timestamp.isoformat()
+        claimed = self.storage.claim_decision_timestamp(
+            decision_ts,
+            datetime.now(timezone.utc).isoformat(),
+        )
+        if not claimed:
+            self._log_skip(
+                "SKIP_DUPLICATE_BAR_GLOBAL",
+                f"decision_timestamp={decision_ts}",
+            )
+        return claimed
 
     def _is_regular_hours(self, timestamp: datetime | pd.Timestamp) -> bool:
         stamp = pd.Timestamp(timestamp)
@@ -990,7 +1078,7 @@ class AlpacaTradingBot:
             decision_ts=aligned_decision_timestamp.isoformat(),
         )
         if bar_delay_seconds > self.config.max_data_delay_seconds:
-            raise RuntimeError(
+            raise StaleMarketDataError(
                 f"Stale completed bars for {symbol}: latest close {latest_bar_close.isoformat()}"
             )
 
@@ -1088,7 +1176,11 @@ class AlpacaTradingBot:
             _rejection = None
         else:
             _failing = []
-            if _trend_pass is False:
+            _trend_filter_active = (
+                strategy.config.strategy_mode != STRATEGY_MODE_MEAN_REVERSION
+                or self.config.mean_reversion_trend_filter
+            )
+            if _trend_pass is False and _trend_filter_active:
                 _failing.append("trend_filter")
             if _atr_pass is False:
                 _failing.append("atr_filter")
@@ -1121,6 +1213,7 @@ class AlpacaTradingBot:
             ml_signal=ml_signal,
             action=action,
             latest_bar_close_utc=latest_bar_close.isoformat(),
+            hold_reason=_rejection,
         )
 
     def decide(
@@ -1194,8 +1287,11 @@ class AlpacaTradingBot:
                         ml_sell_threshold=evaluation.ml_signal.sell_threshold,
                         ml_model_name=evaluation.ml_signal.model_name,
                         holding_minutes=holding_minutes,
+                        hold_reason=evaluation.hold_reason,
                     )
                 )
+            except StaleMarketDataError:
+                raise
             except Exception as exc:
                 symbols.append(
                     SymbolSnapshot(
@@ -1537,7 +1633,12 @@ class AlpacaTradingBot:
 
     def record_state(self, snapshot: BotSnapshot, orders_limit: int = 50) -> list[OrderSnapshot]:
         orders = self.get_recent_orders(limit=orders_limit)
-        self.storage.save_snapshot(snapshot, orders)
+        self.storage.save_snapshot(
+            snapshot,
+            orders,
+            session_id=self.session_id,
+            symbol_fingerprint=self._active_symbol_fingerprint,
+        )
         self._log_fills_from_orders(orders)
         return orders
 
@@ -1597,16 +1698,20 @@ class AlpacaTradingBot:
 
                 if side == "buy":
                     # Record entry state so we can compute PnL when the position closes.
+                    # Only log position.opened on the first fill — partial fills must not
+                    # inflate the count.
+                    _is_first_fill = order.symbol not in self._position_entry_price
                     self._position_entry_price[order.symbol] = fill_price
                     self._position_entry_ts[order.symbol] = dec_ts
                     self._position_qty[order.symbol] = fill_qty
-                    self.blog.position_opened(
-                        symbol=order.symbol,
-                        decision_ts=dec_ts,
-                        entry_price=fill_price,
-                        qty=fill_qty,
-                        strategy_mode=self.config.strategy_mode,
-                    )
+                    if _is_first_fill:
+                        self.blog.position_opened(
+                            symbol=order.symbol,
+                            decision_ts=dec_ts,
+                            entry_price=fill_price,
+                            qty=fill_qty,
+                            strategy_mode=self.config.strategy_mode,
+                        )
 
                 elif side == "sell":
                     entry_price = self._position_entry_price.pop(order.symbol, fill_price)
@@ -1773,22 +1878,10 @@ class AlpacaTradingBot:
         now_et = self._et_now()
         decision_timestamp = self.get_decision_timestamp()
         should_process = True if force_process else self._should_process_decision_timestamp(decision_timestamp)
-        snapshot = self.build_snapshot(
-            decision_timestamp=decision_timestamp,
-            evaluate_signals=should_process,
-        )
-        print(f"Connected. Cash: {snapshot.cash} Buying power: {snapshot.buying_power}")
-        print(f"Daily PnL: {snapshot.daily_pnl:.2f}")
-        print(f"Strategy mode: {self.config.strategy_mode}")
-        print(
-            f"[CYCLE] decision_ts={decision_timestamp.isoformat()} "
-            f"execute_orders={execute_orders} should_process={should_process} "
-            f"force_process={force_process}"
-        )
-        buy_signals = sum(1 for item in snapshot.symbols if item.action == "BUY")
-        sell_signals = sum(1 for item in snapshot.symbols if item.action == "SELL")
-        hold_signals = sum(1 for item in snapshot.symbols if item.action == "HOLD")
-        error_signals = sum(1 for item in snapshot.symbols if item.action == "ERROR")
+        buy_signals = 0
+        sell_signals = 0
+        hold_signals = 0
+        error_signals = 0
         orders_submitted = 0
 
         def _set_cycle_report(processed_bar: bool, skip_reason: str) -> None:
@@ -1814,11 +1907,52 @@ class AlpacaTradingBot:
                 error_signals=error_signals,
                 orders_submitted=orders_submitted,
             )
+            _hold_detail = (
+                " [" + " ".join(f"{k}={v}" for k, v in sorted(_hold_reasons.items())) + "]"
+                if _hold_reasons else ""
+            )
             print(
                 f"[CYCLE RESULT] processed_bar={processed_bar} reason={skip_reason} "
-                f"buy={buy_signals} sell={sell_signals} hold={hold_signals} "
+                f"buy={buy_signals} sell={sell_signals} hold={hold_signals}{_hold_detail} "
                 f"errors={error_signals} orders_submitted={orders_submitted}"
             )
+
+        if execute_orders and should_process and not self._claim_global_decision_execution(decision_timestamp):
+            snapshot = self.build_snapshot(
+                decision_timestamp=decision_timestamp,
+                evaluate_signals=False,
+            )
+            print("[CYCLE] Skipping globally claimed bar before execution branch")
+            _set_cycle_report(processed_bar=False, skip_reason="duplicate_bar")
+            self.record_state(snapshot)
+            return snapshot
+
+        try:
+            snapshot = self.build_snapshot(
+                decision_timestamp=decision_timestamp,
+                evaluate_signals=should_process,
+            )
+        except StaleMarketDataError as exc:
+            print(f"[CYCLE] stale_market_data: {exc}")
+            _set_cycle_report(processed_bar=False, skip_reason="stale_market_data")
+            raise
+
+        print(f"Connected. Cash: {snapshot.cash} Buying power: {snapshot.buying_power}")
+        print(f"Daily PnL: {snapshot.daily_pnl:.2f}")
+        print(f"Strategy mode: {self.config.strategy_mode}")
+        print(
+            f"[CYCLE] decision_ts={decision_timestamp.isoformat()} "
+            f"execute_orders={execute_orders} should_process={should_process} "
+            f"force_process={force_process}"
+        )
+        buy_signals = sum(1 for item in snapshot.symbols if item.action == "BUY")
+        sell_signals = sum(1 for item in snapshot.symbols if item.action == "SELL")
+        hold_signals = sum(1 for item in snapshot.symbols if item.action == "HOLD")
+        error_signals = sum(1 for item in snapshot.symbols if item.action == "ERROR")
+        _hold_reasons: dict[str, int] = {}
+        for _item in snapshot.symbols:
+            if _item.action == "HOLD" and _item.hold_reason:
+                _hold_reasons[_item.hold_reason] = _hold_reasons.get(_item.hold_reason, 0) + 1
 
         if not should_process:
             print("[CYCLE] Skipping duplicate bar before execution branch")
@@ -1901,7 +2035,11 @@ class AlpacaTradingBot:
         if not execute_orders:
             print("[CYCLE] Preview-only mode; execution branch will not submit orders")
             for item in snapshot.symbols:
-                suffix = f" ml_up={item.ml_probability_up:.3f}" if item.ml_probability_up is not None else ""
+                suffix = (
+                    f" ml_up={item.ml_probability_up:.3f}"
+                    if item.ml_probability_up is not None and item.ml_model_name != "dummy"
+                    else ""
+                )
                 error_suffix = f" ERROR: {item.error}" if item.error else ""
                 print(f"{item.symbol} -> {item.action}{suffix}{error_suffix}")
             _set_cycle_report(processed_bar=True, skip_reason="preview_only")
@@ -1945,7 +2083,9 @@ class AlpacaTradingBot:
 
                 ml_text = (
                     f" ml_up={item.ml_probability_up:.3f} conf={item.ml_confidence:.3f}"
-                    if item.ml_probability_up is not None and item.ml_confidence is not None
+                    if item.ml_probability_up is not None
+                    and item.ml_confidence is not None
+                    and item.ml_model_name != "dummy"
                     else ""
                 )
                 holding_text = (
@@ -2114,10 +2254,11 @@ class AlpacaTradingBot:
         return snapshot
 
 
-def main() -> None:
+def main(config: BotConfig | None = None, session_id: str | None = None) -> None:
     load_dotenv(Path.cwd() / ".env")
-    config = load_config()
-    bot = AlpacaTradingBot(config)
+    if config is None:
+        config = load_config()
+    bot = AlpacaTradingBot(config, session_id=session_id)
     execute_orders = os.getenv("EXECUTE_ORDERS", "true").lower() != "false"
     bar_interval_seconds = config.bar_timeframe_minutes * 60
     shutdown_event = threading.Event()

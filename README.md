@@ -3,16 +3,17 @@
 Intraday Alpaca paper-trading bot with shared live, backtest, and offline-research components.
 
 The current default operating rules are frozen in [TRADING_SPEC.md](TRADING_SPEC.md).
+The current operator workflow is documented in [OPERATIONS.md](OPERATIONS.md).
 
 ## Quick Start As A Program
 
+For day-of trading operations, prefer the workflow in [OPERATIONS.md](OPERATIONS.md):
+
+- use one `alpaca-bot live` process only
+- use `alpaca-bot dashboard` for monitoring only
+- keep `config/live_config.json` as the runtime trading-settings source of truth
+
 This repo now has an installable package and a single top-level command.
-
-If you want to open it by clicking instead of using the terminal, double-click:
-
-`Open AlpacaTradingBot App.pyw`
-
-That opens the native desktop dashboard directly on Windows with no terminal window.
 
 Install it from the repo root:
 
@@ -36,39 +37,11 @@ Main commands:
 - `alpaca-bot experiments ...` runs the backtest experiment batch
 - `alpaca-bot report ...` runs the daily diagnostic report
 - `alpaca-bot dashboard` launches the browser-based Streamlit dashboard
-- `alpaca-bot control-panel` launches the desktop control panel
 
 You can also run the package without installing the script wrapper:
 
 ```powershell
 python -m alpaca_trading_bot --help
-```
-
-After install, Windows also gets a GUI launcher command:
-
-```powershell
-alpaca-bot-gui
-```
-
-If you want this to feel even more like a normal app, create a shortcut to [Launch AlpacaTradingBot.pyw](c:/Users/lesco/Desktop/AlpacaTradingBot-1/Launch%20AlpacaTradingBot.pyw) and pin that shortcut to Start or your taskbar.
-
-## Build A Standalone Windows App
-
-To package the native desktop dashboard as a standalone Windows `.exe`:
-
-```powershell
-python -m pip install pyinstaller
-powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
-```
-
-The built app will be here:
-
-`dist\AlpacaTradingBot\AlpacaTradingBot.exe`
-
-To create a desktop shortcut after building:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\create_desktop_shortcut.ps1
 ```
 
 ## Current Behavior Snapshot
@@ -229,32 +202,6 @@ alpaca-bot dashboard
 ```
 
 Streamlit usually serves on `http://localhost:8501`.
-
-## Desktop Control Panel
-
-There is also a small Windows launcher that wraps the existing operational commands without changing the backend.
-
-Install dependencies:
-
-```powershell
-python -m pip install -e .
-```
-
-Launch the control panel:
-
-```powershell
-alpaca-bot control-panel
-```
-
-Phase 1 buttons currently wrap:
-
-- `bot.ps1 setup`
-- `bot.ps1 show-config`
-- `bot.ps1 preflight`
-- `bot.ps1 paper-run`
-- `bot.ps1 dashboard`
-
-The app streams command output into an in-window console and uses the existing repo scripts as the source of truth.
 
 ## Config Flow
 

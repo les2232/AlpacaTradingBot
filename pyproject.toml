@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "alpaca-trading-bot"
 version = "0.1.0"
-description = "Installable CLI and desktop launcher for the AlpacaTradingBot workspace."
+description = "Installable CLI for the AlpacaTradingBot workspace."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,14 +17,10 @@ dependencies = [
     "pyarrow",
     "scikit-learn",
     "plotly",
-    "customtkinter",
 ]
 
 [project.scripts]
 alpaca-bot = "alpaca_trading_bot.cli:main"
-
-[project.gui-scripts]
-alpaca-bot-gui = "desktop_app.app:main"
 
 [tool.setuptools]
 py-modules = [
@@ -42,7 +38,7 @@ py-modules = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["alpaca_trading_bot", "desktop_app", "ml"]
+include = ["alpaca_trading_bot", "ml"]
 
 [tool.setuptools.package-data]
 ml = ["models/*.pkl"]

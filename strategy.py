@@ -368,6 +368,7 @@ class StrategyConfig:
     mean_reversion_exit_style: str = MEAN_REVERSION_EXIT_SMA
     mean_reversion_max_atr_percentile: float = 0.0
     mean_reversion_stop_pct: float = 0.0   # 0 = disabled; e.g. 0.02 = exit if price falls 2% below entry
+    sma_stop_pct: float = 0.0              # 0 = disabled; e.g. 0.02 = exit if price falls 2% below entry
     mean_reversion_trend_filter: bool = False       # when True, skip entries where price < 50-bar SMA
     mean_reversion_trend_slope_filter: bool = False # when True, skip entries where SMA_50 slope < 0
 
@@ -508,8 +509,14 @@ class Strategy:
                 and self._regime_allows_entry(bullish_regime)
             ):
                 return "BUY"
-            if price < sma and holding:
-                return "SELL"
+            if holding:
+                stop_triggered = (
+                    self.config.sma_stop_pct > 0
+                    and position_entry_price is not None
+                    and price <= position_entry_price * (1.0 - self.config.sma_stop_pct)
+                )
+                if price < sma or stop_triggered:
+                    return "SELL"
             return "HOLD"
 
         if mode == STRATEGY_MODE_ML:
