@@ -1,13 +1,21 @@
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+import html
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
-from dashboard_state import DashboardState, load_dashboard_state
+from dashboard_state import DashboardState, DrilldownEvent, load_dashboard_state
 
-st.set_page_config(page_title="Alpaca Bot", layout="wide")
+st.set_page_config(page_title="TradeOS", layout="wide")
+
+
+def _strategy_mode_uses_ml(strategy_mode: str | None) -> bool:
+    return str(strategy_mode or "").strip().lower() in {"ml", "hybrid"}
 
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -16,11 +24,36 @@ def _inject_css() -> None:
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500&display=swap');
-        html, body, [class*="css"] { font-family: 'DM Sans', 'Segoe UI', sans-serif; font-size: 17px; }
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;700&display=swap');
+        :root {
+            --bg: #0b111b;
+            --panel: rgba(14, 22, 35, 0.92);
+            --panel-strong: rgba(18, 28, 43, 0.98);
+            --panel-soft: rgba(255,255,255,0.035);
+            --line: rgba(148, 163, 184, 0.16);
+            --text: #edf4ff;
+            --text-soft: #adc1d9;
+            --text-dim: #71859c;
+            --accent: #67b8ff;
+            --accent-2: #4ce2c5;
+            --glow: 0 18px 50px rgba(5, 10, 20, 0.36);
+        }
+        html, body, [class*="css"] { font-family: 'DM Sans', 'Segoe UI', sans-serif; font-size: 20px; }
         code, pre, .mono { font-family: 'DM Mono', 'Consolas', monospace; }
 
-        .stApp { background: #0f1117; color: #d8e0ec; }
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(71, 132, 255, 0.14), transparent 28%),
+                radial-gradient(circle at 85% 0%, rgba(76, 226, 197, 0.10), transparent 20%),
+                radial-gradient(circle at 50% 20%, rgba(255,255,255,0.03), transparent 35%),
+                linear-gradient(180deg, #08101a 0%, #0b111b 35%, #0b111b 100%);
+            color: #d8e0ec;
+        }
+        .block-container {
+            padding-top: 1.2rem;
+            padding-bottom: 2.8rem;
+            max-width: 1600px;
+        }
 
         /* Kill switch banner */
         .ks-banner {
@@ -55,7 +88,7 @@ def _inject_css() -> None:
             display: inline-block;
             border-radius: 4px;
             padding: 0.16rem 0.58rem;
-            font-size: 0.76rem;
+            font-size: 0.84rem;
             font-weight: 700;
             letter-spacing: 0.07em;
             font-family: 'DM Mono', monospace;
@@ -127,34 +160,198 @@ def _inject_css() -> None:
             padding: 0.5rem 0;
             border-bottom: 0.5px solid rgba(255,255,255,0.05);
         }
-        .kv-key { font-size: 0.94rem; color: #6b7a90; }
-        .kv-val { font-size: 0.98rem; font-family: 'DM Mono', monospace; color: #d8e0ec; }
+        .kv-key { font-size: 1.02rem; color: #6b7a90; }
+        .kv-val { font-size: 1.08rem; font-family: 'DM Mono', monospace; color: #d8e0ec; }
 
         /* Section headings */
         .sec-head {
             font-size: 0.86rem;
             text-transform: uppercase;
-            letter-spacing: 0.16em;
-            color: #778ca4;
-            margin: 1.4rem 0 0.72rem;
+            letter-spacing: 0.18em;
+            color: #86a3c4;
+            margin: 1.1rem 0 0.72rem;
             font-family: 'DM Sans', sans-serif;
             font-weight: 600;
         }
 
         /* ── v2 dashboard layout ─────────────────────────────────── */
+        .config-stack {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .config-card {
+            position: relative;
+            padding: 18px 18px 16px;
+            border-radius: 20px;
+            border: 1px solid rgba(126, 157, 194, 0.12);
+            background:
+                linear-gradient(180deg, rgba(17, 27, 41, 0.98), rgba(10, 16, 26, 0.98)),
+                radial-gradient(circle at top right, rgba(103, 184, 255, 0.12), transparent 32%);
+            box-shadow: 0 18px 44px rgba(3, 7, 15, 0.28);
+            overflow: hidden;
+        }
+        .config-card::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(135deg, rgba(255,255,255,0.04), transparent 24%, transparent 76%, rgba(255,255,255,0.02));
+            pointer-events: none;
+        }
+        .config-card-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 14px;
+            margin-bottom: 14px;
+        }
+        .config-card-title {
+            font-size: 0.86rem;
+            text-transform: uppercase;
+            letter-spacing: 0.16em;
+            color: #86a3c4;
+            font-weight: 700;
+        }
+        .config-card-note {
+            font-size: 0.9rem;
+            color: #93a7bf;
+            line-height: 1.45;
+            max-width: 24rem;
+        }
+        .config-hero {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.82rem;
+            color: #cde5ff;
+            padding: 0.34rem 0.62rem;
+            border-radius: 999px;
+            background: rgba(103, 184, 255, 0.12);
+            border: 1px solid rgba(103, 184, 255, 0.2);
+            white-space: nowrap;
+        }
+        .config-stat-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .config-stat {
+            padding: 13px 14px 12px;
+            border-radius: 16px;
+            background: rgba(255,255,255,0.032);
+            border: 1px solid rgba(255,255,255,0.065);
+            min-height: 92px;
+        }
+        .config-stat-label {
+            font-size: 0.73rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #7590ae;
+            margin-bottom: 0.48rem;
+        }
+        .config-stat-value {
+            font-family: 'DM Mono', monospace;
+            font-size: 1.08rem;
+            line-height: 1.35;
+            color: #edf4ff;
+            font-weight: 700;
+            overflow-wrap: anywhere;
+        }
+        .config-stat-sub {
+            margin-top: 0.42rem;
+            font-size: 0.88rem;
+            color: #92a7bf;
+            line-height: 1.4;
+        }
+        .config-band {
+            margin-top: 14px;
+            padding-top: 14px;
+            border-top: 1px solid rgba(255,255,255,0.06);
+        }
+        .config-band-label {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #7590ae;
+            margin-bottom: 0.6rem;
+        }
+        .config-chip-cloud {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .config-chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.38rem 0.68rem;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.045);
+            border: 1px solid rgba(255,255,255,0.075);
+            color: #e6f0fb;
+            font-family: 'DM Mono', monospace;
+            font-size: 0.84rem;
+            line-height: 1;
+        }
+        .config-chip.muted {
+            color: #9eb2c8;
+            background: rgba(255,255,255,0.03);
+        }
+        .config-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .config-row {
+            display: grid;
+            grid-template-columns: minmax(140px, 180px) minmax(0, 1fr);
+            gap: 12px;
+            align-items: start;
+            padding: 11px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.055);
+        }
+        .config-row:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+        .config-row-key {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #6f88a5;
+        }
+        .config-row-val {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.93rem;
+            line-height: 1.55;
+            color: #edf4ff;
+            overflow-wrap: anywhere;
+        }
+        .config-empty {
+            padding: 16px;
+            border-radius: 16px;
+            background: rgba(255,255,255,0.032);
+            border: 1px dashed rgba(126, 157, 194, 0.18);
+            color: #9fb3c8;
+            font-size: 0.96rem;
+        }
+
+        @media (max-width: 1100px) {
+            .config-stat-grid { grid-template-columns: 1fr; }
+            .config-row { grid-template-columns: 1fr; gap: 6px; }
+        }
+
         .dash-metrics {
             display: grid;
             grid-template-columns: repeat(5, 1fr);
-            background: rgba(255,255,255,0.02);
-            border: 0.5px solid rgba(255,255,255,0.08);
-            border-radius: 12px;
+            background: linear-gradient(180deg, rgba(17, 26, 40, 0.96), rgba(12, 18, 29, 0.96));
+            border: 1px solid rgba(123, 152, 187, 0.12);
+            border-radius: 18px;
             overflow: hidden;
             margin-bottom: 1.25rem;
+            box-shadow: var(--glow);
         }
-        .dash-metric { padding: 16px 20px; border-right: 0.5px solid rgba(255,255,255,0.06); }
+        .dash-metric { padding: 18px 22px; border-right: 1px solid rgba(255,255,255,0.05); }
         .dash-metric:last-child { border-right: none; }
-        .dash-metric-label { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: #61758d; margin-bottom: 6px; font-family: 'DM Sans', sans-serif; }
-        .dash-metric-val { font-size: 24px; font-weight: 700; font-family: 'DM Mono', monospace; }
+        .dash-metric-label { font-size: 12px; text-transform: uppercase; letter-spacing: .1em; color: #61758d; margin-bottom: 7px; font-family: 'DM Sans', sans-serif; }
+        .dash-metric-val { font-size: 28px; font-weight: 700; font-family: 'DM Mono', monospace; }
 
         /* Watchlist cards */
         .sym-card-v2 { padding: 12px 15px; border-bottom: 0.5px solid rgba(255,255,255,0.05); cursor: pointer; border-left: 2px solid transparent; transition: background 0.1s; }
@@ -164,8 +361,8 @@ def _inject_css() -> None:
         .sym-card-v2.sym-s-buy  { border-left-color: #4ade80; border-left-width: 3px; }
         .sym-card-v2.sym-s-sell { border-left-color: #f87171; border-left-width: 3px; }
         .sym-card-v2-top { display: flex; justify-content: space-between; align-items: center; }
-        .sym-card-v2-meta { font-size: 0.88rem; color: #4a5c6e; margin-top: 6px; display: flex; justify-content: space-between; }
-        .sym-ticker { font-weight: 700; font-family: 'DM Mono', monospace; font-size: 1.02rem; color: #d8e0ec; }
+        .sym-card-v2-meta { font-size: 0.98rem; color: #4a5c6e; margin-top: 8px; display: flex; justify-content: space-between; }
+        .sym-ticker { font-weight: 700; font-family: 'DM Mono', monospace; font-size: 1.14rem; color: #d8e0ec; }
         /* Card-specific badge and mini bar sizing */
         .sym-card-v2 .badge { font-size: 0.73rem; padding: 0.12rem 0.48rem; }
         .sym-card-v2 .ml-track { height: 4px; border-radius: 2px; margin: 8px 0 3px; }
@@ -177,8 +374,8 @@ def _inject_css() -> None:
         .detail-error-banner { background: rgba(226,75,74,0.09); border: 0.5px solid rgba(226,75,74,0.28); border-radius: 8px; padding: 12px 15px; margin-bottom: 15px; font-family: 'DM Mono', monospace; font-size: 13px; color: #e05c5c; }
         .detail-info-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 18px; }
         .detail-info-cell { background: rgba(255,255,255,0.025); border: 0.5px solid rgba(255,255,255,0.07); border-radius: 9px; padding: 13px 14px; }
-        .detail-info-cell-label { font-size: 10px; text-transform: uppercase; letter-spacing: .11em; color: #5d738d; margin-bottom: 6px; font-family: 'DM Sans', sans-serif; }
-        .detail-info-cell-val { font-size: 16px; font-weight: 700; font-family: 'DM Mono', monospace; color: #d8e0ec; }
+        .detail-info-cell-label { font-size: 11px; text-transform: uppercase; letter-spacing: .11em; color: #5d738d; margin-bottom: 7px; font-family: 'DM Sans', sans-serif; }
+        .detail-info-cell-val { font-size: 18px; font-weight: 700; font-family: 'DM Mono', monospace; color: #d8e0ec; }
 
         /* Right rail */
         .rail-alert { display: flex; gap: 8px; align-items: flex-start; padding: 10px 0; border-bottom: 0.5px solid rgba(255,255,255,0.05); font-size: 13px; }
@@ -190,12 +387,12 @@ def _inject_css() -> None:
 
         .kill-switch-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 13px; background: rgba(226,75,74,0.08); border: 0.5px solid rgba(226,75,74,0.2); border-radius: 7px; margin-top: 10px; font-size: 13px; color: #e05c5c; font-weight: 500; }
 
-        .rail-empty { font-size: 13px; color: #6a7f97; padding: 10px 0; font-style: italic; }
+        .rail-empty { font-size: 15px; color: #6a7f97; padding: 10px 0; font-style: italic; }
         .rail-row { padding: 11px 0; border-bottom: 0.5px solid rgba(255,255,255,0.05); }
         .rail-row-top { display: flex; justify-content: space-between; align-items: center; }
-        .rail-row-meta { display: flex; justify-content: space-between; font-size: 12px; color: #6d8197; margin-top: 4px; }
-        .rail-row-val { font-size: 0.95rem; color: #d8e0ec; font-family: 'DM Mono', monospace; }
-        .rail-sym { font-weight: 700; font-family: 'DM Mono', monospace; font-size: 0.98rem; color: #d8e0ec; }
+        .rail-row-meta { display: flex; justify-content: space-between; font-size: 13px; color: #6d8197; margin-top: 5px; }
+        .rail-row-val { font-size: 1.04rem; color: #d8e0ec; font-family: 'DM Mono', monospace; }
+        .rail-sym { font-weight: 700; font-family: 'DM Mono', monospace; font-size: 1.08rem; color: #d8e0ec; }
         .order-row {
             padding: 12px 0 13px;
             border-bottom: 1px solid rgba(255,255,255,0.045);
@@ -295,8 +492,36 @@ def _inject_css() -> None:
             align-items: flex-start;
             margin-bottom: 0.85rem;
         }
+        .hero-card {
+            background:
+                radial-gradient(circle at top right, rgba(103, 184, 255, 0.12), transparent 22%),
+                linear-gradient(135deg, rgba(15, 24, 38, 0.98), rgba(10, 15, 25, 0.98)),
+                linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0));
+            border: 1px solid rgba(129, 151, 181, 0.14);
+            border-radius: 24px;
+            padding: 22px 24px;
+            box-shadow: var(--glow);
+            min-height: 118px;
+            position: relative;
+            overflow: hidden;
+        }
+        .hero-card:before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(90deg, rgba(103,184,255,0.10), transparent 30%, transparent 70%, rgba(76,226,197,0.08));
+            pointer-events: none;
+        }
+        .hero-kicker {
+            font-size: 0.76rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.18em;
+            color: #7f95ae;
+            margin-bottom: 0.45rem;
+        }
         .top-title {
-            font-size: 1.72rem;
+            font-size: 2.25rem;
             font-weight: 700;
             color: #f8fbff;
             letter-spacing: -0.02em;
@@ -309,8 +534,41 @@ def _inject_css() -> None:
             margin-top: 0.3rem;
         }
         .subtle-copy {
-            font-size: 0.9rem;
+            font-size: 1rem;
             color: #7c90a6;
+        }
+        .hero-summary {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 0.95rem;
+        }
+        .hero-stat {
+            border: 1px solid rgba(129, 151, 181, 0.12);
+            background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+            border-radius: 16px;
+            padding: 12px 14px;
+            backdrop-filter: blur(10px);
+        }
+        .hero-stat-label {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.13em;
+            color: #7489a2;
+            margin-bottom: 0.25rem;
+        }
+        .hero-stat-value {
+            font-size: 1.12rem;
+            font-weight: 700;
+            color: #f3f7fc;
+            font-family: 'DM Mono', monospace;
+        }
+        .hero-note {
+            margin-top: 0.75rem;
+            font-size: 0.9rem;
+            color: #9bb0c7;
+            max-width: 54rem;
+            line-height: 1.45;
         }
         .status-inline {
             display: flex;
@@ -319,12 +577,82 @@ def _inject_css() -> None:
             flex-wrap: wrap;
             justify-content: flex-end;
         }
+        .action-cluster {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 10px;
+        }
+        .action-card {
+            background: linear-gradient(180deg, rgba(18, 26, 38, 0.94), rgba(12, 17, 27, 0.94));
+            border: 1px solid rgba(129, 151, 181, 0.14);
+            border-radius: 18px;
+            padding: 14px 16px;
+            min-width: 260px;
+            box-shadow: var(--glow);
+        }
+        .action-card .workspace-label { margin-bottom: 0.35rem; }
+        .status-emphasis {
+            font-size: 1.12rem;
+            color: #eff5fb;
+            font-weight: 600;
+        }
         .compact-card {
             background: linear-gradient(180deg, rgba(23, 30, 42, 0.96), rgba(15, 18, 27, 0.96));
             border: 1px solid rgba(129, 151, 181, 0.14);
             border-radius: 16px;
             padding: 16px 18px;
             box-shadow: 0 14px 28px rgba(0, 0, 0, 0.16);
+        }
+        .compact-card.feed-card {
+            background:
+                radial-gradient(circle at left center, rgba(76, 226, 197, 0.09), transparent 18%),
+                linear-gradient(135deg, rgba(18, 29, 42, 0.98), rgba(11, 17, 27, 0.98));
+            border-color: rgba(96, 165, 250, 0.14);
+            border-radius: 18px;
+            padding: 14px 16px;
+            margin-bottom: 0.35rem;
+            box-shadow: var(--glow);
+        }
+        .feed-grid {
+            display: grid;
+            grid-template-columns: minmax(220px, 1.5fr) repeat(3, minmax(120px, 0.72fr));
+            gap: 10px;
+            align-items: center;
+        }
+        .feed-primary { min-width: 0; }
+        .feed-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 1.04rem;
+            color: #eef4fb;
+            font-weight: 600;
+            margin-bottom: 0.2rem;
+        }
+        .feed-subline {
+            font-size: 0.92rem;
+            color: #9cb0c8;
+            line-height: 1.32;
+            max-width: 28rem;
+        }
+        .feed-stat {
+            min-width: 0;
+            padding-left: 12px;
+            border-left: 1px solid rgba(255,255,255,0.08);
+        }
+        .feed-stat-label {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #71859c;
+            margin-bottom: 0.3rem;
+        }
+        .feed-stat-value {
+            font-size: 1.1rem;
+            color: #f1f6fc;
+            font-weight: 700;
+            font-family: 'DM Mono', monospace;
         }
         .status-card {
             display: flex;
@@ -379,30 +707,44 @@ def _inject_css() -> None:
             font-weight: 600;
         }
         .watchlist-shell {
-            background: linear-gradient(180deg, rgba(21, 27, 38, 0.98), rgba(14, 18, 27, 0.96));
+            background: linear-gradient(180deg, rgba(18, 26, 39, 0.98), rgba(11, 17, 27, 0.97));
             border: 1px solid rgba(129, 151, 181, 0.12);
-            border-radius: 18px;
+            border-radius: 22px;
             overflow: hidden;
+            box-shadow: var(--glow);
         }
         .watchlist-header {
-            padding: 14px 14px 10px;
+            padding: 16px 16px 12px;
             border-bottom: 1px solid rgba(255,255,255,0.06);
-            background: rgba(255,255,255,0.015);
+            background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015));
+        }
+        .watchlist-body {
+            max-height: 980px;
+            overflow-y: auto;
         }
         .watchlist-subtext {
-            font-size: 0.9rem;
+            font-size: 1rem;
             color: #8b9fb6;
             margin-top: 0.2rem;
         }
+        .watchlist-tip {
+            margin-top: 0.45rem;
+            font-size: 0.82rem;
+            color: #72849a;
+            line-height: 1.35;
+        }
         .sym-card-v2 {
-            padding: 13px 15px;
+            padding: 14px 16px;
             border-bottom: 1px solid rgba(255,255,255,0.045);
             cursor: pointer;
             border-left: 3px solid transparent;
-            transition: background 0.12s ease, border-color 0.12s ease;
+            transition: background 0.14s ease, border-color 0.14s ease, transform 0.14s ease;
         }
         .sym-card-v2:last-child { border-bottom: none; }
-        .sym-card-v2:hover { background: rgba(255,255,255,0.028); }
+        .sym-card-v2:hover {
+            background: rgba(255,255,255,0.032);
+            transform: translateX(3px);
+        }
         .sym-card-v2.sym-active {
             background: linear-gradient(90deg, rgba(59,130,246,0.14), rgba(59,130,246,0.04));
             border-left-color: #60a5fa;
@@ -428,12 +770,12 @@ def _inject_css() -> None:
         .sym-price {
             font-family: 'DM Mono', monospace;
             color: #e8eef7;
-            font-size: 0.94rem;
+            font-size: 1.02rem;
         }
         .sym-change {
             font-family: 'DM Mono', monospace;
             color: #93a5bc;
-            font-size: 0.9rem;
+            font-size: 0.98rem;
         }
         .sym-card-foot {
             display: flex;
@@ -443,17 +785,19 @@ def _inject_css() -> None:
             margin-top: 6px;
         }
         .tiny-label {
-            font-size: 0.77rem;
+            font-size: 0.84rem;
             color: #6f8095;
             text-transform: uppercase;
             letter-spacing: 0.09em;
         }
         .detail-hero {
-            background: linear-gradient(180deg, rgba(23, 30, 42, 0.98), rgba(14, 18, 27, 0.96));
-            border: 1px solid rgba(129, 151, 181, 0.14);
-            border-radius: 20px;
-            padding: 22px 24px;
-            box-shadow: 0 18px 36px rgba(0, 0, 0, 0.2);
+            background:
+                radial-gradient(circle at top right, rgba(103,184,255,0.10), transparent 18%),
+                linear-gradient(180deg, rgba(20, 29, 42, 0.98), rgba(11, 17, 27, 0.96));
+            border: 1px solid rgba(129, 151, 181, 0.13);
+            border-radius: 22px;
+            padding: 24px 26px;
+            box-shadow: var(--glow);
             margin-bottom: 0.9rem;
         }
         .detail-hero-top {
@@ -464,14 +808,14 @@ def _inject_css() -> None:
             margin-bottom: 1rem;
         }
         .detail-symbol {
-            font-size: 2.6rem;
+            font-size: 2.9rem;
             line-height: 1;
             font-weight: 700;
             color: #fbfdff;
             font-family: 'DM Mono', monospace;
         }
         .detail-price {
-            font-size: 2.2rem;
+            font-size: 2.45rem;
             line-height: 1;
             font-weight: 700;
             color: #f8fbff;
@@ -486,6 +830,16 @@ def _inject_css() -> None:
             margin-top: 0.45rem;
             color: #8093a8;
             font-size: 0.92rem;
+        }
+        .detail-context {
+            margin-top: 0.8rem;
+            padding: 10px 12px;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.9rem;
+            color: #adc0d3;
+            line-height: 1.4;
         }
         .detail-pill-row {
             display: flex;
@@ -521,11 +875,12 @@ def _inject_css() -> None:
         }
         .detail-history-card,
         .rail-card {
-            background: linear-gradient(180deg, rgba(21, 27, 38, 0.98), rgba(14, 18, 27, 0.96));
+            background: linear-gradient(180deg, rgba(18, 26, 39, 0.98), rgba(11, 17, 27, 0.96));
             border: 1px solid rgba(129, 151, 181, 0.12);
-            border-radius: 18px;
-            padding: 17px 17px 15px;
+            border-radius: 20px;
+            padding: 18px 18px 16px;
             margin-bottom: 0.95rem;
+            box-shadow: var(--glow);
         }
         .rail-card:last-child { margin-bottom: 0; }
         .rail-card .sec-head,
@@ -533,6 +888,45 @@ def _inject_css() -> None:
             margin-top: 0;
             margin-bottom: 0.85rem;
         }
+
+        /* Trader Thoughts + Near Misses panels */
+        .thought-row {
+            padding: 9px 0;
+            border-bottom: 0.5px solid rgba(255,255,255,0.05);
+        }
+        .thought-row:last-child { border-bottom: none; padding-bottom: 0; }
+        .thought-meta {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            margin-bottom: 3px;
+        }
+        .thought-sym {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: #7db6f7;
+            letter-spacing: 0.04em;
+        }
+        /* Near-miss symbol chip — amber tint to signal "almost" */
+        .miss-sym {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: #f0c96a;
+            letter-spacing: 0.04em;
+        }
+        .thought-ts {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.74rem;
+            color: #4a5c6e;
+        }
+        .thought-text {
+            font-size: 0.9rem;
+            color: #b8cfe8;
+            line-height: 1.4;
+        }
+
         .ticker-strip {
             display: flex;
             flex-direction: column;
@@ -549,10 +943,10 @@ def _inject_css() -> None:
             display: flex;
             gap: 10px;
             overflow-x: auto;
-            padding: 11px 13px;
-            border-radius: 14px;
-            background: linear-gradient(90deg, rgba(20, 28, 39, 0.98), rgba(14, 19, 28, 0.98));
-            border: 1px solid rgba(129, 151, 181, 0.16);
+            padding: 12px 14px;
+            border-radius: 16px;
+            background: linear-gradient(90deg, rgba(17, 25, 38, 0.98), rgba(10, 17, 27, 0.98));
+            border: 1px solid rgba(129, 151, 181, 0.14);
             box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
         }
         .ticker-chip {
@@ -564,6 +958,10 @@ def _inject_css() -> None:
             border-radius: 10px;
             background: rgba(255,255,255,0.045);
             border: 1px solid rgba(255,255,255,0.08);
+        }
+        .ticker-chip.active {
+            background: rgba(96,165,250,0.11);
+            border-color: rgba(96,165,250,0.28);
         }
         .ticker-chip-symbol {
             font-family: 'DM Mono', monospace;
@@ -582,12 +980,14 @@ def _inject_css() -> None:
             font-weight: 700;
         }
         .exec-panel {
-            background: linear-gradient(180deg, rgba(25, 32, 45, 0.98), rgba(17, 22, 32, 0.98));
-            border: 1px solid rgba(96, 165, 250, 0.26);
-            border-radius: 18px;
-            padding: 18px 19px;
+            background:
+                radial-gradient(circle at right top, rgba(76, 226, 197, 0.08), transparent 18%),
+                linear-gradient(180deg, rgba(21, 30, 44, 0.98), rgba(12, 18, 28, 0.98));
+            border: 1px solid rgba(96, 165, 250, 0.18);
+            border-radius: 20px;
+            padding: 20px 21px;
             margin-bottom: 1rem;
-            box-shadow: 0 16px 28px rgba(0,0,0,0.18);
+            box-shadow: var(--glow);
         }
         .exec-list {
             display: grid;
@@ -639,7 +1039,7 @@ def _inject_css() -> None:
         }
         .exec-action {
             font-family: 'DM Mono', monospace;
-            font-size: 1rem;
+            font-size: 1.08rem;
             font-weight: 800;
             letter-spacing: 0.04em;
         }
@@ -654,18 +1054,18 @@ def _inject_css() -> None:
         }
         .exec-symbol {
             font-family: 'DM Mono', monospace;
-            font-size: 0.98rem;
+            font-size: 1.08rem;
             color: #f5f8fd;
             font-weight: 700;
         }
         .exec-price {
             font-family: 'DM Mono', monospace;
-            font-size: 0.92rem;
+            font-size: 1rem;
             color: #e2e8f0;
             font-weight: 600;
         }
         .exec-reason {
-            font-size: 0.84rem;
+            font-size: 0.94rem;
             color: #afbfd1;
             line-height: 1.3;
         }
@@ -695,7 +1095,7 @@ def _inject_css() -> None:
             display: flex;
             gap: 8px;
             align-items: flex-start;
-            font-size: 0.9rem;
+            font-size: 1rem;
             color: #c8d3e1;
             line-height: 1.35;
             padding: 9px 11px;
@@ -731,12 +1131,96 @@ def _inject_css() -> None:
             margin-top: 5px;
             color: #b1c0d2;
         }
+        .timing-shell {
+            margin: 0.5rem 0 0.75rem;
+            padding: 16px 18px;
+            border-radius: 18px;
+            background: linear-gradient(135deg, rgba(18, 27, 41, 0.98), rgba(12, 16, 24, 0.98));
+            border: 1px solid rgba(96,165,250,0.14);
+            box-shadow: 0 16px 32px rgba(0, 0, 0, 0.18);
+        }
+        .timing-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 0.9rem;
+        }
+        .timing-title {
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: #7f93ab;
+            font-weight: 700;
+        }
+        .timing-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .timing-item {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.06);
+            border-radius: 14px;
+            padding: 12px 13px;
+        }
+        .timing-item.strong {
+            background: rgba(96,165,250,0.09);
+            border-color: rgba(96,165,250,0.24);
+        }
+        .timing-label {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #7286a0;
+            margin-bottom: 0.35rem;
+        }
+        .timing-value {
+            font-size: 1.02rem;
+            font-weight: 700;
+            color: #f5f9ff;
+            font-family: 'DM Mono', monospace;
+        }
+        .timing-help {
+            font-size: 0.96rem;
+            color: #96a8bd;
+        }
+        [data-testid="stButton"] > button[kind="secondary"] {
+            border-radius: 12px;
+            border-color: rgba(129, 151, 181, 0.28);
+            background: rgba(255,255,255,0.03);
+        }
+        [data-testid="stTabs"] [role="tablist"] {
+            gap: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.07);
+            padding-top: 0.05rem;
+            padding-bottom: 0.2rem;
+            margin-bottom: 0.35rem;
+        }
+        [data-testid="stTabs"] [role="tab"] {
+            border-radius: 999px;
+            padding: 0.22rem 0.75rem;
+            color: #8ea2b8;
+            background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015));
+            border: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.88rem;
+            transition: all 0.15s ease;
+        }
+        [data-testid="stTabs"] [aria-selected="true"] {
+            color: #f8fbff;
+            background: linear-gradient(180deg, rgba(103,184,255,0.18), rgba(103,184,255,0.08));
+            border-color: rgba(103,184,255,0.28);
+            box-shadow: 0 8px 24px rgba(14, 90, 183, 0.24);
+        }
         .rail-row { padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
         .rail-row:last-child { border-bottom: none; }
 
         @media (max-width: 1200px) {
             .dash-metrics { grid-template-columns: repeat(2, 1fr); }
             .detail-info-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .hero-summary,
+            .timing-grid,
+            .feed-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         }
         @media (max-width: 900px) {
             .top-shell { flex-direction: column; }
@@ -745,7 +1229,78 @@ def _inject_css() -> None:
             .detail-price { text-align: left; }
             .dash-metrics { grid-template-columns: 1fr; }
             .detail-info-grid { grid-template-columns: 1fr; }
+            .hero-summary,
+            .timing-grid,
+            .feed-grid { grid-template-columns: 1fr; }
+            .feed-stat {
+                padding-left: 0;
+                border-left: none;
+                border-top: 1px solid rgba(255,255,255,0.08);
+                padding-top: 12px;
+            }
+            .action-cluster { align-items: stretch; }
+            .action-card { min-width: 0; }
         }
+
+        /* ── Trade Decision Drilldown ────────────────────────────── */
+        .dd-shell {
+            padding: 20px 22px 18px;
+            border-radius: 18px;
+            background: linear-gradient(180deg, rgba(16,24,38,0.98), rgba(10,15,24,0.98));
+            border: 1px solid rgba(103,184,255,0.14);
+            box-shadow: 0 12px 32px rgba(0,0,0,0.22);
+            margin-bottom: 1.2rem;
+        }
+        .dd-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 1.1rem;
+            flex-wrap: wrap;
+        }
+        .dd-symbol {
+            font-size: 1.35rem;
+            font-weight: 800;
+            color: #edf4ff;
+            font-family: 'DM Mono', monospace;
+            letter-spacing: 0.04em;
+        }
+        .dd-ts {
+            font-size: 0.86rem;
+            color: #4a6474;
+            margin-left: 4px;
+        }
+        .dd-section {
+            margin-top: 1.1rem;
+            padding-top: 0.9rem;
+            border-top: 1px solid rgba(255,255,255,0.06);
+        }
+        .dd-path { margin-top: 0.5rem; }
+        .dd-path-step {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 7px 0;
+            border-bottom: 0.5px solid rgba(255,255,255,0.04);
+        }
+        .dd-path-step:last-child { border-bottom: none; }
+        .dd-step-idx {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.78rem;
+            color: #3d5a78;
+            min-width: 22px;
+            padding-top: 2px;
+        }
+        .dd-step-key {
+            font-size: 0.92rem;
+            color: #8fa3ba;
+            min-width: 150px;
+            flex: 0 0 150px;
+        }
+        .dd-step-val { font-size: 0.92rem; color: #d7e1ec; }
+        .dd-pass  { color: #4ade80; font-weight: 700; }
+        .dd-reject { color: #f87171; font-weight: 700; }
+        .dd-note  { font-size: 0.8rem; color: #4a6070; margin-left: 6px; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -917,34 +1472,78 @@ def _kv(key: str, val: str) -> str:
     )
 
 
+def _escape_html(value) -> str:
+    return html.escape(str(value if value not in (None, "") else "—"))
+
+
+def _config_stat_html(label: str, value, subtext: str | None = None) -> str:
+    sub = f"<div class='config-stat-sub'>{_escape_html(subtext)}</div>" if subtext else ""
+    return (
+        "<div class='config-stat'>"
+        f"<div class='config-stat-label'>{_escape_html(label)}</div>"
+        f"<div class='config-stat-value'>{_escape_html(value)}</div>"
+        f"{sub}"
+        "</div>"
+    )
+
+
+def _config_row_html(label: str, value) -> str:
+    return (
+        "<div class='config-row'>"
+        f"<div class='config-row-key'>{_escape_html(label)}</div>"
+        f"<div class='config-row-val'>{_escape_html(value)}</div>"
+        "</div>"
+    )
+
+
+def _config_chip_cloud_html(values: list[str] | tuple[str, ...], muted: bool = False) -> str:
+    if not values:
+        values = ["n/a"]
+        muted = True
+    cls = "config-chip muted" if muted else "config-chip"
+    chips = "".join(f"<span class='{cls}'>{_escape_html(value)}</span>" for value in values)
+    return f"<div class='config-chip-cloud'>{chips}</div>"
+
+
 def _render_bar_timing(bot) -> None:
     timeframe_minutes = getattr(bot.config, "bar_timeframe_minutes", 0) or 15
     timing = _get_bar_timing(int(timeframe_minutes))
-    current_time_utc = timing["current_time_utc"]
-    next_bar_close_utc = timing["next_bar_close_utc"]
+    current_time_utc: datetime = timing["current_time_utc"]  # type: ignore[assignment]
+    next_bar_close_utc: datetime = timing["next_bar_close_utc"]  # type: ignore[assignment]
     seconds_remaining = timing["seconds_remaining"]
     timeframe_minutes = timing["timeframe_minutes"]
 
     components.html(
         f"""
-        <style>body{{background:#0f1117;margin:0;padding:0;}}</style>
-        <div style="padding:0.4rem 0;">
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:0.5rem;">
-            <div>
-              <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin-bottom:4px;">Current UTC</div>
-              <div id="bot-timing-now" style="font-size:20px;font-weight:600;color:#f1f5f9;font-family:'DM Mono',monospace;"></div>
+        <style>
+          body {{
+            background: transparent;
+            margin: 0;
+            padding: 0;
+            font-family: 'DM Sans', sans-serif;
+            color: #e8eef7;
+          }}
+        </style>
+        <div style="margin:0.35rem 0 0.75rem;padding:18px 20px;border-radius:18px;background:linear-gradient(135deg, rgba(18, 27, 41, 0.98), rgba(12, 16, 24, 0.98));border:1px solid rgba(96,165,250,0.14);box-shadow:0 16px 32px rgba(0, 0, 0, 0.18);">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;">
+            <div style="min-width:240px;">
+              <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.14em;color:#7f93ab;font-weight:700;margin-bottom:0.45rem;">Next Bar In</div>
+              <div id="bot-timing-countdown" style="font-size:2.2rem;line-height:1;font-weight:800;color:#f8fbff;font-family:'DM Mono', monospace;"></div>
+              <div style="font-size:0.9rem;color:#9cb0c8;margin-top:0.55rem;">Next bar closes at <span id="bot-timing-close-inline" style="color:#f1f6fc;font-family:'DM Mono', monospace;font-weight:700;"></span></div>
             </div>
-            <div>
-              <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin-bottom:4px;">Next Bar Close UTC</div>
-              <div id="bot-timing-close" style="font-size:20px;font-weight:600;color:#f1f5f9;font-family:'DM Mono',monospace;"></div>
-            </div>
-            <div>
-              <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin-bottom:4px;">Countdown</div>
-              <div id="bot-timing-countdown" style="font-size:20px;font-weight:600;color:#f1f5f9;font-family:'DM Mono',monospace;"></div>
-            </div>
-            <div>
-              <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#888;margin-bottom:4px;">Bar Timeframe</div>
-              <div style="font-size:20px;font-weight:600;color:#f1f5f9;font-family:'DM Mono',monospace;">{timeframe_minutes} min</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:12px;flex:1 1 420px;">
+              <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:12px 13px;">
+                <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;color:#7286a0;margin-bottom:0.35rem;">Current UTC</div>
+                <div id="bot-timing-now" style="font-size:1rem;font-weight:700;color:#f5f9ff;font-family:'DM Mono', monospace;"></div>
+              </div>
+              <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:12px 13px;">
+                <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;color:#7286a0;margin-bottom:0.35rem;">Next Bar Close</div>
+                <div id="bot-timing-close" style="font-size:1rem;font-weight:700;color:#f5f9ff;font-family:'DM Mono', monospace;"></div>
+              </div>
+              <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:12px 13px;">
+                <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;color:#7286a0;margin-bottom:0.35rem;">Bar Timeframe</div>
+                <div style="font-size:1rem;font-weight:700;color:#f5f9ff;font-family:'DM Mono', monospace;">{timeframe_minutes} min</div>
+              </div>
             </div>
           </div>
           <script>
@@ -953,7 +1552,17 @@ def _render_bar_timing(bot) -> None:
             const baseRemaining = {seconds_remaining};
 
             function formatUtc(tsMs) {{
-              return new Date(tsMs).toISOString().replace("T", " ").slice(0, 19);
+              const iso = new Date(tsMs).toISOString();
+              const yyyy = iso.slice(0, 4);
+              const mm = iso.slice(5, 7);
+              const dd = iso.slice(8, 10);
+              const timeBits = iso.slice(11, 19).split(":");
+              let hour = Number(timeBits[0]);
+              const meridiem = hour >= 12 ? "PM" : "AM";
+              hour = hour % 12 || 12;
+              const hourLabel = String(hour).padStart(2, "0");
+              const time = `${{hourLabel}}:${{timeBits[1]}}:${{timeBits[2]}} ${{meridiem}}`;
+              return `${{mm}}-${{dd}}-${{yyyy}} ${{time}} UTC`;
             }}
 
             function formatCountdown(totalSeconds) {{
@@ -970,6 +1579,7 @@ def _render_bar_timing(bot) -> None:
               const remaining = baseRemaining - elapsed;
               document.getElementById("bot-timing-now").textContent = formatUtc(currentMs);
               document.getElementById("bot-timing-close").textContent = formatUtc(nextCloseMs);
+              document.getElementById("bot-timing-close-inline").textContent = formatUtc(nextCloseMs);
               document.getElementById("bot-timing-countdown").textContent = formatCountdown(remaining);
             }}
 
@@ -978,8 +1588,228 @@ def _render_bar_timing(bot) -> None:
           </script>
         </div>
         """,
-        height=140,
+        height=170,
     )
+
+
+# ── Drilldown panel ───────────────────────────────────────────────────────────
+
+def _drilldown_label(event: DrilldownEvent) -> str:
+    """Short selector label for one drilldown event."""
+    time_str = _compact_time_str(event.timestamp_utc)
+    etype_short = {
+        "signal.evaluated": "sig",
+        "risk.check": "risk",
+        "position.closed": "exit",
+    }.get(event.event_type, event.event_type)
+    action = event.action or "—"
+    return f"{event.symbol}  {time_str}  [{etype_short}]  {action}"
+
+
+def _drilldown_path_html(event: DrilldownEvent) -> str:
+    """Compact decision path steps appropriate for the event type."""
+    steps: list[str] = []
+    idx = 1
+
+    def _step(key: str, val_html: str, note: str = "") -> None:
+        nonlocal idx
+        note_html = (
+            f"<span class='dd-note'>{_escape_html(note)}</span>" if note else ""
+        )
+        steps.append(
+            f"<div class='dd-path-step'>"
+            f"<span class='dd-step-idx'>{idx}</span>"
+            f"<span class='dd-step-key'>{_escape_html(key)}</span>"
+            f"<span class='dd-step-val'>{val_html}{note_html}</span>"
+            f"</div>"
+        )
+        idx += 1
+
+    et = event.event_type
+
+    if et == "signal.evaluated":
+        if event.deviation_pct is not None:
+            sign = "+" if event.deviation_pct >= 0 else ""
+            direction = "above" if event.deviation_pct >= 0 else "below"
+            _step(
+                "Deviation from SMA",
+                f"<span class='dd-step-val'>{sign}{event.deviation_pct:.2f}%</span>",
+                f"{direction} reference",
+            )
+        if event.trend_filter is not None:
+            is_pass = event.trend_filter.lower() == "pass"
+            cls = "dd-pass" if is_pass else "dd-reject"
+            trend_note = (
+                "above trend SMA" if event.above_trend_sma is True
+                else ("below trend SMA" if event.above_trend_sma is False else "")
+            )
+            _step("Trend filter", f"<span class='{cls}'>{event.trend_filter.upper()}</span>", trend_note)
+        if event.atr_filter is not None:
+            is_pass = event.atr_filter.lower() == "pass"
+            cls = "dd-pass" if is_pass else "dd-reject"
+            atr_parts: list[str] = []
+            if event.atr_pct is not None:
+                atr_parts.append(f"ATR {event.atr_pct:.2%}")
+            if event.atr_percentile is not None:
+                atr_parts.append(f"{event.atr_percentile:.0f}th pct")
+            _step("ATR filter", f"<span class='{cls}'>{event.atr_filter.upper()}</span>", " · ".join(atr_parts))
+        if event.ml_prob is not None:
+            pct = int(event.ml_prob * 100)
+            color = "#4ade80" if event.ml_prob >= 0.6 else ("#f87171" if event.ml_prob <= 0.4 else "#d7e1ec")
+            _step(
+                "ML probability",
+                f"<span style='color:{color};font-weight:700'>{event.ml_prob:.3f} ({pct}%)</span>",
+            )
+        if event.volume_ratio is not None:
+            color = "#4ade80" if event.volume_ratio >= 1.0 else "#f87171"
+            note = "above avg" if event.volume_ratio >= 1.0 else "below avg"
+            _step("Volume ratio", f"<span style='color:{color}'>{event.volume_ratio:.2f}x</span>", note)
+        if event.window_open is not None:
+            cls = "dd-pass" if event.window_open else "dd-reject"
+            _step("Entry window", f"<span class='{cls}'>{'OPEN' if event.window_open else 'CLOSED'}</span>")
+        action = (event.action or "HOLD").upper()
+        action_cls = {"BUY": "b-buy", "SELL": "b-sell"}.get(action, "b-hold")
+        if action in {"BUY", "SELL"}:
+            outcome_note = "cleared all filters"
+        elif event.rejection:
+            outcome_note = f"reason: {_pretty_reason(event.rejection)}"
+        else:
+            outcome_note = "no actionable signal"
+        _step("→ Decision", f"<span class='badge {action_cls}'>{action}</span>", outcome_note)
+
+    elif et == "risk.check":
+        action = (event.action or "").upper()
+        action_cls = {"BUY": "b-buy", "SELL": "b-sell"}.get(action, "b-hold")
+        _step("Signal direction", f"<span class='badge {action_cls}'>{action or '—'}</span>")
+        if event.allowed is True:
+            _step("Risk gate", "<span class='dd-pass'>PASSED</span>", "all checks cleared")
+        elif event.allowed is False:
+            block_note = _pretty_reason(event.block_reason) if event.block_reason else "reason unknown"
+            _step("Risk gate", "<span class='dd-reject'>BLOCKED</span>", block_note)
+        else:
+            _step("Risk gate", "<span class='dd-step-val'>—</span>")
+
+    elif et == "position.closed":
+        exit_label = _escape_html(event.exit_reason or "—")
+        exit_note = _pretty_reason(event.exit_reason) if event.exit_reason else ""
+        _step("Exit trigger", f"<span class='dd-step-val'>{exit_label}</span>", exit_note)
+        if event.pnl_usd is not None:
+            sign = "+" if event.pnl_usd >= 0 else ""
+            cls = "dd-pass" if event.pnl_usd >= 0 else "dd-reject"
+            _step("Realized P&L", f"<span class='{cls}'>{sign}${abs(event.pnl_usd):.2f}</span>")
+
+    if not steps:
+        return (
+            "<div class='dd-section'>"
+            "<div class='sec-head' style='margin-top:0'>Decision Path</div>"
+            "<div class='rail-empty'>No decision data available for this event type.</div>"
+            "</div>"
+        )
+    return (
+        "<div class='dd-section'>"
+        "<div class='sec-head' style='margin-top:0'>Decision Path</div>"
+        f"<div class='dd-path'>{''.join(steps)}</div>"
+        "</div>"
+    )
+
+
+def _drilldown_panel_html(event: DrilldownEvent) -> str:
+    """Full drilldown card for one decision event."""
+    et = event.event_type
+    action = (event.action or "").upper()
+
+    etype_label = {
+        "signal.evaluated": "SIGNAL",
+        "risk.check": "RISK CHECK",
+        "position.closed": "EXIT",
+    }.get(et, et.upper().replace(".", " "))
+
+    etype_cls = {
+        "signal.evaluated": "b-hold",
+        "risk.check": "b-blocked" if event.allowed is False else "b-ready",
+        "position.closed": "b-sell",
+    }.get(et, "b-nosignal")
+    action_badge_cls = {"BUY": "b-buy", "SELL": "b-sell", "HOLD": "b-hold"}.get(action, "b-nosignal")
+
+    ts_str = _format_datetime_pretty(event.timestamp_utc) if event.timestamp_utc else "—"
+
+    # Allowed / blocked display
+    if event.allowed is True:
+        allowed_html = "<span class='dd-pass'>allowed</span>"
+    elif event.allowed is False:
+        allowed_html = "<span class='dd-reject'>blocked</span>"
+    else:
+        allowed_html = "<span style='color:#4a6070'>n/a</span>"
+
+    # Primary rejection/block reason
+    reason_raw = event.block_reason or event.rejection or event.exit_reason
+    reason_html = _escape_html(_pretty_reason(reason_raw) if reason_raw else "—")
+
+    fields: list[str] = [
+        _kv("Symbol", _escape_html(event.symbol or "—")),
+        _kv("Timestamp", _escape_html(ts_str)),
+        _kv("Event type", _escape_html(etype_label)),
+        _kv("Action", _escape_html(action or "—")),
+        _kv("Strategy mode", _escape_html(event.strategy_mode or "—")),
+        _kv("Allowed / blocked", allowed_html),
+        _kv("Rejection / reason", reason_html),
+    ]
+
+    if event.trend_filter is not None:
+        cls = "dd-pass" if event.trend_filter.lower() == "pass" else "dd-reject"
+        fields.append(_kv("Trend filter", f"<span class='{cls}'>{_escape_html(event.trend_filter.upper())}</span>"))
+    if event.atr_filter is not None:
+        cls = "dd-pass" if event.atr_filter.lower() == "pass" else "dd-reject"
+        fields.append(_kv("ATR filter", f"<span class='{cls}'>{_escape_html(event.atr_filter.upper())}</span>"))
+    if event.deviation_pct is not None:
+        sign = "+" if event.deviation_pct >= 0 else ""
+        fields.append(_kv("Deviation (% vs SMA)", f"{sign}{event.deviation_pct:.2f}%"))
+    if event.ml_prob is not None:
+        fields.append(_kv("ML probability", f"{event.ml_prob:.3f} ({int(event.ml_prob * 100)}%)"))
+    if event.pnl_usd is not None:
+        sign = "+" if event.pnl_usd >= 0 else ""
+        cls = "dd-pass" if event.pnl_usd >= 0 else "dd-reject"
+        fields.append(_kv("Realized P&L", f"<span class='{cls}'>{sign}${abs(event.pnl_usd):.2f}</span>"))
+
+    return (
+        "<div class='dd-shell'>"
+        "<div class='dd-header'>"
+        f"<span class='dd-symbol'>{_escape_html(event.symbol)}</span>"
+        f"<span class='badge {etype_cls}'>{etype_label}</span>"
+        f"<span class='badge {action_badge_cls}'>{action or '—'}</span>"
+        f"<span class='dd-ts'>{_escape_html(ts_str)}</span>"
+        "</div>"
+        f"{''.join(fields)}"
+        + _drilldown_path_html(event)
+        + "</div>"
+    )
+
+
+def _render_drilldown(state: DashboardState) -> None:
+    """Render the Trade Decision Drilldown tab."""
+    candidates = list(state.drilldown_candidates)
+
+    if not candidates:
+        st.markdown(
+            "<div class='rail-empty' style='margin-top:1.5rem'>"
+            "No recent decision events found. "
+            "Start the bot and wait for the first bar cycle to populate logs."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    labels = [_drilldown_label(ev) for ev in candidates]
+    idx = st.selectbox(
+        "Decision event",
+        range(len(labels)),
+        format_func=lambda i: labels[i],
+    )
+    if idx is None:
+        return
+
+    selected = candidates[int(idx)]
+    st.markdown(_drilldown_panel_html(selected), unsafe_allow_html=True)
 
 
 # ── Error page ────────────────────────────────────────────────────────────────
@@ -1137,22 +1967,66 @@ def _metrics_bar_html(snapshot) -> str:
 
     return (
         "<div class='dash-metrics'>"
-        + _cell("Cash", _fmt_money(snapshot.cash))
-        + _cell("Buying Power", _fmt_money(snapshot.buying_power))
-        + _cell("Equity", _fmt_money(snapshot.equity), f"prev close {_fmt_money(last_eq)}")
+        + _cell("Cash Available", _fmt_money(snapshot.cash))
+        + _cell("Buying Power", _fmt_money(snapshot.buying_power), "ready to deploy")
+        + _cell("Account Value", _fmt_money(snapshot.equity), f"prev close {_fmt_money(last_eq)}")
         + _cell(
-            "Daily P/L",
+            "Today's P/L",
             _fmt_money(snapshot.daily_pnl),
             "Kill switch active" if snapshot.kill_switch_triggered else "Within limit",
             pnl_cls,
         )
-        + _cell("Positions / Signals", f"{open_pos} open", decision_str)
+        + _cell("Positions Open", f"{open_pos}", decision_str)
         + "</div>"
     )
 
 
+def _hero_stat(label: str, value: str) -> str:
+    return (
+        "<div class='hero-stat'>"
+        f"<div class='hero-stat-label'>{label}</div>"
+        f"<div class='hero-stat-value'>{value}</div>"
+        "</div>"
+    )
+
+
+def _header_summary_html(state: DashboardState, snapshot, last_cycle_report) -> str:
+    processed_text = "No cycle yet"
+    if last_cycle_report is not None and last_cycle_report.processed_bar:
+        processed_text = _compact_time_str(last_cycle_report.decision_timestamp)
+    elif last_cycle_report is not None:
+        processed_text = _cycle_reason_label(last_cycle_report.skip_reason)
+
+    symbol_count = len(state.startup_config.symbols) if state.startup_config is not None else len(snapshot.symbols)
+    mode_label = (
+        state.startup_config.strategy_mode
+        if state.startup_config is not None
+        else ("snapshot only" if state.has_persisted_snapshot else "config pending")
+    )
+    position_count = len(snapshot.positions)
+    note = (
+        "A calm control surface for the live bot: quick status up top, recent movement in the middle, and deep symbol context when you need it."
+    )
+    if state.startup_config is None:
+        mode_badge = "<span class='badge b-nosignal'>CONFIG MISSING</span>"
+    elif state.startup_config.paper:
+        mode_badge = "<span class='badge b-hold'>PAPER</span>"
+    else:
+        mode_badge = "<span class='badge b-sell'>LIVE</span>"
+    return (
+        "<div class='hero-card'>"
+        "<div class='hero-kicker'>Live Bot Overview</div>"
+        "<div class='top-title'>TradeOS</div>"
+        f"<div class='top-meta'>{mode_badge}"
+        f"<span class='subtle-copy'>{symbol_count} symbols · {mode_label}</span></div>"
+        f"<div class='hero-summary'>{_hero_stat('Last Update', processed_text)}{_hero_stat('Positions', str(position_count))}{_hero_stat('Snapshot Age', _relative_age(snapshot.timestamp_utc))}</div>"
+        f"<div class='hero-note'>{note}</div>"
+        "</div>"
+    )
+
+
 def _sym_card_v2_html(
-    item, pos_row: dict | None, is_selected: bool, is_error: bool, preview=None
+    item, pos_row: dict | None, is_selected: bool, is_error: bool, preview=None, *, ml_enabled: bool = True
 ) -> str:
     action = (item.action or "HOLD").upper()
     badge = _execution_status_badge(preview.status) if preview is not None else _badge_html(action)
@@ -1180,7 +2054,7 @@ def _sym_card_v2_html(
         meta_right = "<span class='tiny-label'>Flat</span>"
 
     mini_bar = _ml_mini_bar_html(
-        item.ml_probability_up,
+        item.ml_probability_up if ml_enabled else None,
         getattr(item, "ml_buy_threshold", None),
         getattr(item, "ml_sell_threshold", None),
     )
@@ -1221,6 +2095,34 @@ def _status_card_html(level: str, title: str, body: str) -> str:
         f"<div class='status-card-body'>{body}</div>"
         f"</div>"
         f"</div>"
+    )
+
+
+def _feed_health_html(feed_status: str, dot_cls: str, snapshot, timeframe_minutes: int) -> str:
+    freshness = _relative_age(snapshot.timestamp_utc)
+    symbol_count = len(snapshot.symbols)
+    position_count = len(snapshot.positions)
+    return (
+        "<div class='compact-card feed-card'>"
+        "<div class='feed-grid'>"
+        "<div class='feed-primary'>"
+        f"<div class='feed-title'><span class='dot {dot_cls}'></span><span>Bot status</span></div>"
+        f"<div class='feed-subline'>{feed_status}. This screen follows the live bot and helps you understand what it is seeing.</div>"
+        "</div>"
+        "<div class='feed-stat'>"
+        "<div class='feed-stat-label'>How fresh</div>"
+        f"<div class='feed-stat-value'>{freshness}</div>"
+        "</div>"
+        "<div class='feed-stat'>"
+        "<div class='feed-stat-label'>Update rhythm</div>"
+        f"<div class='feed-stat-value'>{timeframe_minutes} min</div>"
+        "</div>"
+        "<div class='feed-stat'>"
+        "<div class='feed-stat-label'>Watching</div>"
+        f"<div class='feed-stat-value'>{symbol_count} syms / {position_count} open</div>"
+        "</div>"
+        "</div>"
+        "</div>"
     )
 
 
@@ -1268,7 +2170,16 @@ def _compact_time_str(value: str | None) -> str:
     if not value:
         return "—"
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%H:%M")
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            et = dt.astimezone(_ET)
+            local = dt.astimezone()
+            et_str = et.strftime("%I:%M %p ET").lstrip("0")
+            local_str = local.strftime("%I:%M %p").lstrip("0") + " local"
+            if et.hour == local.hour and et.minute == local.minute:
+                return et_str
+            return f"{et_str}<br><span style='opacity:0.6;font-size:0.88em'>{local_str}</span>"
+        return dt.strftime("%I:%M %p").lstrip("0")
     except ValueError:
         return str(value)[11:16] if len(str(value)) >= 16 else str(value)
 
@@ -1285,7 +2196,16 @@ def _parse_datetime(value) -> datetime | None:
 def _format_datetime_pretty(value, include_time: bool = True) -> str:
     parsed = _parse_datetime(value)
     if parsed is not None:
-        return parsed.strftime("%b %d, %Y · %H:%M" if include_time else "%b %d, %Y")
+        if parsed.tzinfo is not None and include_time:
+            et = parsed.astimezone(_ET)
+            local = parsed.astimezone()
+            et_str = et.strftime("%b %d, %Y · %I:%M %p ET").replace(" 0", " ")
+            local_str = local.strftime("%I:%M %p").lstrip("0") + " local"
+            if et.hour == local.hour and et.minute == local.minute:
+                return et_str
+            return f"{et_str}<br><span style='opacity:0.6;font-size:0.88em'>{local_str}</span>"
+        fmt = "%b %d, %Y · %I:%M %p ET" if include_time else "%b %d, %Y"
+        return parsed.strftime(fmt).replace(" 0", " ")
     if value in (None, ""):
         return "—"
     return str(value)
@@ -1328,7 +2248,7 @@ def _logic_line(label: str, value_html: str, note: str = "") -> str:
     )
 
 
-def _ticker_strip_html(snapshot, latest_signals: dict, session_first_prices: dict | None = None) -> str:
+def _ticker_strip_html(snapshot, latest_signals: dict, session_first_prices: dict | None = None, selected_symbol: str | None = None) -> str:
     chips: list[str] = []
     first_prices = session_first_prices or {}
     for item in snapshot.symbols:
@@ -1351,8 +2271,9 @@ def _ticker_strip_html(snapshot, latest_signals: dict, session_first_prices: dic
             f"<span style='font-size:0.72em;color:#566778;font-weight:400;margin-left:3px'>{change_label}</span>"
             if change_val is not None else "—"
         )
+        chip_cls = "ticker-chip active" if item.symbol == selected_symbol else "ticker-chip"
         chips.append(
-            "<div class='ticker-chip'>"
+            f"<div class='{chip_cls}'>"
             f"<span class='ticker-chip-symbol'>{item.symbol}</span>"
             f"<span class='ticker-chip-price'>{price_str}</span>"
             f"<span class='ticker-chip-change' style='color:{color}'>{change_html}</span>"
@@ -1362,8 +2283,8 @@ def _ticker_strip_html(snapshot, latest_signals: dict, session_first_prices: dic
     return (
         "<div class='ticker-strip'>"
         "<div class='ticker-strip-head'>"
-        "<div class='workspace-label' style='margin-bottom:0'>Ticker Ribbon</div>"
-        f"<div class='subtle-copy'>Bar-close prices · {data_note}</div>"
+        "<div class='workspace-label' style='margin-bottom:0'>Market snapshot</div>"
+        f"<div class='subtle-copy'>Latest bar-close prices · {data_note}</div>"
         "</div>"
         f"<div class='ticker-strip-ribbon'>{''.join(chips)}</div>"
         "</div>"
@@ -1374,8 +2295,8 @@ def _execution_panel_html(recent_execution_activity: list) -> str:
     if not recent_execution_activity:
         return (
             "<div class='exec-panel'>"
-            "<div class='sec-head' style='margin-top:0;margin-bottom:0.6rem'>What Just Happened</div>"
-            "<div class='rail-empty'>No recent execution activity in persisted logs.</div>"
+            "<div class='sec-head' style='margin-top:0;margin-bottom:0.6rem'>What Changed Recently</div>"
+            "<div class='rail-empty'>Nothing new has been written to the recent activity log yet.</div>"
             "</div>"
         )
     rows: list[str] = []
@@ -1437,7 +2358,8 @@ def _execution_panel_html(recent_execution_activity: list) -> str:
         )
     return (
         "<div class='exec-panel'>"
-        "<div class='sec-head' style='margin-top:0;margin-bottom:0.75rem'>What Just Happened</div>"
+        "<div class='sec-head' style='margin-top:0;margin-bottom:0.2rem'>What Changed Recently</div>"
+        "<div class='subtle-copy' style='margin-bottom:0.85rem'>Recent submits, blocked trades, and holds that did not need action.</div>"
         f"<div class='exec-list'>{''.join(rows)}</div>"
         "</div>"
     )
@@ -1447,8 +2369,8 @@ def _decision_logic_html(signal_row) -> str:
     if signal_row is None:
         return (
             "<div class='detail-history-card'>"
-            "<div class='sec-head'>Decision Logic</div>"
-            "<div class='rail-empty'>No persisted signal evaluation found for the selected symbol.</div>"
+            "<div class='sec-head'>Why This Symbol Looks This Way</div>"
+            "<div class='rail-empty'>There is no saved decision breakdown yet for this symbol.</div>"
             "</div>"
         )
     result_reason = _pretty_reason(signal_row.rejection)
@@ -1503,7 +2425,7 @@ def _decision_logic_html(signal_row) -> str:
     )
     return (
         "<div class='detail-history-card'>"
-        "<div class='sec-head'>Decision Logic</div>"
+        "<div class='sec-head'>Why This Symbol Looks This Way</div>"
         f"<div class='logic-list'>{items}</div>"
         "</div>"
     )
@@ -1513,6 +2435,7 @@ def _cycle_summary_html(last_cycle_report, latest_signal_rows: list, latest_cycl
     if last_cycle_report is None:
         return (
             "<div class='cycle-summary'>"
+            "<div class='workspace-label' style='margin-bottom:0.4rem'>Cycle recap</div>"
             "<div class='cycle-summary-line'>No persisted cycle summary yet.</div>"
             "</div>"
         )
@@ -1562,13 +2485,23 @@ def _cycle_summary_html(last_cycle_report, latest_signal_rows: list, latest_cycl
         line_two_parts.append(f"Holds: {hold_breakdown}")
     return (
         "<div class='cycle-summary'>"
+        "<div class='workspace-label' style='margin-bottom:0.4rem'>Cycle recap</div>"
         f"<div class='cycle-summary-line'>{' | '.join(line_one_parts)}</div>"
         f"<div class='cycle-summary-line'>{' | '.join(line_two_parts) if line_two_parts else _cycle_reason_label(last_cycle_report.skip_reason)}</div>"
         "</div>"
     )
 
 
-def _render_detail_panel(storage, item, pos_row: dict | None, preview, snapshot, signal_row=None) -> None:
+def _render_detail_panel(
+    storage,
+    item,
+    pos_row: dict | None,
+    preview,
+    snapshot,
+    signal_row=None,
+    *,
+    ml_enabled: bool = True,
+) -> None:
     price_str = f"${item.price:,.2f}" if item.price is not None else "—"
     try:
         sym_history = pd.DataFrame(storage.get_symbol_history(item.symbol, limit=20))
@@ -1591,7 +2524,9 @@ def _render_detail_panel(storage, item, pos_row: dict | None, preview, snapshot,
         else "—"
     )
     sma_str = f"${item.sma:,.2f}" if item.sma is not None else "—"
-    ml_str = f"{item.ml_probability_up:.3f}" if item.ml_probability_up is not None else "—"
+    ml_probability = item.ml_probability_up if ml_enabled else None
+    ml_confidence = item.ml_confidence if ml_enabled else None
+    ml_str = f"{ml_probability:.3f}" if ml_probability is not None else "—"
     signal_str = preview.status if preview is not None else "—"
     delta_str = "—"
     if item.price is not None and item.sma not in (None, 0):
@@ -1601,6 +2536,11 @@ def _render_detail_panel(storage, item, pos_row: dict | None, preview, snapshot,
 
     action_badge = _badge_html(item.action or "—") if item.action else "—"
     signal_badge = _execution_status_badge(signal_str) if preview is not None else "—"
+    context_copy = (
+        f"Current action is {(item.action or 'HOLD').upper()} with {signal_str.lower().replace('_', ' ')} execution status."
+        if preview is not None
+        else f"Current action is {(item.action or 'HOLD').upper()}."
+    )
     st.markdown(
         "<div class='detail-hero'>"
         "<div class='detail-hero-top'>"
@@ -1623,17 +2563,18 @@ def _render_detail_panel(storage, item, pos_row: dict | None, preview, snapshot,
         + _trend_strip_html(sym_history)
         + _prox_bar_html(item.price, item.sma)
         + _ml_bar_html(
-            item.ml_probability_up,
+            ml_probability,
             getattr(item, "ml_buy_threshold", None),
             getattr(item, "ml_sell_threshold", None),
-            item.ml_confidence,
+            ml_confidence,
         )
+        + f"<div class='detail-context'>{context_copy}</div>"
         + "</div>",
         unsafe_allow_html=True,
     )
 
     st.markdown(
-        "<div class='detail-history-card'><div class='sec-head'>Recent History</div>",
+        "<div class='detail-history-card'><div class='sec-head'>Recent Snapshot History</div>",
         unsafe_allow_html=True,
     )
     try:
@@ -1675,9 +2616,75 @@ def _render_detail_panel(storage, item, pos_row: dict | None, preview, snapshot,
     st.markdown(_decision_logic_html(signal_row), unsafe_allow_html=True)
 
 
+def _trader_thoughts_html(narrations: list) -> str:
+    """Render the Trader Thoughts explainability panel for the right rail."""
+    if not narrations:
+        return (
+            "<div class='rail-card'>"
+            "<div class='sec-head'>Trader Thoughts</div>"
+            "<div class='rail-empty'>No recent trader thoughts available.</div>"
+            "</div>"
+        )
+    rows: list[str] = []
+    for item in narrations:
+        time_str = _compact_time_str(item.timestamp_utc)
+        sym_html = (
+            f"<span class='thought-sym'>{html.escape(item.symbol)}</span>"
+            if item.symbol and item.symbol != "?"
+            else ""
+        )
+        rows.append(
+            f"<div class='thought-row'>"
+            f"<div class='thought-meta'>{sym_html}"
+            f"<span class='thought-ts'>{time_str}</span></div>"
+            f"<div class='thought-text'>{html.escape(item.narration)}</div>"
+            f"</div>"
+        )
+    return (
+        "<div class='rail-card'>"
+        "<div class='sec-head'>Trader Thoughts</div>"
+        f"{''.join(rows)}"
+        "</div>"
+    )
+
+
+def _near_misses_html(near_misses: list) -> str:
+    """Render the Near Misses explainability panel for the right rail."""
+    if not near_misses:
+        return (
+            "<div class='rail-card'>"
+            "<div class='sec-head'>Near Misses</div>"
+            "<div class='rail-empty'>No near-miss setups detected recently.</div>"
+            "</div>"
+        )
+    rows: list[str] = []
+    for item in near_misses:
+        time_str = _compact_time_str(item.timestamp_utc)
+        sym_html = (
+            f"<span class='miss-sym'>{html.escape(item.symbol)}</span>"
+            if item.symbol and item.symbol != "?"
+            else ""
+        )
+        rows.append(
+            f"<div class='thought-row'>"
+            f"<div class='thought-meta'>{sym_html}"
+            f"<span class='thought-ts'>{time_str}</span></div>"
+            f"<div class='thought-text'>{html.escape(item.narration)}</div>"
+            f"</div>"
+        )
+    return (
+        "<div class='rail-card'>"
+        "<div class='sec-head'>Near Misses</div>"
+        f"{''.join(rows)}"
+        "</div>"
+    )
+
+
 def _render_right_rail(
     snapshot, position_rows: list, recent_orders: list,
     execution_previews: list, preview_lookup: dict,
+    recent_narrations: list | None = None,
+    recent_near_misses: list | None = None,
 ) -> None:
     alerts: list[tuple[str, str, list[str]]] = []
     error_syms = [
@@ -1707,7 +2714,7 @@ def _render_right_rail(
             for severity, desc, syms in alerts
         )
     else:
-        alerts_html = _status_card_html("info", "System status", "No active warnings in the latest snapshot.")
+        alerts_html = _status_card_html("info", "Nothing urgent", "No active warnings in the latest snapshot.")
     st.markdown(
         f"<div class='rail-card'><div class='sec-head'>Alerts</div>{alerts_html}</div>",
         unsafe_allow_html=True,
@@ -1734,9 +2741,9 @@ def _render_right_rail(
                 f"</div></div>"
             )
     else:
-        positions_html = "<div class='rail-empty'>No open positions</div>"
+        positions_html = "<div class='rail-empty'>There are no open positions right now.</div>"
     st.markdown(
-        f"<div class='rail-card'><div class='sec-head'>Open Positions</div>{positions_html}</div>",
+        f"<div class='rail-card'><div class='sec-head'>What You’re Holding</div>{positions_html}</div>",
         unsafe_allow_html=True,
     )
 
@@ -1771,11 +2778,14 @@ def _render_right_rail(
                 f"</div></div>"
             )
     else:
-        orders_html = "<div class='rail-empty'>No recent orders</div>"
+        orders_html = "<div class='rail-empty'>No recent orders have been submitted.</div>"
     st.markdown(
-        f"<div class='rail-card'><div class='sec-head'>Recent Orders</div>{orders_html}</div>",
+        f"<div class='rail-card'><div class='sec-head'>Orders Sent Recently</div>{orders_html}</div>",
         unsafe_allow_html=True,
     )
+
+    st.markdown(_trader_thoughts_html(recent_narrations or []), unsafe_allow_html=True)
+    st.markdown(_near_misses_html(recent_near_misses or []), unsafe_allow_html=True)
 
 
 # ── Tab: Live ─────────────────────────────────────────────────────────────────
@@ -1792,6 +2802,9 @@ def _render_live(
     latest_cycle_risk_checks: list | None = None,
     *,
     session_first_prices: dict | None = None,
+    ml_enabled: bool = False,
+    recent_narrations: list | None = None,
+    recent_near_misses: list | None = None,
 ) -> None:
     position_rows = _position_rows(snapshot)
     position_lookup = {str(row["symbol"]): row for row in position_rows}
@@ -1803,11 +2816,6 @@ def _render_live(
     if execution_previews is None:
         execution_previews = []
     preview_lookup = {preview.symbol: preview for preview in execution_previews}
-
-    st.markdown(_ticker_strip_html(snapshot, latest_signals, session_first_prices), unsafe_allow_html=True)
-    st.markdown(_execution_panel_html(recent_execution_activity), unsafe_allow_html=True)
-    st.markdown(_metrics_bar_html(snapshot), unsafe_allow_html=True)
-    st.markdown(_cycle_summary_html(last_cycle_report, latest_signal_rows, latest_cycle_risk_checks), unsafe_allow_html=True)
 
     if not snapshot.symbols:
         st.info("No symbol data in snapshot.")
@@ -1828,11 +2836,23 @@ def _render_live(
         )
         st.session_state.selected_symbol = fallback
 
+    st.markdown(
+        _ticker_strip_html(
+            snapshot,
+            latest_signals,
+            session_first_prices,
+            st.session_state.selected_symbol,
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(_execution_panel_html(recent_execution_activity), unsafe_allow_html=True)
+    st.markdown(_cycle_summary_html(last_cycle_report, latest_signal_rows, latest_cycle_risk_checks), unsafe_allow_html=True)
+
     left_col, center_col, right_col = st.columns([1, 3, 1.5])
 
     with left_col:
         st.markdown(
-            f"<div class='compact-card' style='margin-bottom:0.5rem'><div class='workspace-label'>Watchlist</div><div class='watchlist-subtext'>{len(snapshot.symbols)} symbols in rotation</div></div>",
+            f"<div class='watchlist-shell'><div class='watchlist-header'><div class='workspace-label'>Symbol Explorer</div><div class='watchlist-subtext'>{len(snapshot.symbols)} names in the live rotation</div><div class='watchlist-tip'>Pick a symbol here, then use the center panel to understand what the bot is seeing.</div></div><div class='watchlist-body'>",
             unsafe_allow_html=True,
         )
         ordered_symbols = sorted(
@@ -1852,6 +2872,7 @@ def _render_live(
                         is_selected,
                         is_error,
                         preview_lookup.get(item.symbol),
+                        ml_enabled=ml_enabled,
                     ),
                     unsafe_allow_html=True,
                 )
@@ -1862,6 +2883,7 @@ def _render_live(
                     on_click=_select,
                     args=(item.symbol,),
                 )
+        st.markdown("</div></div>", unsafe_allow_html=True)
     with center_col:
         sel = st.session_state.selected_symbol
         if sel is None:
@@ -1885,11 +2907,14 @@ def _render_live(
                     preview_lookup.get(sel),
                     snapshot,
                     latest_signals.get(sel),
+                    ml_enabled=ml_enabled,
                 )
 
     with right_col:
         _render_right_rail(
-            snapshot, position_rows, recent_orders, execution_previews, preview_lookup
+            snapshot, position_rows, recent_orders, execution_previews, preview_lookup,
+            recent_narrations=recent_narrations,
+            recent_near_misses=recent_near_misses,
         )
 
 
@@ -1897,6 +2922,9 @@ def _render_live(
 
 def _render_history(state: DashboardState, snapshot) -> None:
     symbols = list(state.startup_config.symbols) if state.startup_config is not None else [item.symbol for item in snapshot.symbols]
+    ml_enabled = _strategy_mode_uses_ml(
+        state.startup_config.strategy_mode if state.startup_config is not None else None
+    )
     if not symbols:
         st.info("No persisted startup config or symbol snapshot yet.")
         return
@@ -1966,7 +2994,7 @@ def _render_history(state: DashboardState, snapshot) -> None:
                 )
                 st.plotly_chart(fig2, use_container_width=True)
 
-            if "ml_probability_up" in symbol_history.columns:
+            if ml_enabled and "ml_probability_up" in symbol_history.columns:
                 ml_sh = sh.dropna(subset=["ml_probability_up"]) if not sh.empty else pd.DataFrame()
                 if not ml_sh.empty:
                     fig3 = go.Figure()
@@ -1998,24 +3026,36 @@ def _render_history(state: DashboardState, snapshot) -> None:
             mix = symbol_history["action"].value_counts().rename_axis("action").reset_index(name="count")
             st.dataframe(mix, use_container_width=True, hide_index=True)
 
-        st.markdown(f"<div class='sec-head'>{selected} — Latest Rows</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sec-head'>{selected} — Recent Snapshots</div>", unsafe_allow_html=True)
         if not symbol_history.empty:
             latest = symbol_history.tail(10).copy()
+            if "timestamp_utc" in latest.columns:
+                latest["Time"] = parse_mixed_iso_timestamps(latest["timestamp_utc"]).dt.strftime("%m-%d-%Y %I:%M %p")
+            if "price" in latest.columns:
+                latest["Price"] = pd.to_numeric(latest["price"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
+            if "sma" in latest.columns:
+                latest["SMA"] = pd.to_numeric(latest["sma"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
+            if "action" in latest.columns:
+                latest["Action"] = latest["action"].fillna("—").astype(str).str.title()
+            if ml_enabled and "ml_probability_up" in latest.columns:
+                latest["ML Up"] = pd.to_numeric(latest["ml_probability_up"], errors="coerce").map(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
             if "holding_minutes" in latest.columns:
-                latest["holding_minutes"] = pd.to_numeric(latest["holding_minutes"], errors="coerce").round(1)
-            st.dataframe(latest, use_container_width=True, hide_index=True)
+                latest["Hold Min"] = pd.to_numeric(latest["holding_minutes"], errors="coerce").round(1).map(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
+            display_cols = [c for c in ["Time", "Action", "Price", "SMA", "ML Up", "Hold Min"] if c in latest.columns]
+            st.dataframe(latest[display_cols].iloc[::-1].reset_index(drop=True), use_container_width=True, hide_index=True)
 
 
 # ── Tab: Config ───────────────────────────────────────────────────────────────
 
 def _render_config(state: DashboardState, snapshot) -> None:
     cfg = state.startup_config
+    ml_enabled = _strategy_mode_uses_ml(cfg.strategy_mode if cfg is not None else None)
     left, right = st.columns(2)
 
     with left:
-        st.markdown("<div class='sec-head'>Strategy</div>", unsafe_allow_html=True)
+        st.markdown("<div class='sec-head'>How The Bot Is Set Up</div>", unsafe_allow_html=True)
         if cfg is None:
-            st.markdown(_kv("Startup Config", "No persisted startup config yet"), unsafe_allow_html=True)
+            st.markdown(_kv("Startup Config", "No saved startup config yet"), unsafe_allow_html=True)
         else:
             st.markdown(
                 "".join(
@@ -2033,32 +3073,32 @@ def _render_config(state: DashboardState, snapshot) -> None:
                 unsafe_allow_html=True,
             )
 
-        st.markdown("<div class='sec-head'>Session</div>", unsafe_allow_html=True)
+        st.markdown("<div class='sec-head'>This Session</div>", unsafe_allow_html=True)
         session_rows = [
-            ("Snapshot time", _format_datetime_pretty(snapshot.timestamp_utc)),
-            ("History DB", str(state.storage.db_path)),
-            ("Observer Mode", "Persisted live-bot state only"),
-            ("Persisted status", state.feed_status),
-            ("Symbol State", state.symbol_state_status.replace("_", " ")),
+            ("Last snapshot", _format_datetime_pretty(snapshot.timestamp_utc)),
+            ("History database", str(state.storage.db_path)),
+            ("Dashboard mode", "Read-only live-bot view"),
+            ("Feed status", state.feed_status),
+            ("Saved symbol state", state.symbol_state_status.replace("_", " ")),
         ]
         if cfg is None:
-            session_rows.append(("Startup Config", "Missing"))
+            session_rows.append(("Startup config", "Missing"))
         else:
-            session_rows.append(("Startup Config", _format_datetime_pretty(cfg.started_at_utc) if cfg.started_at_utc else "Available"))
+            session_rows.append(("Startup config", _format_datetime_pretty(cfg.started_at_utc) if cfg.started_at_utc else "Available"))
             session_rows.append(("Session ID", cfg.session_id or "n/a"))
-            session_rows.append(("Startup Artifact", cfg.artifact_path or "n/a"))
-            session_rows.append(("Runtime Symbols", ", ".join(cfg.symbols) or "n/a"))
+            session_rows.append(("Startup artifact", cfg.artifact_path or "n/a"))
+            session_rows.append(("Symbols in use", ", ".join(cfg.symbols) or "n/a"))
         if state.ignored_snapshot_symbols:
-            session_rows.append(("Ignored Snapshot Symbols", ", ".join(state.ignored_snapshot_symbols)))
+            session_rows.append(("Ignored snapshot symbols", ", ".join(state.ignored_snapshot_symbols)))
         if cfg is not None:
-            session_rows.append(("Runtime Config Path", cfg.runtime_config_path or "n/a"))
-            session_rows.append(("Runtime Overrides", ", ".join(cfg.runtime_overrides) or "none"))
+            session_rows.append(("Runtime config path", cfg.runtime_config_path or "n/a"))
+            session_rows.append(("Runtime overrides", ", ".join(cfg.runtime_overrides) or "none"))
         st.markdown("".join(_kv(k, v) for k, v in session_rows), unsafe_allow_html=True)
 
     with right:
-        st.markdown("<div class='sec-head'>Risk Controls</div>", unsafe_allow_html=True)
+        st.markdown("<div class='sec-head'>Safety Limits</div>", unsafe_allow_html=True)
         if cfg is None:
-            st.markdown(_kv("Risk Controls", "No persisted startup config yet"), unsafe_allow_html=True)
+            st.markdown(_kv("Safety limits", "No saved startup config yet"), unsafe_allow_html=True)
         else:
             st.markdown(
                 "".join(
@@ -2077,24 +3117,185 @@ def _render_config(state: DashboardState, snapshot) -> None:
                 unsafe_allow_html=True,
             )
 
-        st.markdown("<div class='sec-head'>ML Thresholds</div>", unsafe_allow_html=True)
-        model_names = sorted(
-            {getattr(item, "ml_model_name", None) for item in snapshot.symbols} - {None}
-        )
-        if model_names:
-            st.markdown(_kv("Model", ", ".join(model_names)), unsafe_allow_html=True)
-        ml_rows = [
-            f"{item.symbol}: buy ≥ {item.ml_buy_threshold:.2f}  sell ≤ {item.ml_sell_threshold:.2f}"
-            for item in snapshot.symbols
-            if getattr(item, "ml_buy_threshold", None) is not None
-        ]
-        if ml_rows:
-            st.markdown("".join(_kv("Threshold", r) for r in ml_rows), unsafe_allow_html=True)
+        st.markdown("<div class='sec-head'>Model Thresholds</div>", unsafe_allow_html=True)
+        if not ml_enabled:
+            st.markdown(_kv("Model", "n/a for current strategy mode"), unsafe_allow_html=True)
         else:
-            st.markdown(_kv("Thresholds", "n/a"), unsafe_allow_html=True)
+            model_names = sorted(
+                name for item in snapshot.symbols
+                if (name := getattr(item, "ml_model_name", None)) is not None
+            )
+            if model_names:
+                st.markdown(_kv("Model", ", ".join(model_names)), unsafe_allow_html=True)
+            ml_rows = [
+                f"{item.symbol}: buy ≥ {item.ml_buy_threshold:.2f}  sell ≤ {item.ml_sell_threshold:.2f}"
+                for item in snapshot.symbols
+                if getattr(item, "ml_buy_threshold", None) is not None
+            ]
+            if ml_rows:
+                st.markdown("".join(_kv("Threshold", r) for r in ml_rows), unsafe_allow_html=True)
+            else:
+                st.markdown(_kv("Thresholds", "n/a"), unsafe_allow_html=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+def _render_config_v2(state: DashboardState, snapshot) -> None:
+    cfg = state.startup_config
+    ml_enabled = _strategy_mode_uses_ml(cfg.strategy_mode if cfg is not None else None)
+    left, right = st.columns(2)
+
+    with left:
+        if cfg is None:
+            st.markdown(
+                "<div class='config-stack'>"
+                "<section class='config-card'>"
+                "<div class='config-card-top'>"
+                "<div><div class='config-card-title'>How The Bot Is Set Up</div>"
+                "<div class='config-card-note'>Startup configuration has not been persisted yet.</div></div>"
+                "<div class='config-hero'>CONFIG MISSING</div>"
+                "</div>"
+                "<div class='config-empty'>No saved startup config yet.</div>"
+                "</section>",
+                unsafe_allow_html=True,
+            )
+        else:
+            setup_stats = [
+                _config_stat_html("Strategy", cfg.strategy_mode, "Current trading style"),
+                _config_stat_html("Bar cadence", f"{cfg.bar_timeframe_minutes} min", f"SMA uses {cfg.sma_bars} bars"),
+                _config_stat_html("Launch mode", cfg.launch_mode, "Paper/live runtime context"),
+                _config_stat_html("Execution", "Enabled" if cfg.execution_enabled else "Disabled", f"Paper mode: {cfg.paper}"),
+            ]
+            st.markdown(
+                "<div class='config-stack'>"
+                "<section class='config-card'>"
+                "<div class='config-card-top'>"
+                "<div><div class='config-card-title'>How The Bot Is Set Up</div>"
+                "<div class='config-card-note'>Core runtime choices at a glance, without the spreadsheet feel.</div></div>"
+                f"<div class='config-hero'>{_escape_html(cfg.strategy_mode)}</div>"
+                "</div>"
+                f"<div class='config-stat-grid'>{''.join(setup_stats)}</div>"
+                "<div class='config-band'>"
+                "<div class='config-band-label'>Symbol Universe</div>"
+                f"{_config_chip_cloud_html(list(cfg.symbols))}"
+                "</div>"
+                "</section>",
+                unsafe_allow_html=True,
+            )
+
+        session_rows = [
+            ("Last snapshot", _format_datetime_pretty(snapshot.timestamp_utc)),
+            ("History database", str(state.storage.db_path)),
+            ("Dashboard mode", "Read-only live-bot view"),
+            ("Feed status", state.feed_status),
+            ("Saved symbol state", state.symbol_state_status.replace("_", " ")),
+        ]
+        if cfg is None:
+            session_rows.append(("Startup config", "Missing"))
+        else:
+            session_rows.append(("Startup config", _format_datetime_pretty(cfg.started_at_utc) if cfg.started_at_utc else "Available"))
+            session_rows.append(("Session ID", cfg.session_id or "n/a"))
+            session_rows.append(("Startup artifact", cfg.artifact_path or "n/a"))
+            session_rows.append(("Symbols in use", ", ".join(cfg.symbols) or "n/a"))
+        if state.ignored_snapshot_symbols:
+            session_rows.append(("Ignored snapshot symbols", ", ".join(state.ignored_snapshot_symbols)))
+        if cfg is not None:
+            session_rows.append(("Runtime config path", cfg.runtime_config_path or "n/a"))
+            session_rows.append(("Runtime overrides", ", ".join(cfg.runtime_overrides) or "none"))
+        st.markdown(
+            "<section class='config-card'>"
+            "<div class='config-card-top'>"
+            "<div><div class='config-card-title'>This Session</div>"
+            "<div class='config-card-note'>Live context, persisted artifacts, and the exact runtime this dashboard is reflecting.</div></div>"
+            "<div class='config-hero'>SESSION</div>"
+            "</div>"
+            f"<div class='config-list'>{''.join(_config_row_html(k, v) for k, v in session_rows)}</div>"
+            "</section>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    with right:
+        if cfg is None:
+            st.markdown(
+                "<div class='config-stack'>"
+                "<section class='config-card'>"
+                "<div class='config-card-top'>"
+                "<div><div class='config-card-title'>Safety Limits</div>"
+                "<div class='config-card-note'>Risk controls will appear here once a startup config is available.</div></div>"
+                "<div class='config-hero'>SAFETY</div>"
+                "</div>"
+                "<div class='config-empty'>No saved startup config yet.</div>"
+                "</section>",
+                unsafe_allow_html=True,
+            )
+        else:
+            safety_stats = [
+                _config_stat_html("Max per trade", _fmt_money(cfg.max_usd_per_trade)),
+                _config_stat_html("Max symbol exposure", _fmt_money(cfg.max_symbol_exposure_usd)),
+                _config_stat_html("Max daily loss", _fmt_money(cfg.max_daily_loss_usd)),
+                _config_stat_html("Max open positions", str(cfg.max_open_positions)),
+                _config_stat_html("Orders per minute", str(cfg.max_orders_per_minute)),
+                _config_stat_html("Price collar", f"{cfg.max_price_deviation_bps:.0f} bps"),
+                _config_stat_html("Max live price age", f"{cfg.max_live_price_age_seconds}s"),
+                _config_stat_html("Max bar delay", f"{cfg.max_data_delay_seconds}s"),
+            ]
+            st.markdown(
+                "<div class='config-stack'>"
+                "<section class='config-card'>"
+                "<div class='config-card-top'>"
+                "<div><div class='config-card-title'>Safety Limits</div>"
+                "<div class='config-card-note'>Hard guardrails the runtime should respect before taking risk.</div></div>"
+                "<div class='config-hero'>GUARDRAILS</div>"
+                "</div>"
+                f"<div class='config-stat-grid'>{''.join(safety_stats)}</div>"
+                "</section>",
+                unsafe_allow_html=True,
+            )
+
+        if not ml_enabled:
+            st.markdown(
+                "<section class='config-card'>"
+                "<div class='config-card-top'>"
+                "<div><div class='config-card-title'>Model Thresholds</div>"
+                "<div class='config-card-note'>Machine-learning gates are inactive for the current strategy mode.</div></div>"
+                "<div class='config-hero'>ML OFF</div>"
+                "</div>"
+                "<div class='config-empty'>n/a for current strategy mode</div>"
+                "</section>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            model_names = sorted(
+                name for item in snapshot.symbols
+                if (name := getattr(item, "ml_model_name", None)) is not None
+            )
+            ml_rows = [
+                f"{item.symbol}: buy >= {item.ml_buy_threshold:.2f} | sell <= {item.ml_sell_threshold:.2f}"
+                for item in snapshot.symbols
+                if getattr(item, "ml_buy_threshold", None) is not None
+            ]
+            st.markdown(
+                "<section class='config-card'>"
+                "<div class='config-card-top'>"
+                "<div><div class='config-card-title'>Model Thresholds</div>"
+                "<div class='config-card-note'>Active model names and per-symbol probability gates for ML-assisted entries.</div></div>"
+                "<div class='config-hero'>ML ACTIVE</div>"
+                "</div>"
+                "<div class='config-band' style='margin-top:0;padding-top:0;border-top:none;'>"
+                "<div class='config-band-label'>Models</div>"
+                f"{_config_chip_cloud_html(model_names, muted=not bool(model_names))}"
+                "</div>"
+                "<div class='config-band'>"
+                "<div class='config-band-label'>Per-Symbol Thresholds</div>"
+                f"{_config_chip_cloud_html(ml_rows, muted=not bool(ml_rows))}"
+                "</div>"
+                "</section>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
 
 def main() -> None:
     _inject_css()
@@ -2127,31 +3328,12 @@ def main() -> None:
         get_price_feed_status=lambda: state.feed_status,
     )
 
-    hdr_l, hdr_r = st.columns([1.8, 1.2])
+    hdr_l, hdr_r = st.columns([2.2, 1])
     with hdr_l:
-        if state.startup_config is None:
-            paper_badge = "<span class='badge b-nosignal'>CONFIG MISSING</span>"
-        else:
-            paper_badge = (
-                "<span class='badge b-hold'>PAPER</span>"
-                if state.startup_config.paper else
-                "<span class='badge b-sell'>LIVE</span>"
-            )
-        st.markdown(
-            "<div class='top-title'>Alpaca Bot</div>"
-            f"<div class='top-meta'>"
-            f"{paper_badge}"
-            f"<span class='subtle-copy'>{header_symbol_count} symbols · {header_mode_label}</span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            "<div class='subtle-copy' style='margin-top:0.35rem'>Reading persisted state written by `alpaca-bot live`.</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(_header_summary_html(state, snapshot, last_cycle_report), unsafe_allow_html=True)
 
     with hdr_r:
-        monitor_badge = "<span class='badge b-nosignal'>MONITOR ONLY</span>"
+        monitor_badge = "<span class='badge b-nosignal'>READ ONLY</span>"
         if last_cycle_report is not None and last_cycle_report.processed_bar:
             last_text = f"Last bar: {_format_datetime_pretty(last_cycle_report.decision_timestamp)}"
         elif last_cycle_report is not None:
@@ -2159,10 +3341,12 @@ def main() -> None:
         else:
             last_text = "No persisted cycle yet"
         st.markdown(
-            f"<div class='status-inline' style='margin-bottom:8px'>"
-            f"{monitor_badge}"
-            f"<span class='subtle-copy'>{last_text}</span>"
-            f"</div>",
+            "<div class='action-card'>"
+            "<div class='workspace-label'>What You Can Do Here</div>"
+            f"<div class='status-inline' style='justify-content:flex-start;margin-bottom:0.45rem'>{monitor_badge}</div>"
+            f"<div class='status-emphasis'>{last_text}</div>"
+            "<div class='subtle-copy' style='margin-top:0.35rem'>You can inspect the live bot here, but trades are still managed by the running bot process.</div>"
+            "</div>",
             unsafe_allow_html=True,
         )
         refresh = st.button("Refresh", use_container_width=False, type="secondary")
@@ -2195,6 +3379,7 @@ def main() -> None:
             render_startup_error(exc)
             return
 
+    st.markdown(_metrics_bar_html(snapshot), unsafe_allow_html=True)
     _render_bar_timing(bot)
 
     try:
@@ -2208,25 +3393,8 @@ def main() -> None:
     except Exception:
         feed_status = "unavailable"
         dot_cls = "dot-error"
-    try:
-        snap_dt = datetime.fromisoformat(str(snapshot.timestamp_utc).replace("Z", "+00:00"))
-        age_s = int((datetime.now(timezone.utc) - snap_dt).total_seconds())
-        age_color = "#4ade80" if age_s < 60 else ("#facc15" if age_s < 300 else "#f87171")
-    except Exception:
-        age_color = "#888"
     st.markdown(
-        f"<div class='compact-card' style='margin:0.35rem 0 0.7rem'>"
-        f"<div class='status-inline' style='justify-content:space-between'>"
-        f"<div>"
-        f"<div class='workspace-label' style='margin-bottom:0.2rem'>Live Feed</div>"
-        f"<span class='dot {dot_cls}'></span>"
-        f"<span style='font-size:0.88rem;color:#c7d2e3'>{feed_status}</span>"
-        f"&nbsp;·&nbsp;"
-        f"<span style='font-size:0.88rem;color:{age_color}'>data {_relative_age(snapshot.timestamp_utc)}</span>"
-        f"</div>"
-        f"<div class='subtle-copy'>Focused live workspace</div>"
-        f"</div>"
-        f"</div>",
+        _feed_health_html(feed_status, dot_cls, snapshot, getattr(bot.config, "bar_timeframe_minutes", 15) or 15),
         unsafe_allow_html=True,
     )
 
@@ -2235,8 +3403,8 @@ def main() -> None:
         status_cards.append(
             _status_card_html(
                 "info",
-                "Waiting for first snapshot",
-                "Start `alpaca-bot live` or wait for the first recorded cycle.",
+                "Waiting for the first saved update",
+                "Start `tradeos live` or wait for the bot to write its first cycle.",
             )
         )
     if not state.has_persisted_startup_config:
@@ -2244,24 +3412,24 @@ def main() -> None:
             status_cards.append(
                 _status_card_html(
                     "warn",
-                    "Startup config missing",
-                    "Snapshot data exists, but startup_config.json has not been persisted for this session yet.",
+                    "Setup details are still missing",
+                    "Snapshot data exists, but startup_config.json has not been saved for this session yet.",
                 )
             )
         else:
             status_cards.append(
                 _status_card_html(
                     "warn",
-                    "Startup config missing",
-                    "Config panels will show placeholders until `alpaca-bot live` writes startup_config.json.",
+                    "Setup details are still missing",
+                    "The setup panels will stay partial until `tradeos live` writes startup_config.json.",
                 )
             )
     for message in state.session_warnings:
-        status_cards.append(_status_card_html("warn", "Session warning", message))
+        status_cards.append(_status_card_html("warn", "Heads up", message))
     if status_cards:
         st.markdown("".join(status_cards), unsafe_allow_html=True)
 
-    live_tab, history_tab, config_tab = st.tabs(["Live", "History", "Config"])
+    live_tab, history_tab, config_tab, drill_tab = st.tabs(["Live", "History", "Config", "Drilldown"])
 
     with live_tab:
         _render_live(
@@ -2275,13 +3443,21 @@ def main() -> None:
             list(state.latest_signal_rows),
             list(state.latest_cycle_risk_checks),
             session_first_prices=state.session_first_prices,
+            ml_enabled=_strategy_mode_uses_ml(
+                state.startup_config.strategy_mode if state.startup_config is not None else None
+            ),
+            recent_narrations=list(state.recent_narrations),
+            recent_near_misses=list(state.recent_near_misses),
         )
 
     with history_tab:
         _render_history(state, snapshot)
 
     with config_tab:
-        _render_config(state, snapshot)
+        _render_config_v2(state, snapshot)
+
+    with drill_tab:
+        _render_drilldown(state)
 
 
 if __name__ == "__main__":

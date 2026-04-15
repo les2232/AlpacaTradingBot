@@ -1,95 +1,49 @@
 {
-  "saved_at": "2026-04-06T01:19:20Z",
+  "saved_at": "2026-04-14T11:48:22Z",
   "validation_windows": [
-    30,
-    60,
-    90
+    0
   ],
   "per_window": [
     {
-      "lookback_days": 30,
-      "dataset": "datasets\\AAPL-GOOGL-JPM-KO-META-MSFT__15Min__20251004T000000Z__20260404T000000Z__sip__7bdcdff15c5f",
+      "lookback_days": 0,
+      "dataset": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e",
       "config": {
-        "strategy_mode": "sma",
-        "sma_bars": 20,
-        "entry_threshold_pct": 0.0025,
+        "strategy_mode": "mean_reversion",
+        "sma_bars": 15,
+        "entry_threshold_pct": 0.0015,
+        "ml_probability_buy": 0.55,
+        "ml_probability_sell": 0.45,
         "threshold_mode": "static_pct",
-        "time_window_mode": "morning_only",
+        "atr_multiple": 1.0,
+        "atr_percentile_threshold": 0.0,
+        "time_window_mode": "full_day",
         "regime_filter_enabled": false,
         "orb_filter_mode": "none",
         "breakout_exit_style": "target_1x_stop_low",
-        "mean_reversion_exit_style": "sma"
+        "breakout_tight_stop_fraction": 0.5,
+        "mean_reversion_exit_style": "sma",
+        "mean_reversion_max_atr_percentile": 80.0
       },
       "performance": {
-        "total_return_pct": 4.606178,
-        "profit_factor": 1.253684,
-        "max_drawdown_pct": 3.967358,
-        "sharpe_ratio": 1.274551,
-        "win_rate": 38.793103,
-        "trades_per_day": 1.870968,
-        "realized_pnl": 92.123568,
-        "combined_score": 1.0
-      }
-    },
-    {
-      "lookback_days": 60,
-      "dataset": "datasets\\AAPL-GOOGL-JPM-KO-META-MSFT__15Min__20251004T000000Z__20260404T000000Z__sip__7bdcdff15c5f",
-      "config": {
-        "strategy_mode": "sma",
-        "sma_bars": 20,
-        "entry_threshold_pct": 0.0025,
-        "threshold_mode": "static_pct",
-        "time_window_mode": "morning_only",
-        "regime_filter_enabled": false,
-        "orb_filter_mode": "none",
-        "breakout_exit_style": "target_1x_stop_low",
-        "mean_reversion_exit_style": "sma"
-      },
-      "performance": {
-        "total_return_pct": 4.606178,
-        "profit_factor": 1.253684,
-        "max_drawdown_pct": 3.967358,
-        "sharpe_ratio": 1.274551,
-        "win_rate": 38.793103,
-        "trades_per_day": 1.870968,
-        "realized_pnl": 92.123568,
-        "combined_score": 1.0
-      }
-    },
-    {
-      "lookback_days": 90,
-      "dataset": "datasets\\AAPL-GOOGL-JPM-KO-META-MSFT__15Min__20251004T000000Z__20260404T000000Z__sip__7bdcdff15c5f",
-      "config": {
-        "strategy_mode": "sma",
-        "sma_bars": 20,
-        "entry_threshold_pct": 0.0025,
-        "threshold_mode": "static_pct",
-        "time_window_mode": "morning_only",
-        "regime_filter_enabled": false,
-        "orb_filter_mode": "none",
-        "breakout_exit_style": "target_1x_stop_low",
-        "mean_reversion_exit_style": "sma"
-      },
-      "performance": {
-        "total_return_pct": 4.606178,
-        "profit_factor": 1.253684,
-        "max_drawdown_pct": 3.967358,
-        "sharpe_ratio": 1.274551,
-        "win_rate": 38.793103,
-        "trades_per_day": 1.870968,
-        "realized_pnl": 92.123568,
-        "combined_score": 1.0
+        "total_return_pct": 5.457028,
+        "profit_factor": 1.188961,
+        "max_drawdown_pct": 3.875082,
+        "sharpe_ratio": 1.830071,
+        "win_rate": 68.784228,
+        "trades_per_day": 29.934426,
+        "realized_pnl": 545.702826,
+        "combined_score": 3.666667
       }
     }
   ],
   "average_performance": {
-    "total_return_pct": 4.606178,
-    "profit_factor": 1.253684,
-    "max_drawdown_pct": 3.967358,
-    "sharpe_ratio": 1.274551,
-    "win_rate": 38.793103,
-    "trades_per_day": 1.870968,
-    "realized_pnl": 92.123568
+    "total_return_pct": 5.457028,
+    "profit_factor": 1.188961,
+    "max_drawdown_pct": 3.875082,
+    "sharpe_ratio": 1.830071,
+    "win_rate": 68.784228,
+    "trades_per_day": 29.934426,
+    "realized_pnl": 545.702826
   },
   "stability": {
     "stable": true,
@@ -100,38 +54,83 @@
   "market_regime": {
     "regime": "sideways",
     "disabled_by_regime": false,
-    "avg_volatility": 0.001171,
-    "avg_sma_slope_pct": -0.005717,
+    "avg_volatility": 0.001742,
+    "avg_sma_slope_pct": 0.003403,
     "per_symbol": {
-      "AAPL": {
+      "ABBV": {
+        "regime": "trending",
+        "current_volatility": 0.002137,
+        "sma_slope_pct": -0.020165
+      },
+      "AMD": {
+        "regime": "trending",
+        "current_volatility": 0.001718,
+        "sma_slope_pct": 0.050196
+      },
+      "BAC": {
         "regime": "sideways",
-        "current_volatility": 0.001341,
-        "sma_slope_pct": -0.002025
+        "current_volatility": 0.001218,
+        "sma_slope_pct": 0.010046
+      },
+      "C": {
+        "regime": "sideways",
+        "current_volatility": 0.001365,
+        "sma_slope_pct": 0.009802
+      },
+      "COP": {
+        "regime": "sideways",
+        "current_volatility": 0.00263,
+        "sma_slope_pct": -0.014822
       },
       "GOOGL": {
         "regime": "sideways",
-        "current_volatility": 0.00116,
-        "sma_slope_pct": -0.004641
+        "current_volatility": 0.00115,
+        "sma_slope_pct": 0.003248
+      },
+      "HD": {
+        "regime": "sideways",
+        "current_volatility": 0.001782,
+        "sma_slope_pct": 0.002817
+      },
+      "HON": {
+        "regime": "sideways",
+        "current_volatility": 0.001339,
+        "sma_slope_pct": 0.004576
       },
       "JPM": {
         "regime": "sideways",
-        "current_volatility": 0.001051,
-        "sma_slope_pct": -0.009365
+        "current_volatility": 0.001194,
+        "sma_slope_pct": 0.004476
       },
-      "KO": {
+      "LLY": {
         "regime": "sideways",
-        "current_volatility": 0.000794,
-        "sma_slope_pct": 0.006131
-      },
-      "META": {
-        "regime": "sideways",
-        "current_volatility": 0.001171,
-        "sma_slope_pct": -0.017598
+        "current_volatility": 0.000987,
+        "sma_slope_pct": -0.019472
       },
       "MSFT": {
         "regime": "sideways",
-        "current_volatility": 0.001509,
-        "sma_slope_pct": -0.006803
+        "current_volatility": 0.001976,
+        "sma_slope_pct": 0.007898
+      },
+      "QCOM": {
+        "regime": "sideways",
+        "current_volatility": 0.001641,
+        "sma_slope_pct": 0.013772
+      },
+      "TSLA": {
+        "regime": "sideways",
+        "current_volatility": 0.002637,
+        "sma_slope_pct": 0.010677
+      },
+      "WFC": {
+        "regime": "sideways",
+        "current_volatility": 0.001491,
+        "sma_slope_pct": 0.004406
+      },
+      "XOM": {
+        "regime": "sideways",
+        "current_volatility": 0.002862,
+        "sma_slope_pct": -0.016412
       }
     }
   }

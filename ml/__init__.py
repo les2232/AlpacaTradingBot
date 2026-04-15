@@ -1,1 +1,1 @@
-"""Machine-learning helpers for AlpacaTradingBot."""
+"""Machine-learning helpers for TradeOS."""

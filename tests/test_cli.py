@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from dotenv import load_dotenv
 
 from alpaca_trading_bot import cli
 
@@ -44,6 +45,77 @@ def test_main_forwards_backtest_passthrough_args(monkeypatch) -> None:
     assert exit_code == 0
     assert captured["program_name"] == "backtest_runner.py"
     assert captured["args"] == ["--dataset", "datasets/sample", "--strategy-mode", "sma"]
+
+
+def test_run_dashboard_starts_streamlit_headless_and_reports_url(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+        def wait(self) -> int:
+            return 0
+
+    def fake_popen(command, cwd=None):
+        captured["command"] = command
+        captured["cwd"] = cwd
+        return FakeProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli, "_wait_for_dashboard_server", lambda port, process: True)
+
+    exit_code = cli._run_dashboard(port=None)
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert captured["command"] == [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        "dashboard.py",
+        "--server.headless",
+        "true",
+    ]
+    assert captured["cwd"] == str(cli.PROJECT_ROOT)
+    assert "Dashboard available at http://localhost:8501" in output
+
+
+def test_run_dashboard_honors_custom_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+        def wait(self) -> int:
+            return 0
+
+    def fake_popen(command, cwd=None):
+        captured["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli, "_wait_for_dashboard_server", lambda port, process: False)
+
+    exit_code = cli._run_dashboard(port=9123)
+
+    assert exit_code == 0
+    assert captured["command"] == [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        "dashboard.py",
+        "--server.headless",
+        "true",
+        "--server.port",
+        "9123",
+    ]
 
 
 def test_run_live_refuses_non_paper_execution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -93,7 +165,7 @@ def test_run_preview_allows_non_paper_but_disables_execution(monkeypatch: pytest
 def test_run_live_refuses_second_live_instance(monkeypatch: pytest.MonkeyPatch) -> None:
     lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
     log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
-    lock_path.write_text('{"pid": 4242, "command": "alpaca-bot live"}', encoding="utf-8")
+    lock_path.write_text('{"pid": 4242, "command": "tradeos live"}', encoding="utf-8")
     config = SimpleNamespace(
         paper=True,
         strategy_mode="mean_reversion",
@@ -132,7 +204,7 @@ def test_run_live_replaces_stale_lock_and_cleans_up(
 ) -> None:
     lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
     log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
-    lock_path.write_text('{"pid": 999999, "command": "alpaca-bot live"}', encoding="utf-8")
+    lock_path.write_text('{"pid": 999999, "command": "tradeos live"}', encoding="utf-8")
     called: dict[str, bool] = {"main": False}
     config = SimpleNamespace(
         paper=True,
@@ -214,6 +286,46 @@ def test_run_live_reports_lock_acquired(monkeypatch: pytest.MonkeyPatch, capsys:
     finally:
         lock_path.unlink(missing_ok=True)
         _cleanup_tree(log_root)
+
+
+def test_run_live_loads_dotenv_before_resolving_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[str] = []
+    config = SimpleNamespace(
+        paper=True,
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        symbols=["AMD"],
+        sma_bars=20,
+        max_usd_per_trade=1000.0,
+        max_symbol_exposure_usd=1000.0,
+        max_open_positions=5,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+    )
+
+    def fake_load_config_details():
+        called.append("load_config_details")
+        return SimpleNamespace(config=config, runtime_config_path="config/live_config.json", overridden_fields=("symbols",))
+
+    fake_module = SimpleNamespace(
+        load_config_details=fake_load_config_details,
+        main=lambda **kwargs: None,
+    )
+
+    def fake_load_dotenv(path):
+        called.append("load_dotenv")
+        return load_dotenv(path)
+
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.setattr(cli, "load_dotenv", fake_load_dotenv)
+
+    exit_code = cli._run_live(preview=True)
+
+    assert exit_code == 0
+    assert called[:2] == ["load_dotenv", "load_config_details"]
 
 
 def test_run_live_recovers_malformed_lock(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

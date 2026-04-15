@@ -51,6 +51,36 @@ TRADE_DECISION_PATH   = RESULTS_DIR / "trade_decision.json"
 LIVE_CONFIG_PATH      = CONFIG_DIR / "live_config.json"
 
 
+def _load_live_runtime_defaults() -> dict:
+    if not LIVE_CONFIG_PATH.exists():
+        raise RuntimeError(f"Live config not found: {LIVE_CONFIG_PATH}")
+
+    payload = json.loads(LIVE_CONFIG_PATH.read_text(encoding="utf-8"))
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict):
+        raise RuntimeError(f"Live config is missing a 'runtime' object: {LIVE_CONFIG_PATH}")
+
+    symbols = runtime.get("symbols")
+    if not isinstance(symbols, list) or not symbols:
+        raise RuntimeError(f"Live config is missing runtime.symbols: {LIVE_CONFIG_PATH}")
+
+    strategy_mode = str(runtime.get("strategy_mode") or "").strip()
+    if not strategy_mode:
+        raise RuntimeError(f"Live config is missing runtime.strategy_mode: {LIVE_CONFIG_PATH}")
+
+    return {
+        "symbols": [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()],
+        "bar_timeframe_minutes": int(runtime.get("bar_timeframe_minutes", 15) or 15),
+        "strategy_mode": strategy_mode,
+        "sma_bars": int(runtime.get("sma_bars", 20) or 20),
+        "entry_threshold_pct": float(runtime.get("entry_threshold_pct", 0.002) or 0.002),
+        "mean_reversion_exit_style": str(runtime.get("mean_reversion_exit_style") or "sma"),
+        "mean_reversion_max_atr_percentile": float(
+            runtime.get("mean_reversion_max_atr_percentile", 80.0) or 80.0
+        ),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -71,8 +101,10 @@ def parse_args() -> argparse.Namespace:
 # SNAPSHOT CONFIG
 # ---------------------------------------------------------------------------
 
-SNAPSHOT_SYMBOLS   = ["AAPL", "MSFT", "NVDA"]
-SNAPSHOT_TIMEFRAME = "15Min"
+LIVE_RESEARCH_DEFAULTS = _load_live_runtime_defaults()
+
+SNAPSHOT_SYMBOLS   = LIVE_RESEARCH_DEFAULTS["symbols"]
+SNAPSHOT_TIMEFRAME = f"{LIVE_RESEARCH_DEFAULTS['bar_timeframe_minutes']}Min"
 
 # Lookback windows (in calendar days) run in order, shortest first.
 # The longest window is treated as the primary result for approval and
@@ -89,10 +121,18 @@ SNAPSHOT_ALIGN_MODE    = "shared"     # choices: shared | none
 # ---------------------------------------------------------------------------
 
 SWEEP_PARAMS: list[tuple[str, str]] = [
-    ("strategy-mode-list",        "sma,hybrid,breakout"),
-    ("sma-bars-list",             "10,15,20,30"),
-    ("entry-threshold-pct-list",  "0.001,0.0025,0.005"),
+    ("strategy-mode-list",        LIVE_RESEARCH_DEFAULTS["strategy_mode"]),
+    # Broader SMA range to find a tighter or looser mean.
+    ("sma-bars-list",             "10,15,20,25,30"),
+    # Tighter entries (0.001) and slightly wider (0.003) added to the search space.
+    ("entry-threshold-pct-list",  "0.001,0.0015,0.002,0.0025,0.003"),
     ("time-window-mode-list",     "full_day,morning_only"),
+    # Sweep all exit styles: sma (wait for recross), midpoint (take profit earlier),
+    # eod (hold until forced flatten).
+    ("mean-reversion-exit-style-list", "sma,midpoint,eod"),
+    # Sweep ATR percentile filter — lower values only trade lower-vol pullbacks,
+    # which tend to revert more cleanly.  80 (previous default) is included.
+    ("mean-reversion-max-atr-percentile-list", "40,50,60,70,80"),
 ]
 
 # Fixed (non-sweep) backtest parameters.
@@ -127,6 +167,8 @@ STABILITY_PARAMS = [
     "sma_bars",
     "entry_threshold_pct",
     "time_window_mode",
+    "mean_reversion_exit_style",
+    "mean_reversion_max_atr_percentile",
 ]
 
 # ---------------------------------------------------------------------------
@@ -348,6 +390,8 @@ DISPLAY_COLS = [
     "sma_bars",
     "entry_threshold_pct",
     "time_window_mode",
+    "mean_reversion_exit_style",
+    "mean_reversion_max_atr_percentile",
     COL_RETURN,
     COL_PF,
     COL_DRAWDOWN,
@@ -1083,11 +1127,15 @@ def main() -> None:
         )
 
         # ── Phase 3: stability evaluation across all windows ──────────────
-        _section("Promote runtime config")
-        step_write_live_config(
-            primary["best_row"], primary["dataset"],
-            LIVE_CONFIG_PATH, approved, rejection_reasons,
-        )
+        if approved:
+            _section("Promote runtime config")
+            step_write_live_config(
+                primary["best_row"], primary["dataset"],
+                LIVE_CONFIG_PATH, approved, rejection_reasons,
+            )
+        else:
+            _section("Promote runtime config")
+            _log("Skipped live config promotion because the selected config was not approved.")
 
         _section("Stability evaluation")
         stability = step_evaluate_stability(window_results)

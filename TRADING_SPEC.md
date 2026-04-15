@@ -24,10 +24,15 @@ These settings may be changed without changing the spec itself.
 
 ## Frozen Defaults
 
+These are the code-level fallback defaults when no override is present.
+The currently active live strategy is selected via `config/live_config.json`, not from these defaults.
+See `config/live_config.json` for the runtime source of truth.
+
 - Default universe: `AAPL`, `MSFT`, `NVDA`
 - Default bar frequency: `15` minutes
 - Default SMA lookback: `20` bars
-- Default strategy mode: `hybrid`
+- Historical code-default strategy mode: `hybrid`
+  - **Current live selection: `mean_reversion`** (set in `config/live_config.json`)
 - Default max trade budget: `$200`
 - Default max simultaneous positions: `3`
 - Default max daily loss: `$300`
@@ -82,6 +87,8 @@ These settings may be changed without changing the spec itself.
   - Buy when `probability_up >= ML_PROBABILITY_BUY` and no position is open.
 - `hybrid` mode:
   - Buy only when both the SMA trend is bullish and the ML probability meets the buy threshold.
+- `mean_reversion` mode (**current live mode**):
+  - Buy when price has pulled back below SMA by at least `entry_threshold_pct` and ATR percentile is within `mean_reversion_max_atr_percentile`. Optional trend filter via `mean_reversion_trend_filter`.
 
 ## Exit Rules
 
@@ -91,6 +98,8 @@ These settings may be changed without changing the spec itself.
   - Exit when `probability_up <= ML_PROBABILITY_SELL`.
 - `hybrid` mode:
   - Exit when either the SMA trend turns bearish or the ML probability falls to or below the sell threshold.
+- `mean_reversion` mode (**current live mode**):
+  - Exit style is determined by `mean_reversion_exit_style` (currently `sma`: exit when price recrosses above SMA).
 - Risk exit:
   - Stop all new trading when daily PnL is less than or equal to `-MAX_DAILY_LOSS_USD`.
 - Session exit:

@@ -1,6 +1,6 @@
-# AlpacaTradingBot
+# TradeOS
 
-Intraday Alpaca paper-trading bot with shared live, backtest, and offline-research components.
+TradeOS is a strategy-driven trading system with a broker adapter layer, shared live execution, backtesting, and offline research components. The current live backend is Alpaca.
 
 The current default operating rules are frozen in [TRADING_SPEC.md](TRADING_SPEC.md).
 The current operator workflow is documented in [OPERATIONS.md](OPERATIONS.md).
@@ -9,8 +9,8 @@ The current operator workflow is documented in [OPERATIONS.md](OPERATIONS.md).
 
 For day-of trading operations, prefer the workflow in [OPERATIONS.md](OPERATIONS.md):
 
-- use one `alpaca-bot live` process only
-- use `alpaca-bot dashboard` for monitoring only
+- use one `tradeos live` process only
+- use `tradeos dashboard` for monitoring only
 - keep `config/live_config.json` as the runtime trading-settings source of truth
 
 This repo now has an installable package and a single top-level command.
@@ -24,24 +24,25 @@ python -m pip install -e .
 Then use the program entry point:
 
 ```powershell
-alpaca-bot --help
+tradeos --help
 ```
 
 Main commands:
 
-- `alpaca-bot preview` runs the live bot with order execution disabled
-- `alpaca-bot live` runs the live bot with normal execution behavior
-- `alpaca-bot backtest ...` passes arguments through to `backtest_runner.py`
-- `alpaca-bot snapshot ...` passes arguments through to `dataset_snapshotter.py`
-- `alpaca-bot research` runs the research pipeline
-- `alpaca-bot experiments ...` runs the backtest experiment batch
-- `alpaca-bot report ...` runs the daily diagnostic report
-- `alpaca-bot dashboard` launches the browser-based Streamlit dashboard
+- `tradeos preview` runs the live bot with order execution disabled
+- `tradeos live` runs the live bot with normal execution behavior
+- `tradeos paper` is a compatibility-friendly alias for the current paper-account execution workflow
+- `tradeos backtest ...` passes arguments through to `backtest_runner.py`
+- `tradeos snapshot ...` passes arguments through to `dataset_snapshotter.py`
+- `tradeos research` runs the research pipeline
+- `tradeos experiments ...` runs the backtest experiment batch
+- `tradeos report ...` runs the daily diagnostic report
+- `tradeos dashboard` launches the browser-based Streamlit dashboard
 
 You can also run the package without installing the script wrapper:
 
 ```powershell
-python -m alpaca_trading_bot --help
+python -m tradeos --help
 ```
 
 ## Current Behavior Snapshot
@@ -63,16 +64,33 @@ One implementation detail is intentionally duplicated for safety:
 - the in-loop guard protects normal decision flow
 - the background thread acts as a wall-clock fail-safe if the loop drifts or stalls
 
+## Current Live Strategy
+
+The active strategy is **`mean_reversion`**, configured in `config/live_config.json`.
+
+Key settings as of 2026-04-08:
+- 15-symbol universe (see `config/live_config.json` for the list)
+- 15-minute bars, 20-bar SMA, entry pullback threshold 0.2%
+- ATR percentile filter ≤ 80, exit on SMA recross, no trend filter
+
+**Why mean reversion:** IS/OOS backtests on the 15-symbol universe showed IS PF 1.189 and OOS PF 1.431 — stronger and more stable than the prior hybrid baseline.
+
+**`hybrid` mode** remains available in the strategy engine but is not the current live selection.
+
+**Older research artifacts** (comparison CSVs, prior `best_config_latest.json`) may reflect earlier SMA or hybrid experiments. They are preserved for reference but do not represent the current live configuration.
+
+See `results/strategy_status.md` for a concise summary of current strategy evidence.
+
 ## Repository Map
 
 - [trading_bot.py](trading_bot.py)
-  Live/paper trading entry point. Loads `.env`, builds the runtime `BotConfig`, evaluates completed 15-minute bars, applies execution safety checks, places Alpaca orders, and writes snapshots to SQLite.
+  Live/paper trading entry point. Loads `.env`, builds the runtime `BotConfig`, evaluates completed 15-minute bars, applies execution safety checks, places broker-backed orders, and writes snapshots to SQLite.
 - [strategy.py](strategy.py)
   Shared decision engine for `sma`, `ml`, `hybrid`, `breakout`, and `mean_reversion`. This is the main logic shared by live trading and backtests.
 - [backtest_runner.py](backtest_runner.py)
   Offline backtest CLI. Replays saved datasets through the shared strategy layer, supports sweeps, and compares strategy modes.
 - [dataset_snapshotter.py](dataset_snapshotter.py)
-  Dataset-building CLI. Downloads Alpaca historical bars and writes versioned datasets under `datasets/`.
+  Dataset-building CLI. Downloads historical bars with the current Alpaca-backed data path and writes versioned datasets under `datasets/`.
 - [ml/feature_pipeline.py](ml/feature_pipeline.py)
   Offline feature engineering aligned to the live ML feature vector.
 - [ml/train.py](ml/train.py)
@@ -106,25 +124,23 @@ Create a `.env` file:
 ALPACA_API_KEY=your_key
 ALPACA_API_SECRET=your_secret
 ALPACA_PAPER=true
-BOT_SYMBOLS=AAPL,MSFT,NVDA
 MAX_USD_PER_TRADE=200
 MAX_OPEN_POSITIONS=3
 MAX_DAILY_LOSS_USD=300
-SMA_BARS=20
-BAR_TIMEFRAME_MINUTES=15
-STRATEGY_MODE=hybrid
 ```
+
+> **Note:** Runtime trading settings (symbols, strategy mode, bar timeframe, indicator parameters) are driven by `config/live_config.json`, not `.env`. Set secrets and risk limits in `.env`; set strategy config in `config/live_config.json`.
 
 Run the live bot:
 
 ```powershell
-alpaca-bot live
+tradeos live
 ```
 
 Preview one or more decision cycles without placing orders:
 
 ```powershell
-alpaca-bot preview
+tradeos preview
 ```
 
 ### Backtests
@@ -132,13 +148,13 @@ alpaca-bot preview
 Run a single backtest:
 
 ```powershell
-alpaca-bot backtest --dataset datasets\YOUR_DATASET --strategy-mode sma
+tradeos backtest --dataset datasets\YOUR_DATASET --strategy-mode sma
 ```
 
 Run the canned breakout comparison batch into an isolated experiment folder:
 
 ```powershell
-alpaca-bot experiments --dataset datasets\YOUR_DATASET
+tradeos experiments --dataset datasets\YOUR_DATASET
 ```
 
 Or use the wrapper with the current large breakout dataset already filled in:
@@ -157,7 +173,7 @@ That writes a timestamped folder under `results\experiments\` with:
 Compare `sma`, `ml`, and `hybrid`:
 
 ```powershell
-alpaca-bot backtest --dataset datasets\YOUR_DATASET --strategy-mode-list sma,ml,hybrid
+tradeos backtest --dataset datasets\YOUR_DATASET --strategy-mode-list sma,ml,hybrid
 ```
 
 Run the standard comparison suite:
@@ -171,7 +187,7 @@ powershell -ExecutionPolicy Bypass -File run_compare_suite.ps1
 Run the broader research workflow:
 
 ```powershell
-alpaca-bot research
+tradeos research
 ```
 
 Or use the PowerShell wrapper that logs output to `logs/`:
@@ -185,7 +201,7 @@ powershell -ExecutionPolicy Bypass -File run_research.ps1
 Build a versioned dataset snapshot:
 
 ```powershell
-alpaca-bot snapshot --symbols AAPL MSFT NVDA --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z --timeframe 15Min --feed iex
+tradeos snapshot --symbols AAPL MSFT NVDA --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z --timeframe 15Min --feed iex
 ```
 
 This writes a dataset directory under `datasets/` containing:
@@ -198,7 +214,7 @@ This writes a dataset directory under `datasets/` containing:
 Run the local monitoring dashboard:
 
 ```powershell
-alpaca-bot dashboard
+tradeos dashboard
 ```
 
 Streamlit usually serves on `http://localhost:8501`.

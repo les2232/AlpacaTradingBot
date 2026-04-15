@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 ATR_PERIOD = 14
 ATR_PERCENTILE_LOOKBACK_DAYS = 20
+ADX_PERIOD = 14
 REGIME_SMA_PERIOD = 50
 REGIME_TIMEFRAME_MINUTES = 60
 ML_BUY_THRESHOLD = 0.55
@@ -125,6 +126,30 @@ def calculate_atr_values(
     return atr_values
 
 
+def calculate_mean_reversion_signal(
+    current_price: float,
+    sma: float,
+    entry_threshold: float,
+    is_holding: bool,
+    exit_target: float,
+) -> tuple[float, str]:
+    """Return (signal_pct, label) for mean reversion mode.
+
+    Pre-entry: 0.0 at/above SMA, 1.0 at/below entry threshold ("Distance to Entry").
+    Post-entry: 1.0 at entry threshold, 0.0 at exit target ("Recovery Progress").
+    """
+    if not is_holding:
+        denom = sma - entry_threshold
+        if denom <= 0:
+            return 0.0, "Distance to Entry"
+        return max(0.0, min(1.0, (sma - current_price) / denom)), "Distance to Entry"
+    else:
+        denom = exit_target - entry_threshold
+        if denom <= 0:
+            return 1.0, "Recovery Progress"
+        return max(0.0, min(1.0, (exit_target - current_price) / denom)), "Recovery Progress"
+
+
 def calculate_atr_pct_values(
     highs: list[float],
     lows: list[float],
@@ -218,6 +243,179 @@ def calculate_hourly_regime_series(
         direction="backward",
     )
     return [None if pd.isna(value) else bool(value) for value in merged["bullish"]]
+
+
+def calculate_vwap_series(
+    timestamps: list[pd.Timestamp],
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    volumes: list[float],
+) -> list[float | None]:
+    """Compute intraday session VWAP for each bar, resetting at each trading day.
+
+    VWAP = Σ(typical_price_i × volume_i) / Σ(volume_i)
+    where typical_price = (high + low + close) / 3
+
+    Design rules that match the rest of this module's series functions:
+    - Returns a parallel list of the same length as the inputs.
+    - Accumulators (cum_pv, cum_v) reset at the first bar of each new calendar
+      day in the US/Eastern timezone, so overnight carry-over never occurs.
+    - The first bar of each session always returns None.  A single-bar VWAP is
+      just the typical price of that bar — it is not a meaningful intraday anchor
+      and would produce spurious z-scores on the open bar.
+    - Returns None for any bar where cumulative session volume is still zero.
+    - O(n) single pass; no nested loops or pandas groupby.
+
+    Live usage (batch re-compute each tick, matching existing bot pattern):
+        vwap_values = calculate_vwap_series(timestamps, highs, lows, closes, volumes)
+        current_vwap = vwap_values[-1]   # None if first bar of session
+
+    Incremental streaming state (one bar at a time):
+        Maintain (cum_pv, cum_v, current_day) across calls. On each new bar:
+          1. If trading_day != current_day: reset cum_pv=0, cum_v=0, is_first=True
+          2. Accumulate: cum_pv += tp * vol; cum_v += vol
+          3. If is_first: return None (and clear is_first flag)
+          4. Else: return cum_pv / cum_v if cum_v > 0 else None
+
+    Args:
+        timestamps: bar timestamps; timezone-aware or naive UTC.
+        highs:      per-bar high prices.
+        lows:       per-bar low prices.
+        closes:     per-bar close prices.
+        volumes:    per-bar traded volumes; zero or negative treated as zero.
+
+    Returns:
+        Parallel list of VWAP floats; None where not yet computable.
+    """
+    n = len(timestamps)
+    if not timestamps or not (n == len(highs) == len(lows) == len(closes) == len(volumes)):
+        return []
+
+    vwap_values: list[float | None] = [None] * n
+    cum_pv: float = 0.0
+    cum_v: float = 0.0
+    current_day = None
+    is_first_bar_of_session: bool = False
+
+    for idx in range(n):
+        stamp = pd.Timestamp(timestamps[idx])
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize("UTC")
+        trading_day = stamp.tz_convert("America/New_York").date()
+
+        # New session: reset accumulators before touching this bar's data.
+        if trading_day != current_day:
+            current_day = trading_day
+            cum_pv = 0.0
+            cum_v = 0.0
+            is_first_bar_of_session = True
+
+        tp = (highs[idx] + lows[idx] + closes[idx]) / 3.0
+        vol = max(0.0, float(volumes[idx]))
+        cum_pv += tp * vol
+        cum_v += vol
+
+        # Emit None for the opening bar; it seeds the accumulator for bar 2+.
+        if is_first_bar_of_session:
+            is_first_bar_of_session = False
+            continue
+
+        if cum_v > 0.0:
+            vwap_values[idx] = cum_pv / cum_v
+
+    return vwap_values
+
+
+def calculate_adx_series(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    period: int = ADX_PERIOD,
+) -> list[float | None]:
+    """Wilder's Average Directional Index (ADX) for each bar.
+
+    Algorithm:
+        1. True Range (TR), +DM, -DM for every bar.
+        2. Wilder-smooth each over `period` bars (same EMA formula as ATR).
+        3. +DI = 100 * smoothed_+DM / smoothed_TR
+           -DI = 100 * smoothed_-DM / smoothed_TR
+        4. DX  = 100 * |+DI - -DI| / (+DI + -DI)
+        5. ADX = Wilder-smooth DX over `period` bars.
+
+    The first valid ADX value appears at index 2*period - 2 (27 bars for period=14).
+    Earlier bars return None.  None is also returned when smoothed TR is zero.
+
+    Consistent with calculate_atr_values: uses simple average for the first
+    smoothing window, then Wilder's EMA ((prev*(n-1) + x) / n) thereafter.
+    The DI ratio is invariant to this normalisation choice.
+    """
+    n = len(highs)
+    if not highs or not (n == len(lows) == len(closes)):
+        return []
+
+    result: list[float | None] = [None] * n
+    if n < period * 2 - 1:
+        return result
+
+    # --- Step 1: raw TR, +DM, -DM per bar ---
+    tr_raw:      list[float] = [highs[0] - lows[0]]
+    plus_dm_raw: list[float] = [0.0]
+    minus_dm_raw: list[float] = [0.0]
+
+    for i in range(1, n):
+        up_move   = highs[i]   - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+        tr_raw.append(max(
+            highs[i] - lows[i],
+            abs(highs[i]  - closes[i - 1]),
+            abs(lows[i]   - closes[i - 1]),
+        ))
+        plus_dm_raw.append(up_move   if up_move > down_move and up_move > 0   else 0.0)
+        minus_dm_raw.append(down_move if down_move > up_move and down_move > 0 else 0.0)
+
+    # --- Step 2: first Wilder window (simple average, matching calculate_atr_values) ---
+    tr_s   = sum(tr_raw[:period])   / period
+    pdm_s  = sum(plus_dm_raw[:period])  / period
+    mdm_s  = sum(minus_dm_raw[:period]) / period
+
+    # --- Step 3: DX series ---
+    dx_values: list[float | None] = [None] * n
+
+    def _dx(tr_s: float, pdm_s: float, mdm_s: float) -> float | None:
+        if tr_s <= 0:
+            return None
+        plus_di  = 100.0 * pdm_s / tr_s
+        minus_di = 100.0 * mdm_s / tr_s
+        di_sum   = plus_di + minus_di
+        return 100.0 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0.0
+
+    dx_values[period - 1] = _dx(tr_s, pdm_s, mdm_s)
+    for i in range(period, n):
+        tr_s  = (tr_s  * (period - 1) + tr_raw[i])       / period
+        pdm_s = (pdm_s * (period - 1) + plus_dm_raw[i])  / period
+        mdm_s = (mdm_s * (period - 1) + minus_dm_raw[i]) / period
+        dx_values[i] = _dx(tr_s, pdm_s, mdm_s)
+
+    # --- Step 4: ADX = Wilder-smooth DX ---
+    first_adx_idx = 2 * period - 2
+    first_dx_window = [dx_values[i] for i in range(period - 1, first_adx_idx + 1)
+                       if dx_values[i] is not None]
+    if len(first_dx_window) < period:
+        return result
+
+    adx: float | None = sum(first_dx_window) / period
+    result[first_adx_idx] = adx
+
+    for i in range(first_adx_idx + 1, n):
+        dx = dx_values[i]
+        if dx is None or adx is None:
+            adx = None
+        else:
+            adx = (adx * (period - 1) + dx) / period
+        result[i] = adx
+
+    return result
 
 
 def get_capped_breakout_stop_price(
@@ -371,6 +569,10 @@ class StrategyConfig:
     sma_stop_pct: float = 0.0              # 0 = disabled; e.g. 0.02 = exit if price falls 2% below entry
     mean_reversion_trend_filter: bool = False       # when True, skip entries where price < 50-bar SMA
     mean_reversion_trend_slope_filter: bool = False # when True, skip entries where SMA_50 slope < 0
+    vwap_z_entry_threshold: float = 1.5  # |z| required to trigger VWAP Z-score entry
+    vwap_z_stop_atr_multiple: float = 2.0  # long stop = entry_price - (mult * ATR)
+    min_atr_percentile: float = 20.0  # VWAP MR entry: skip if atr_percentile < this; 0 = disabled
+    max_adx_threshold: float = 25.0  # VWAP MR entry: skip if adx >= this (trending); 0 = disabled
 
 
 @dataclass(frozen=True)
@@ -472,6 +674,34 @@ class Strategy:
             return True
         return atr_percentile is not None and atr_percentile <= max_threshold
 
+    def _vwap_mr_min_atr_allowed(self, atr_percentile: float | None) -> bool:
+        """Block VWAP MR entries during low-volatility regimes.
+
+        Returns False only when atr_percentile is a known value strictly below
+        the configured minimum.  None is treated as unknown → fail open (True),
+        so bars with missing percentile data are never silently skipped.
+        """
+        threshold = self.config.min_atr_percentile
+        if threshold <= 0:
+            return True
+        if atr_percentile is None:
+            return True  # fail open — never block on missing data
+        return atr_percentile >= threshold
+
+    def _vwap_mr_adx_allowed(self, adx: float | None) -> bool:
+        """Block VWAP MR entries during strong directional trends.
+
+        Returns False only when adx is a known value >= the configured maximum.
+        None is treated as unknown → fail open (True), consistent with the
+        ATR percentile filter convention.
+        """
+        threshold = self.config.max_adx_threshold
+        if threshold <= 0:
+            return True
+        if adx is None:
+            return True  # fail open — never block on missing data
+        return adx < threshold
+
     def decide_action(
         self,
         price: float,
@@ -494,6 +724,8 @@ class Strategy:
         gap_pct: float | None = None,
         trend_sma: float | None = None,
         trend_sma_slope: float | None = None,
+        vwap: float | None = None,
+        adx: float | None = None,
     ) -> str:
         mode = normalize_strategy_mode(self.config.strategy_mode)
 
@@ -589,6 +821,48 @@ class Strategy:
             return "HOLD"
 
         if mode == STRATEGY_MODE_MEAN_REVERSION:
+            # ------------------------------------------------------------------
+            # VWAP Z-score path — used when the caller provides a session VWAP.
+            # atr_pct is ATR/close, so raw ATR in price units = atr_pct * price.
+            # This is a long-only implementation; short selling is not supported
+            # by the current broker infrastructure.
+            # ------------------------------------------------------------------
+            if vwap is not None and atr_pct is not None:
+                atr = atr_pct * price
+                if atr <= 0:
+                    # Degenerate ATR (perfectly flat tape or bad data) — skip bar.
+                    return "HOLD"
+                z = (price - vwap) / atr
+
+                if not holding:
+                    if (
+                        z <= -self.config.vwap_z_entry_threshold
+                        and time_window_open
+                        and self._entry_allowed(atr_percentile)
+                        and self._vwap_mr_min_atr_allowed(atr_percentile)
+                        and self._vwap_mr_adx_allowed(adx)
+                        and self._mean_reversion_entry_allowed(atr_percentile)
+                        and self._regime_allows_entry(bullish_regime)
+                    ):
+                        return "BUY"
+                    return "HOLD"
+
+                # Holding a long position — evaluate exits in priority order.
+                # Stop first: hard floor below entry in ATR units.
+                if position_entry_price is not None:
+                    stop = position_entry_price - self.config.vwap_z_stop_atr_multiple * atr
+                    if price <= stop:
+                        return "SELL"
+                # Profit target: price has reverted to or above session VWAP.
+                if price >= vwap:
+                    return "SELL"
+                return "HOLD"
+
+            # ------------------------------------------------------------------
+            # SMA fallback — used when VWAP is unavailable (backtester not yet
+            # wired, or first session bar where VWAP returns None).
+            # All original behaviour is preserved exactly.
+            # ------------------------------------------------------------------
             reversion_entry_price = self._reversion_threshold_price(sma, atr_pct)
             trend_filter_ok = (
                 not self.config.mean_reversion_trend_filter

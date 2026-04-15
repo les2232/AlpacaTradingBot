@@ -1,7 +1,7 @@
 """
 botlog.py
 ---------
-Structured JSON-lines logging for AlpacaTradingBot.
+Structured JSON-lines logging for TradeOS.
 
 Usage:
     from botlog import BotLogger

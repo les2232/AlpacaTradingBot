@@ -8,17 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
-from typing import Any, cast
-
-from alpaca.data.enums import DataFeed
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.live.stock import StockDataStream
-from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
-from alpaca.trading.models import Position
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from typing import Any
 import pandas as pd
 import pytz
 from dotenv import load_dotenv
@@ -33,6 +23,7 @@ else:
 
 from botlog import BotLogger
 from storage import BotStorage
+from tradeos.brokers import AlpacaBroker, BrokerBar, BrokerOrder, BrokerPosition
 from symbol_state import (
     format_symbol_list,
     normalize_symbols,
@@ -60,6 +51,8 @@ from strategy import (
     calculate_opening_range_series,
     calculate_atr_pct_values,
     calculate_atr_percentile_series,
+    calculate_adx_series,
+    calculate_vwap_series,
     get_capped_breakout_stop_price,
     REGIME_SMA_PERIOD,
     REGIME_TIMEFRAME_MINUTES,
@@ -77,6 +70,8 @@ from strategy import (
 )
 
 logger = logging.getLogger(__name__)
+
+Position = BrokerPosition
 
 
 class StaleMarketDataError(RuntimeError):
@@ -117,6 +112,7 @@ class BotConfig:
     max_price_deviation_bps: float = 75.0
     max_data_delay_seconds: int = 300
     max_live_price_age_seconds: int = 60
+    broker_backend: str = "alpaca"
 
 
 @dataclass(frozen=True)
@@ -144,6 +140,8 @@ class SymbolSnapshot:
     holding_minutes: float | None = None
     error: str | None = None
     hold_reason: str | None = None  # why action is HOLD: "trend_filter", "atr_filter", "no_signal", "holding_no_exit"
+    signal_pct: float | None = None   # normalized 0–1 signal strength for non-ML modes
+    signal_label: str | None = None   # e.g. "Distance to Entry" or "Recovery Progress"
 
 
 @dataclass(frozen=True)
@@ -154,6 +152,8 @@ class SymbolEvaluation:
     action: str
     latest_bar_close_utc: str
     hold_reason: str | None = None  # populated when action == "HOLD"; e.g. "trend_filter", "atr_filter", "no_signal"
+    signal_pct: float | None = None
+    signal_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -169,18 +169,7 @@ class BotSnapshot:
     symbols: list[SymbolSnapshot]
 
 
-@dataclass(frozen=True)
-class OrderSnapshot:
-    order_id: str
-    submitted_at: str | None
-    filled_at: str | None
-    symbol: str
-    side: str
-    status: str
-    qty: float | None
-    filled_qty: float | None
-    filled_avg_price: float | None
-    notional: float | None
+OrderSnapshot = BrokerOrder
 
 
 @dataclass(frozen=True)
@@ -214,17 +203,6 @@ _SESSION_ENTRY_START = dt_time(9, 45)   # no new entries before this
 _SESSION_ENTRY_END   = dt_time(15, 45)  # no new entries after this
 _SESSION_FLATTEN_AT  = dt_time(15, 55)  # forced EOD flatten deadline
 DEFAULT_RUNTIME_CONFIG_PATH = Path("config") / "live_config.json"
-_PRICE_STREAM_FEED_BY_NAME = {
-    "iex": DataFeed.IEX,
-    "sip": DataFeed.SIP,
-    "delayed_sip": DataFeed.DELAYED_SIP,
-}
-
-
-def _minutes_to_timeframe(minutes: int) -> TimeFrame:
-    if minutes >= 60 and minutes % 60 == 0:
-        return TimeFrame(minutes // 60, TimeFrameUnit.Hour)
-    return TimeFrame(minutes, TimeFrameUnit.Minute)
 
 
 def _safe_float(value: str | None, default: float) -> float:
@@ -239,6 +217,21 @@ def _normalize_enum_text(value: Any) -> str:
     if "." in text:
         text = text.rsplit(".", 1)[-1]
     return text.lower()
+
+
+def _parse_iso_timestamp(raw_value: str | None) -> datetime | None:
+    if not raw_value or raw_value == "None":
+        return None
+    normalized = raw_value
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _position_qty_value(position: Position | None) -> float:
@@ -472,10 +465,12 @@ def _load_base_config() -> BotConfig:
         max_price_deviation_bps=_safe_float(os.getenv("MAX_PRICE_DEVIATION_BPS"), 75.0),
         max_data_delay_seconds=int(os.getenv("MAX_DATA_DELAY_SECONDS", "300")),
         max_live_price_age_seconds=int(os.getenv("MAX_LIVE_PRICE_AGE_SECONDS", "60")),
+        broker_backend=os.getenv("BROKER_BACKEND", "alpaca").strip().lower() or "alpaca",
     )
 
 
 def load_config_details() -> RuntimeConfigDetails:
+    load_dotenv(Path.cwd() / ".env")
     base_config = _load_base_config()
     runtime_path, runtime = _load_runtime_config_payload()
     config, changed_fields = _apply_runtime_config(base_config, runtime_path, runtime)
@@ -492,22 +487,13 @@ def load_config() -> BotConfig:
     return load_config_details().config
 
 
-class AlpacaTradingBot:
+class TradeOSBot:
     def __init__(self, config: BotConfig, session_id: str | None = None) -> None:
         load_dotenv(Path.cwd() / ".env")
-
-        api_key = os.getenv("ALPACA_API_KEY")
-        api_secret = os.getenv("ALPACA_API_SECRET")
-        if not api_key or not api_secret:
-            raise RuntimeError(
-                "Missing Alpaca credentials. Set ALPACA_API_KEY and ALPACA_API_SECRET in .env."
-            )
+        self._session_started_at = datetime.now(timezone.utc)
 
         self.config = config
-        self.trading = TradingClient(api_key, api_secret, paper=config.paper)
-        self.data = StockHistoricalDataClient(api_key, api_secret)
-        self._api_key = api_key
-        self._api_secret = api_secret
+        self.broker = self._build_broker()
         db_path = Path(os.getenv("BOT_DB_PATH", "bot_history.db"))
         self.storage = BotStorage(db_path)
         self.blog = BotLogger(log_root="logs")
@@ -524,19 +510,11 @@ class AlpacaTradingBot:
         self._position_entry_price: dict[str, float] = {} # symbol → fill price at entry
         self._position_entry_ts: dict[str, str] = {}      # symbol → decision_ts at entry
         self._position_qty: dict[str, float] = {}         # symbol → qty at entry
-        self._latest_prices: dict[str, float] = {}
-        self._latest_price_times: dict[str, float] = {}
-        self._latest_trade_times: dict[str, float] = {}
-        self._price_lock = threading.Lock()
-        self._stream_enabled = os.getenv("ENABLE_PRICE_STREAM", "true").lower() != "false"
-        self._stream_error: str | None = None
-        self.data_stream: StockDataStream | None = None
-        self._stream_thread: threading.Thread | None = None
         self._ml_disabled_reason: str | None = None
         self._order_signal_price: dict[str, float] = {}
         self._last_processed_decision_timestamp: datetime | None = None
         self._position_first_seen_utc: dict[str, datetime] = {}
-        self._bars_cache: dict[tuple[str, int, int, str], list[Any]] = {}
+        self._bars_cache: dict[tuple[str, int, int, str], list[BrokerBar]] = {}
         self._hourly_regime_cache: dict[tuple[str, str], bool | None] = {}
         self._strategy_cache: dict[str, Strategy] = {}
         self._last_run_cycle_report: RunCycleReport | None = None
@@ -610,6 +588,26 @@ class AlpacaTradingBot:
         ):
             self._disable_ml_trading("ml.predict import failed", _ML_PREDICT_IMPORT_ERROR)
 
+    def _build_broker(self) -> AlpacaBroker:
+        backend = (self.config.broker_backend or "alpaca").strip().lower()
+        if backend != "alpaca":
+            raise RuntimeError(
+                f"Unsupported BROKER_BACKEND={backend!r}. TradeOS currently ships with the Alpaca adapter only."
+            )
+
+        api_key = os.getenv("ALPACA_API_KEY")
+        api_secret = os.getenv("ALPACA_API_SECRET")
+        if not api_key or not api_secret:
+            raise RuntimeError(
+                "Missing Alpaca credentials. Set ALPACA_API_KEY and ALPACA_API_SECRET in .env."
+            )
+        return AlpacaBroker(
+            api_key=api_key,
+            api_secret=api_secret,
+            paper=self.config.paper,
+            symbols=self.config.symbols,
+        )
+
     def _validate_persisted_symbol_state(self) -> None:
         latest_run = self.storage.get_latest_run()
         if latest_run is None:
@@ -674,23 +672,11 @@ class AlpacaTradingBot:
         return strategy
 
     def get_account(self) -> Any:
-        return cast(Any, self.trading).get_account()
+        return self.broker.get_account()
 
     def _log_skip(self, reason: str, detail: str) -> None:
         logger.info("%s %s", reason, detail)
         print(f"{reason}: {detail}")
-
-    def _preferred_price_stream_feed(self) -> DataFeed:
-        raw = os.getenv("PRICE_STREAM_FEED", "iex").strip().lower()
-        return _PRICE_STREAM_FEED_BY_NAME.get(raw, DataFeed.IEX)
-
-    def _latest_trade_feeds(self) -> list[DataFeed]:
-        preferred = self._preferred_price_stream_feed()
-        feeds: list[DataFeed] = []
-        for feed in (preferred, DataFeed.IEX, DataFeed.SIP):
-            if feed not in feeds:
-                feeds.append(feed)
-        return feeds
 
     def _position_holding_minutes(self, symbol: str, now_utc: datetime) -> float | None:
         first_seen = self._position_first_seen_utc.get(symbol)
@@ -742,119 +728,20 @@ class AlpacaTradingBot:
         return dt_time(9, 30) <= time_et < dt_time(16, 0)
 
     def _is_market_open(self) -> bool:
-        try:
-            clock = cast(Any, self.trading).get_clock()
-        except Exception as exc:
-            raise RuntimeError("Unable to fetch Alpaca market clock.") from exc
-        return bool(getattr(clock, "is_open", False))
+        return self.broker.is_market_open()
 
     def get_price_feed_status(self) -> str:
-        with self._price_lock:
-            active_symbols = len(self._latest_prices)
-
-        if not self._stream_enabled:
-            return "live stream disabled"
-        if self._stream_error:
-            return f"stream error: {self._stream_error}"
-        if self._stream_thread is None:
-            return "stream idle"
-        if active_symbols == 0:
-            return "stream connecting"
-        return f"live stream active for {active_symbols}/{len(self.config.symbols)} symbols"
-
-    def _start_price_stream(self) -> None:
-        if not self._stream_enabled or self._stream_thread is not None:
-            return
-
-        try:
-            stream_feed = self._preferred_price_stream_feed()
-            self.data_stream = StockDataStream(self._api_key, self._api_secret, feed=stream_feed)
-            self.data_stream.subscribe_trades(self._handle_trade, *self.config.symbols)
-            self._stream_thread = threading.Thread(target=self._run_price_stream, daemon=True)
-            self._stream_thread.start()
-            self._stream_error = None
-        except Exception as exc:
-            self._stream_error = str(exc)
-            self.data_stream = None
-            self._stream_thread = None
-
-    def _run_price_stream(self) -> None:
-        try:
-            if self.data_stream is None:
-                return
-            self.data_stream.run()
-        except Exception as exc:
-            self._stream_error = str(exc)
-
-    async def _handle_trade(self, trade: Any) -> None:
-        symbol = str(getattr(trade, "symbol", ""))
-        price = getattr(trade, "price", None)
-        if not symbol or price is None:
-            return
-
-        with self._price_lock:
-            self._latest_prices[symbol] = float(price)
-            self._latest_price_times[symbol] = time.time()
-            trade_timestamp = getattr(trade, "timestamp", None)
-            if isinstance(trade_timestamp, datetime):
-                if trade_timestamp.tzinfo is None:
-                    normalized_trade_time = trade_timestamp.replace(tzinfo=timezone.utc)
-                else:
-                    normalized_trade_time = trade_timestamp.astimezone(timezone.utc)
-                self._latest_trade_times[symbol] = normalized_trade_time.timestamp()
-            else:
-                self._latest_trade_times[symbol] = time.time()
-            self._stream_error = None
+        return self.broker.get_price_feed_status()
 
     def get_latest_price_with_age(self, symbol: str) -> tuple[float, float]:
-        self._start_price_stream()
-
-        with self._price_lock:
-            cached_price = self._latest_prices.get(symbol)
-            cached_at = self._latest_price_times.get(symbol)
-            cached_trade_at = self._latest_trade_times.get(symbol)
-
-        if cached_price is not None and cached_at is not None and (time.time() - cached_at) <= 15:
-            if cached_trade_at is not None:
-                return cached_price, max(0.0, time.time() - cached_trade_at)
-            return cached_price, time.time() - cached_at
-
-        last_exc: Exception | None = None
-        for feed in self._latest_trade_feeds():
-            try:
-                request = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=feed)
-                latest = cast(dict[str, Any], cast(Any, self.data).get_stock_latest_trade(request))
-                trade = latest[symbol]
-                price = float(trade.price)
-                timestamp = getattr(trade, "timestamp", None)
-                if isinstance(timestamp, datetime):
-                    if timestamp.tzinfo is None:
-                        trade_timestamp = timestamp.replace(tzinfo=timezone.utc)
-                    else:
-                        trade_timestamp = timestamp.astimezone(timezone.utc)
-                    age_seconds = max(0.0, (datetime.now(timezone.utc) - trade_timestamp).total_seconds())
-                else:
-                    age_seconds = 0.0
-
-                with self._price_lock:
-                    self._latest_prices[symbol] = price
-                    self._latest_price_times[symbol] = time.time()
-                    self._latest_trade_times[symbol] = time.time() - age_seconds
-
-                return price, age_seconds
-            except Exception as exc:
-                last_exc = exc
-
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError(f"Could not resolve latest trade for {symbol}")
+        return self.broker.get_latest_price_with_age(symbol)
 
     def get_latest_price(self, symbol: str) -> float:
         price, _ = self.get_latest_price_with_age(symbol)
         return price
 
     def get_positions_by_symbol(self) -> dict[str, Position]:
-        positions = cast(list[Position], cast(Any, self.trading).get_all_positions())
+        positions = self.broker.list_positions()
         return {position.symbol: position for position in positions}
 
     def _bar_interval(self) -> timedelta:
@@ -866,13 +753,8 @@ class AlpacaTradingBot:
         decision_unix = int(current_time.timestamp()) // bar_seconds * bar_seconds
         return datetime.fromtimestamp(decision_unix, tz=timezone.utc)
 
-    def _get_bar_start_time(self, bar: Any) -> datetime:
-        raw_timestamp = getattr(bar, "timestamp", None)
-        if not isinstance(raw_timestamp, datetime):
-            raise RuntimeError("Bar is missing a timestamp.")
-        if raw_timestamp.tzinfo is None:
-            return raw_timestamp.replace(tzinfo=timezone.utc)
-        return raw_timestamp.astimezone(timezone.utc)
+    def _get_bar_start_time(self, bar: BrokerBar) -> datetime:
+        return bar.timestamp
 
     def _get_bars(
         self,
@@ -880,7 +762,7 @@ class AlpacaTradingBot:
         bars_needed: int,
         timeframe_minutes: int,
         decision_timestamp: datetime | None = None,
-    ) -> list[Any]:
+    ) -> list[BrokerBar]:
         if bars_needed <= 0:
             raise RuntimeError("bars_needed must be greater than zero.")
 
@@ -894,17 +776,12 @@ class AlpacaTradingBot:
         trading_days_needed = max(3, math.ceil((bars_needed * timeframe_minutes) / trading_minutes_per_day))
         start = aligned_decision_timestamp - timedelta(days=trading_days_needed * 6)
         request_end = aligned_decision_timestamp + timedelta(minutes=timeframe_minutes)
-        tf = _minutes_to_timeframe(timeframe_minutes)
-        request = StockBarsRequest(
-            symbol_or_symbols=[symbol],
-            timeframe=tf,
+        bars = self.broker.get_bars(
+            symbol,
+            timeframe_minutes=timeframe_minutes,
             start=start,
             end=request_end,
-            feed=DataFeed.IEX,
         )
-
-        bars_response = cast(Any, self.data).get_stock_bars(request)
-        bars = cast(list[Any], bars_response.data.get(symbol, []))
         completed_bars = [
             bar
             for bar in bars
@@ -919,7 +796,7 @@ class AlpacaTradingBot:
         symbol: str,
         bars_needed: int,
         decision_timestamp: datetime | None = None,
-    ) -> list[Any]:
+    ) -> list[BrokerBar]:
         return self._get_bars(
             symbol,
             bars_needed,
@@ -949,7 +826,7 @@ class AlpacaTradingBot:
         self._hourly_regime_cache[cache_key] = bullish
         return bullish
 
-    def _latest_bar_close_time(self, bars: list[Any]) -> datetime:
+    def _latest_bar_close_time(self, bars: list[BrokerBar]) -> datetime:
         if not bars:
             raise RuntimeError("No completed bars available.")
         return self._get_bar_start_time(bars[-1]) + self._bar_interval()
@@ -1107,7 +984,10 @@ class AlpacaTradingBot:
         atr_pct_values = calculate_atr_pct_values(highs, lows, closes)
         atr_percentiles = calculate_atr_percentile_series(timestamps, highs, lows, closes)
         opening_range_highs, opening_range_lows = calculate_opening_range_series(timestamps, highs, lows)
-        recent_volumes = [float(getattr(bar, "volume", 0.0) or 0.0) for bar in intraday_bars][-20:]
+        volumes = [float(getattr(bar, "volume", 0.0) or 0.0) for bar in intraday_bars]
+        vwap_values = calculate_vwap_series(timestamps, highs, lows, closes, volumes)
+        adx_values = calculate_adx_series(highs, lows, closes)
+        recent_volumes = volumes[-20:]
         avg_volume = (sum(recent_volumes) / len(recent_volumes)) if recent_volumes else None
         current_volume = float(getattr(intraday_bars[-1], "volume", 0.0) or 0.0)
         volume_ratio = (current_volume / avg_volume) if avg_volume and avg_volume > 0 else None
@@ -1164,6 +1044,8 @@ class AlpacaTradingBot:
             volatility_ratio=volatility_ratio,
             effective_stop_price=effective_stop_price,
             trend_sma=trend_sma,
+            vwap=vwap_values[-1] if vwap_values else None,
+            adx=adx_values[-1] if adx_values else None,
         )
         # --- structured signal log ---
         _trend_pass = (price >= trend_sma) if trend_sma is not None else None
@@ -1321,56 +1203,19 @@ class AlpacaTradingBot:
         )
 
     def get_recent_orders(self, limit: int = 10) -> list[OrderSnapshot]:
-        request = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit, nested=False)
-        orders = cast(list[Any], cast(Any, self.trading).get_orders(filter=request))
-        snapshots: list[OrderSnapshot] = []
+        return self.broker.list_recent_orders(limit=limit)
 
-        for order in orders:
-            _filled_at_raw = getattr(order, "filled_at", None)
-            _filled_at_str = str(_filled_at_raw) if _filled_at_raw is not None else None
-            snapshots.append(
-                OrderSnapshot(
-                    order_id=str(getattr(order, "id", "")),
-                    submitted_at=str(getattr(order, "submitted_at", None)),
-                    filled_at=_filled_at_str,
-                    symbol=str(getattr(order, "symbol", "")),
-                    side=_normalize_enum_text(getattr(order, "side", "")),
-                    status=_normalize_enum_text(getattr(order, "status", "")),
-                    qty=float(order.qty) if getattr(order, "qty", None) else None,
-                    filled_qty=float(order.filled_qty) if getattr(order, "filled_qty", None) else None,
-                    filled_avg_price=(
-                        float(order.filled_avg_price)
-                        if getattr(order, "filled_avg_price", None)
-                        else None
-                    ),
-                    notional=float(order.notional) if getattr(order, "notional", None) else None,
-                )
-            )
-
-        return snapshots
-
-    def get_open_orders(self) -> list[Any]:
-        request = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=False)
-        return cast(list[Any], cast(Any, self.trading).get_orders(filter=request))
+    def get_open_orders(self) -> list[OrderSnapshot]:
+        return self.broker.list_open_orders()
 
     def _count_recent_orders(self, window_seconds: int = 60) -> int:
         orders = self.get_recent_orders(limit=100)
         now = datetime.now(timezone.utc)
         count = 0
         for order in orders:
-            if not order.submitted_at or order.submitted_at == "None":
+            submitted_at = _parse_iso_timestamp(order.submitted_at)
+            if submitted_at is None:
                 continue
-            raw_timestamp = order.submitted_at
-            if raw_timestamp.endswith("Z"):
-                raw_timestamp = raw_timestamp[:-1] + "+00:00"
-            try:
-                submitted_at = datetime.fromisoformat(raw_timestamp)
-            except ValueError:
-                continue
-            if submitted_at.tzinfo is None:
-                submitted_at = submitted_at.replace(tzinfo=timezone.utc)
-            else:
-                submitted_at = submitted_at.astimezone(timezone.utc)
             if (now - submitted_at).total_seconds() <= window_seconds:
                 count += 1
         return count
@@ -1627,7 +1472,31 @@ class AlpacaTradingBot:
                 print(f"Skip flatten {symbol}: existing open order in flight")
                 continue
             try:
-                self.place_market_sell(symbol, position, exit_reason=exit_reason)
+                qty = int(float(position.qty))
+                if qty > 0:
+                    self.place_market_sell(symbol, position, exit_reason=exit_reason)
+                elif qty < 0:
+                    # Short position — buy to cover
+                    cover_qty = abs(qty)
+                    order = self.broker.submit_market_order(symbol=symbol, qty=cover_qty, side="buy")
+                    print(f"Submitted BUY-TO-COVER {symbol} qty={cover_qty} (flatten)")
+                    order_id = order.order_id
+                    dec_ts = self.get_decision_timestamp().isoformat()
+                    if order_id:
+                        self._order_submission_ts[order_id] = dec_ts
+                        self._order_submission_side[order_id] = "buy"
+                        self._order_exit_reason[order_id] = exit_reason
+                    self.blog.order_submitted(
+                        symbol=symbol,
+                        decision_ts=dec_ts,
+                        side="buy",
+                        qty=cover_qty,
+                        live_price=float(position.current_price or position.avg_entry_price),
+                        order_id=order_id,
+                        signal_bar_close=None,
+                    )
+                else:
+                    print(f"Skip flatten {symbol}: qty is 0")
             except Exception as exc:
                 print(f"Flatten {symbol} ERROR: {exc}")
 
@@ -1655,6 +1524,9 @@ class AlpacaTradingBot:
             if status not in ("filled", "partially_filled"):
                 continue
             if order.filled_avg_price is None or order.filled_qty is None:
+                continue
+            fill_time = _parse_iso_timestamp(order.filled_at) or _parse_iso_timestamp(order.submitted_at)
+            if fill_time is not None and fill_time < self._session_started_at:
                 continue
 
             fill_qty = float(order.filled_qty)
@@ -1753,7 +1625,7 @@ class AlpacaTradingBot:
         price: float | None = None,
         decision_ts: str | None = None,
         signal_price: float | None = None,
-    ) -> Any | None:
+    ) -> OrderSnapshot | None:
         execution_price = price if price is not None else self.get_latest_price(symbol)
         available_buying_power = buying_power_available
         if available_buying_power is None:
@@ -1775,19 +1647,9 @@ class AlpacaTradingBot:
             )
             return None
 
-        order = cast(
-            Any,
-            self.trading.submit_order(
-                MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                )
-            ),
-        )
+        order = self.broker.submit_market_order(symbol=symbol, qty=qty, side="buy")
         print(f"Submitted BUY {symbol} qty={qty} approx=${qty * execution_price:.2f}")
-        order_id = str(getattr(order, "id", ""))
+        order_id = order.order_id
         dec_ts = decision_ts or self.get_decision_timestamp().isoformat()
         if order_id:
             self._order_submission_ts[order_id] = dec_ts
@@ -1813,7 +1675,7 @@ class AlpacaTradingBot:
         live_price: float | None = None,
         decision_ts: str | None = None,
         signal_price: float | None = None,
-    ) -> Any | None:
+    ) -> OrderSnapshot | None:
         qty = int(float(position.qty))
         if qty <= 0:
             print(f"Skip SELL {symbol}: non-positive quantity {position.qty}")
@@ -1821,20 +1683,10 @@ class AlpacaTradingBot:
 
         holding_minutes = self._position_holding_minutes(symbol, datetime.now(timezone.utc))
 
-        order = cast(
-            Any,
-            self.trading.submit_order(
-                MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY,
-                )
-            ),
-        )
+        order = self.broker.submit_market_order(symbol=symbol, qty=qty, side="sell")
         holding_text = f" holding_minutes={holding_minutes:.1f}" if holding_minutes is not None else ""
         print(f"Submitted SELL {symbol} qty={qty}{holding_text}")
-        order_id = str(getattr(order, "id", ""))
+        order_id = order.order_id
         dec_ts = decision_ts or self.get_decision_timestamp().isoformat()
         if order_id:
             self._order_submission_ts[order_id] = dec_ts
@@ -2254,11 +2106,14 @@ class AlpacaTradingBot:
         return snapshot
 
 
+AlpacaTradingBot = TradeOSBot
+
+
 def main(config: BotConfig | None = None, session_id: str | None = None) -> None:
     load_dotenv(Path.cwd() / ".env")
     if config is None:
         config = load_config()
-    bot = AlpacaTradingBot(config, session_id=session_id)
+    bot = TradeOSBot(config, session_id=session_id)
     execute_orders = os.getenv("EXECUTE_ORDERS", "true").lower() != "false"
     bar_interval_seconds = config.bar_timeframe_minutes * 60
     shutdown_event = threading.Event()
@@ -2337,4 +2192,5 @@ def main(config: BotConfig | None = None, session_id: str | None = None) -> None
 
 
 if __name__ == "__main__":
-    main()
+    from alpaca_trading_bot.cli import _run_live
+    raise SystemExit(_run_live(preview=False))

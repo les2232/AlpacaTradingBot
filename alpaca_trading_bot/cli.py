@@ -4,27 +4,34 @@ import argparse
 import contextlib
 import json
 import os
+import socket
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
+from dotenv import load_dotenv
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LIVE_BOT_LOCK_PATH = PROJECT_ROOT / ".live_bot.lock"
 LOG_ROOT = PROJECT_ROOT / "logs"
+DEFAULT_DASHBOARD_PORT = 8501
+DASHBOARD_READY_TIMEOUT_SECONDS = 15.0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="alpaca-bot",
-        description="Single entry point for live trading, monitoring, and research workflows.",
+        prog="tradeos",
+        description="TradeOS entry point for live trading, monitoring, and research workflows.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("live", help="Run the live bot with normal order-execution behavior.")
+    subparsers.add_parser("paper", help="Alias for `live` while using the current paper-trading account.")
     subparsers.add_parser("preview", help="Run the live bot with order execution disabled.")
 
     dashboard_parser = subparsers.add_parser(
@@ -130,7 +137,7 @@ def _live_instance_lock():
     current_pid = os.getpid()
     lock_payload = {
         "pid": current_pid,
-        "command": "alpaca-bot live",
+        "command": "tradeos live",
         "created_at_utc": _utcnow_iso(),
         "workspace": str(PROJECT_ROOT),
     }
@@ -220,6 +227,7 @@ def _persist_startup_config(details: object, preview: bool, *, session_id: str) 
         "paper": bool(getattr(config, "paper", False)),
         "account_mode": "paper" if bool(getattr(config, "paper", False)) else "live-account",
         "strategy_mode": getattr(config, "strategy_mode", ""),
+        "broker_backend": getattr(config, "broker_backend", "alpaca"),
         "bar_timeframe_minutes": int(getattr(config, "bar_timeframe_minutes", 0) or 0),
         "sma_bars": int(getattr(config, "sma_bars", 0) or 0),
         "symbols": list(getattr(config, "symbols", [])),
@@ -252,13 +260,14 @@ def _validate_live_runtime(config: object, preview: bool) -> None:
         return
     raise RuntimeError(
         "Refusing to start live order execution with ALPACA_PAPER=false. "
-        "This repo is currently being operated in paper-trading mode."
+        "This TradeOS workspace is currently being operated in paper-trading mode."
     )
 
 
 def _run_live(preview: bool) -> int:
     import trading_bot
 
+    load_dotenv(PROJECT_ROOT / ".env")
     details = trading_bot.load_config_details()
     config = details.config
     session_id = f"live-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
@@ -276,12 +285,41 @@ def _run_live(preview: bool) -> int:
     return 0
 
 
+def _dashboard_url(port: int) -> str:
+    return f"http://localhost:{port}"
+
+
+def _wait_for_dashboard_server(
+    port: int,
+    process: subprocess.Popen[bytes] | subprocess.Popen[str],
+    *,
+    timeout_seconds: float = DASHBOARD_READY_TIMEOUT_SECONDS,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
+
 def _run_dashboard(port: int | None) -> int:
     command = [sys.executable, "-m", "streamlit", "run", "dashboard.py"]
+    command.extend(["--server.headless", "true"])
     if port is not None:
         command.extend(["--server.port", str(port)])
-    completed = subprocess.run(command, cwd=str(PROJECT_ROOT), check=False)
-    return int(completed.returncode)
+    effective_port = port or DEFAULT_DASHBOARD_PORT
+    process = subprocess.Popen(command, cwd=str(PROJECT_ROOT))
+    url = _dashboard_url(effective_port)
+    if _wait_for_dashboard_server(effective_port, process):
+        print(f"Dashboard available at {url}")
+    else:
+        print(f"Dashboard is starting without auto-opening a browser. URL: {url}")
+    return int(process.wait())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -295,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         args = parser.parse_args(raw_argv)
 
-    if args.command == "live":
+    if args.command in {"live", "paper"}:
         return _run_live(preview=False)
     if args.command == "preview":
         return _run_live(preview=True)

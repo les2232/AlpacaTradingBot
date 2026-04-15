@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "alpaca-trading-bot"
+name = "tradeos"
 version = "0.1.0"
-description = "Installable CLI for the AlpacaTradingBot workspace."
+description = "Installable CLI for the TradeOS workspace."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,25 +20,34 @@ dependencies = [
 ]
 
 [project.scripts]
+tradeos = "alpaca_trading_bot.cli:main"
 alpaca-bot = "alpaca_trading_bot.cli:main"
 
 [tool.setuptools]
 py-modules = [
+    "avatar",
     "backtest_runner",
     "botlog",
+    "breakout_eval",
+    "breakout_sweep",
+    "compare_mr_strategies",
     "daily_report",
     "dashboard",
+    "dashboard_state",
     "dataset_snapshotter",
     "run_backtest_experiments",
     "run_research",
     "storage",
     "strategy",
+    "symbol_state",
     "trading_bot",
     "universe",
+    "vwap_atr_sweep",
+    "vwap_sweep",
 ]
 
 [tool.setuptools.packages.find]
-include = ["alpaca_trading_bot", "ml"]
+include = ["alpaca_trading_bot", "tradeos", "tradeos.*", "ml"]
 
 [tool.setuptools.package-data]
 ml = ["models/*.pkl"]

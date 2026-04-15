@@ -1,27 +1,35 @@
 {
-  "saved_at": "2026-04-06T01:03:55Z",
-  "dataset": "datasets\\smoketest",
-  "approved": true,
-  "rejection_reasons": [],
+  "saved_at": "2026-04-14T11:48:22Z",
+  "dataset": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e",
+  "approved": false,
+  "rejection_reasons": [
+    "profit_factor 1.1890 >= 1.2"
+  ],
   "config": {
-    "strategy_mode": "sma",
-    "sma_bars": 20,
-    "entry_threshold_pct": 0.0025,
+    "strategy_mode": "mean_reversion",
+    "sma_bars": 15,
+    "entry_threshold_pct": 0.0015,
+    "ml_probability_buy": 0.55,
+    "ml_probability_sell": 0.45,
     "threshold_mode": "static_pct",
-    "time_window_mode": "morning_only",
+    "atr_multiple": 1.0,
+    "atr_percentile_threshold": 0.0,
+    "time_window_mode": "full_day",
     "regime_filter_enabled": false,
     "orb_filter_mode": "none",
     "breakout_exit_style": "target_1x_stop_low",
-    "mean_reversion_exit_style": "sma"
+    "breakout_tight_stop_fraction": 0.5,
+    "mean_reversion_exit_style": "sma",
+    "mean_reversion_max_atr_percentile": 80.0
   },
   "performance": {
-    "total_return_pct": 4.606178,
-    "profit_factor": 1.253684,
-    "max_drawdown_pct": 3.967358,
-    "sharpe_ratio": 1.274551,
-    "win_rate": 38.793103,
-    "trades_per_day": 1.870968,
-    "realized_pnl": 92.123568,
-    "combined_score": 1.0
+    "total_return_pct": 5.457028,
+    "profit_factor": 1.188961,
+    "max_drawdown_pct": 3.875082,
+    "sharpe_ratio": 1.830071,
+    "win_rate": 68.784228,
+    "trades_per_day": 29.934426,
+    "realized_pnl": 545.702826,
+    "combined_score": 3.666667
   }
 }

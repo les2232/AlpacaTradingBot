@@ -39,7 +39,14 @@
       "Bash(rmdir tools:*)",
       "Bash(cmd:*)",
       "Bash(bash:*)",
-      "Bash(PYTHONIOENCODING=utf-8 python daily_report.py --date 2026-04-13)"
+      "Bash(PYTHONIOENCODING=utf-8 python daily_report.py --date 2026-04-13)",
+      "mcp__ide__getDiagnostics",
+      "Bash(ls C:/Users/lesco/Desktop/AlpacaTradingBot-1/results/*.csv)",
+      "Bash(ls C:/Users/lesco/Desktop/AlpacaTradingBot-1/results/*.json)",
+      "Bash(ls C:/Users/lesco/Desktop/AlpacaTradingBot-1/*.parquet)",
+      "Bash(grep -E --line-buffered \"\\\\[|TOP|INTERP|Traceback|Error|error|done$|sweep\\\\]\")",
+      "Bash(xargs cat *)",
+      "Bash(python3 *)"
     ]
   }
 }

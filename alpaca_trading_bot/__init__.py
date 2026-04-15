@@ -1,4 +1,4 @@
-"""Installable CLI package for AlpacaTradingBot."""
+"""Compatibility package for the legacy AlpacaTradingBot CLI entry point."""
 
 __all__ = ["__version__"]
 

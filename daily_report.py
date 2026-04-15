@@ -52,7 +52,7 @@ WARN: dict[str, Any] = {
     "win_rate_high":              0.90,   # above this → too few trades, not meaningful
     "eod_exit_rate":              0.30,   # >30% of exits from EOD flatten → exits not firing
     "stale_bar_count":            2,      # stale bars during market hours = data feed issue
-    "avg_bar_age_s":              30.0,   # seconds — Alpaca data latency
+    "avg_bar_age_s":              240.0,  # seconds — IEX feed has ~4-5 min publication delay; warn if approaching the 300s stale cutoff
     "min_trades_for_win_rate":    5,      # don't report win rate below this sample size
 }
 

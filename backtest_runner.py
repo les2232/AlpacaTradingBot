@@ -40,10 +40,12 @@ from strategy import (
     THRESHOLD_MODE_STATIC_PCT,
     TIME_WINDOW_CHOICES,
     TIME_WINDOW_FULL_DAY,
+    calculate_adx_series,
     calculate_atr_pct_values,
     calculate_atr_percentile_series,
     calculate_hourly_regime_series,
     calculate_opening_range_series,
+    calculate_vwap_series,
     get_capped_breakout_stop_price,
     is_entry_window_open,
     normalize_strategy_mode,
@@ -119,6 +121,8 @@ class PreparedSymbolData:
     bullish_regime: list[bool | None]
     opening_range_high: list[float | None]
     opening_range_low: list[float | None]
+    vwap: list[float | None]
+    adx: list[float | None]
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +174,8 @@ class _SimState:
     bullish_regime_arrs: dict[str, list[bool | None]]
     opening_range_high_arrs: dict[str, list[float | None]]
     opening_range_low_arrs: dict[str, list[float | None]]
+    vwap_arrs: dict[str, list[float | None]]
+    adx_arrs: dict[str, list[float | None]]
     # Mutable position / trade tracking
     pointers: dict[str, int]
     position: dict[str, bool]
@@ -490,6 +496,7 @@ def _prepare_symbol_data(symbol: str, sdf: pd.DataFrame) -> PreparedSymbolData:
     highs = sdf["high"].tolist()
     lows = sdf["low"].tolist()
     closes = sdf["close"].tolist()
+    volumes = sdf["volume"].tolist()
     opening_range_high, opening_range_low = calculate_opening_range_series(timestamps, highs, lows)
     return PreparedSymbolData(
         symbol=symbol,
@@ -499,7 +506,7 @@ def _prepare_symbol_data(symbol: str, sdf: pd.DataFrame) -> PreparedSymbolData:
         highs=highs,
         lows=lows,
         closes=closes,
-        volumes=sdf["volume"].tolist(),
+        volumes=volumes,
         day_keys=day_keys,
         is_eod=is_eod,
         atr_pct=calculate_atr_pct_values(highs, lows, closes),
@@ -512,6 +519,8 @@ def _prepare_symbol_data(symbol: str, sdf: pd.DataFrame) -> PreparedSymbolData:
         ),
         opening_range_high=opening_range_high,
         opening_range_low=opening_range_low,
+        vwap=calculate_vwap_series(timestamps, highs, lows, closes, volumes),
+        adx=calculate_adx_series(highs, lows, closes),
     )
 
 
@@ -800,6 +809,10 @@ def _prepare_backtest_inputs(
     atr_multiple: float,
     atr_percentile_threshold: float,
     regime_filter_enabled: bool,
+    vwap_z_entry_threshold: float = 0.0,
+    vwap_z_stop_atr_multiple: float = 2.0,
+    min_atr_percentile: float = 0.0,
+    max_adx_threshold: float = 0.0,
 ) -> _BacktestInputs:
     """Normalize all mode strings, load the dataset, validate symbol strategy modes, and build Strategy objects."""
     time_window_mode = normalize_time_window_mode(time_window_mode)
@@ -845,6 +858,10 @@ def _prepare_backtest_inputs(
             sma_stop_pct=sma_stop_pct,
             mean_reversion_trend_filter=mean_reversion_trend_filter,
             mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
+            vwap_z_entry_threshold=vwap_z_entry_threshold,
+            vwap_z_stop_atr_multiple=vwap_z_stop_atr_multiple,
+            min_atr_percentile=min_atr_percentile,
+            max_adx_threshold=max_adx_threshold,
         ))
         for symbol in resolved_symbols
     }
@@ -957,6 +974,8 @@ def _initialize_simulation_state(
     bullish_regime_arrs: dict[str, list[bool | None]] = {}
     opening_range_high_arrs: dict[str, list[float | None]] = {}
     opening_range_low_arrs: dict[str, list[float | None]] = {}
+    vwap_arrs: dict[str, list[float | None]] = {}
+    adx_arrs:  dict[str, list[float | None]] = {}
 
     for symbol in symbols:
         sdf = df[df["symbol"] == symbol].sort_values("timestamp").reset_index(drop=True)
@@ -982,6 +1001,10 @@ def _initialize_simulation_state(
         opening_range_high_arrs[symbol], opening_range_low_arrs[symbol] = calculate_opening_range_series(
             timestamp_arrs_sym, high_arrs_sym, low_arrs_sym,
         )
+        vwap_arrs[symbol] = calculate_vwap_series(
+            timestamp_arrs_sym, high_arrs_sym, low_arrs_sym, close_arrs[symbol], volume_arrs[symbol],
+        )
+        adx_arrs[symbol] = calculate_adx_series(high_arrs_sym, low_arrs_sym, close_arrs[symbol])
 
     return _SimState(
         symbols_dfs=symbols_dfs,
@@ -995,6 +1018,8 @@ def _initialize_simulation_state(
         bullish_regime_arrs=bullish_regime_arrs,
         opening_range_high_arrs=opening_range_high_arrs,
         opening_range_low_arrs=opening_range_low_arrs,
+        vwap_arrs=vwap_arrs,
+        adx_arrs=adx_arrs,
         pointers={s: 0 for s in symbols},
         position={s: False for s in symbols},
         entry_price={s: 0.0 for s in symbols},
@@ -1295,6 +1320,16 @@ def _process_bar(
         gap_pct=state.breakout_day_gap_pct[symbol],
         trend_sma=trend_sma,
         trend_sma_slope=trend_sma_slope,
+        vwap=(
+            state.vwap_arrs[symbol][p]
+            if symbol_strategy.config.vwap_z_entry_threshold > 0
+            else None
+        ),
+        adx=(
+            state.adx_arrs[symbol][p]
+            if symbol_strategy.config.max_adx_threshold > 0
+            else None
+        ),
     )
 
     has_next_bar = p + 1 < len(state.symbols_dfs[symbol])
@@ -1495,6 +1530,10 @@ def run_backtest(
     ml_retrain_every_bars: int = DEFAULT_ML_RETRAIN_EVERY_BARS,
     ml_probability_buy: float = DEFAULT_ML_PROBABILITY_BUY,
     ml_probability_sell: float = DEFAULT_ML_PROBABILITY_SELL,
+    vwap_z_entry_threshold: float = 0.0,
+    vwap_z_stop_atr_multiple: float = 2.0,
+    min_atr_percentile: float = 0.0,
+    max_adx_threshold: float = 0.0,
 ) -> dict:
     total_start = perf_counter()
 
@@ -1526,6 +1565,10 @@ def run_backtest(
         atr_multiple=atr_multiple,
         atr_percentile_threshold=atr_percentile_threshold,
         regime_filter_enabled=regime_filter_enabled,
+        vwap_z_entry_threshold=vwap_z_entry_threshold,
+        vwap_z_stop_atr_multiple=vwap_z_stop_atr_multiple,
+        min_atr_percentile=min_atr_percentile,
+        max_adx_threshold=max_adx_threshold,
     )
     load_seconds = perf_counter() - load_start
 
@@ -2503,6 +2546,304 @@ def _print_regime_results(results_list: list[dict]) -> None:
         _print_single_result(result)
 
 
+# ---------------------------------------------------------------------------
+# Walk-forward validation
+# ---------------------------------------------------------------------------
+
+def _validate_wf_args(
+    train_days: int,
+    test_days: int,
+    step_days: int,
+    has_regime_specs: bool,
+    has_sweep_lists: bool,
+) -> None:
+    """Raise ValueError for any walk-forward argument that would produce unsafe or ambiguous results."""
+    if train_days <= 0:
+        raise ValueError(f"--wf-train-days must be > 0, got {train_days}.")
+    if test_days <= 0:
+        raise ValueError(f"--wf-test-days must be > 0, got {test_days}.")
+    if step_days <= 0:
+        raise ValueError(f"--wf-step-days must be > 0, got {step_days}.")
+
+    if step_days < test_days:
+        raise ValueError(
+            f"--wf-step-days ({step_days}) is less than --wf-test-days ({test_days}). "
+            "This would create overlapping OOS windows: consecutive test periods would share "
+            "trading days, making the out-of-sample evaluation invalid. "
+            "Set --wf-step-days >= --wf-test-days to ensure each OOS window is independent."
+        )
+
+    if has_regime_specs:
+        raise ValueError(
+            "--regime conflicts with --walk-forward. Walk-forward manages its own date windows; "
+            "use --start-date / --end-date to restrict the dataset range instead."
+        )
+
+    if has_sweep_lists:
+        raise ValueError(
+            "Parameter sweep flags (--strategy-mode-list, --sma-bars-list, etc.) cannot be "
+            "combined with --walk-forward. Walk-forward evaluates one fixed configuration across "
+            "time windows. Run each configuration separately."
+        )
+
+
+def _get_trading_days(dataset_path: Path) -> list[str]:
+    """Return sorted unique trading day strings (YYYY-MM-DD ET) from the dataset."""
+    df, _ = load_dataset(dataset_path)
+    df = df.copy()
+    df["_date_et"] = pd.to_datetime(df["timestamp"]).dt.tz_convert("America/New_York").dt.date
+    return sorted({str(d) for d in df["_date_et"].unique()})
+
+
+def _generate_walk_forward_windows(
+    trading_days: list[str],
+    train_days: int,
+    test_days: int,
+    step_days: int,
+) -> list[dict]:
+    """Slice trading_days into IS/OOS windows.
+
+    Each window is a dict with train_start, train_end, test_start, test_end
+    (all YYYY-MM-DD strings) and window_idx (1-based).
+    Windows are non-overlapping in the OOS period; IS windows may overlap when
+    step_days < train_days.
+    """
+    windows = []
+    n = len(trading_days)
+    offset = 0
+    while True:
+        train_end_idx = offset + train_days - 1
+        test_start_idx = offset + train_days
+        test_end_idx = offset + train_days + test_days - 1
+        if test_end_idx >= n:
+            break
+        windows.append({
+            "window_idx": len(windows) + 1,
+            "train_start": trading_days[offset],
+            "train_end": trading_days[train_end_idx],
+            "test_start": trading_days[test_start_idx],
+            "test_end": trading_days[test_end_idx],
+        })
+        offset += step_days
+    return windows
+
+
+def _wf_metric_line(r: dict) -> str:
+    pf = r.get("profit_factor", 0.0)
+    pf_str = f"{pf:.3f}" if pf != float("inf") else "  inf"
+    return (
+        f"trades={r.get('total_trades', 0):>3}  "
+        f"win%={r.get('win_rate', 0.0):>5.1f}  "
+        f"PF={pf_str}  "
+        f"PnL=${r.get('realized_pnl', 0.0):>8.2f}  "
+        f"ret%={r.get('total_return_pct', 0.0):>+7.3f}  "
+        f"sharpe={r.get('sharpe_ratio', 0.0):>5.2f}  "
+        f"maxDD={r.get('max_drawdown_pct', 0.0):>5.2f}%"
+    )
+
+
+def _compute_wf_summary(window_results: list[dict]) -> dict:
+    """Aggregate OOS metrics across all walk-forward windows."""
+    oos = [w["oos"] for w in window_results]
+
+    def _mean(xs: list[float]) -> float:
+        return sum(xs) / len(xs) if xs else 0.0
+
+    def _median(xs: list[float]) -> float:
+        if not xs:
+            return 0.0
+        s = sorted(xs)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+    pfs = [r.get("profit_factor", 0.0) for r in oos if r.get("profit_factor", 0.0) != float("inf")]
+    pnls = [r.get("realized_pnl", 0.0) for r in oos]
+    trades = [r.get("total_trades", 0) for r in oos]
+    win_rates = [r.get("win_rate", 0.0) for r in oos]
+    sharpes = [r.get("sharpe_ratio", 0.0) for r in oos]
+    returns = [r.get("total_return_pct", 0.0) for r in oos]
+    drawdowns = [r.get("max_drawdown_pct", 0.0) for r in oos]
+
+    all_wins = [p for r in oos for p in r.get("winning_pnls", [])]
+    all_losses = [p for r in oos for p in r.get("losing_pnls", [])]
+    gross_profit = sum(p for p in all_wins if p > 0)
+    gross_loss = abs(sum(p for p in all_losses if p < 0))
+    combined_pf = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+
+    profitable = sum(1 for p in pnls if p > 0)
+    best_idx = max(range(len(oos)), key=lambda i: pnls[i])
+    worst_idx = min(range(len(oos)), key=lambda i: pnls[i])
+
+    return {
+        "total_windows": len(window_results),
+        "profitable_windows": profitable,
+        "losing_windows": len(window_results) - profitable,
+        "combined_oos_profit_factor": combined_pf,
+        "mean_oos_profit_factor": _mean(pfs),
+        "median_oos_profit_factor": _median(pfs),
+        "total_oos_pnl": sum(pnls),
+        "mean_oos_pnl": _mean(pnls),
+        "total_oos_trades": sum(trades),
+        "mean_oos_win_rate": _mean(win_rates),
+        "mean_oos_sharpe": _mean(sharpes),
+        "mean_oos_return_pct": _mean(returns),
+        "mean_oos_max_drawdown_pct": _mean(drawdowns),
+        "best_window_idx": window_results[best_idx]["window_idx"],
+        "best_window_oos_pnl": pnls[best_idx],
+        "worst_window_idx": window_results[worst_idx]["window_idx"],
+        "worst_window_oos_pnl": pnls[worst_idx],
+    }
+
+
+def _print_wf_summary(summary: dict) -> None:
+    sep = "=" * 66
+    print(f"\n{sep}")
+    print("WALK-FORWARD VALIDATION -- OUT-OF-SAMPLE SUMMARY")
+    print(sep)
+    n = summary["total_windows"]
+    profitable = summary["profitable_windows"]
+    print(f"  Windows:                {n}")
+    print(f"  Profitable OOS windows: {profitable}/{n}  ({profitable/n*100:.0f}%)")
+    print(f"  Losing OOS windows:     {summary['losing_windows']}/{n}")
+    print()
+    cpf = summary["combined_oos_profit_factor"]
+    cpf_str = f"{cpf:.3f}" if cpf != float("inf") else "inf"
+    print(f"  Combined OOS PF:        {cpf_str}")
+    print(f"  Mean OOS PF:            {summary['mean_oos_profit_factor']:.3f}")
+    print(f"  Median OOS PF:          {summary['median_oos_profit_factor']:.3f}")
+    print()
+    print(f"  Total OOS PnL:          ${summary['total_oos_pnl']:.2f}")
+    print(f"  Mean OOS PnL/window:    ${summary['mean_oos_pnl']:.2f}")
+    print(f"  Total OOS trades:       {summary['total_oos_trades']}")
+    print(f"  Mean OOS win rate:      {summary['mean_oos_win_rate']:.1f}%")
+    print(f"  Mean OOS Sharpe:        {summary['mean_oos_sharpe']:.2f}")
+    print(f"  Mean OOS return:        {summary['mean_oos_return_pct']:+.3f}%")
+    print(f"  Mean OOS max drawdown:  {summary['mean_oos_max_drawdown_pct']:.2f}%")
+    print()
+    print(f"  Best OOS window:  #{summary['best_window_idx']}  (PnL ${summary['best_window_oos_pnl']:.2f})")
+    print(f"  Worst OOS window: #{summary['worst_window_idx']}  (PnL ${summary['worst_window_oos_pnl']:.2f})")
+    print()
+    pnl_consistent = profitable / max(1, n) >= 0.6
+    pf_ok = summary["combined_oos_profit_factor"] >= 1.2
+    print("  Assessment:")
+    print(f"    Profitable in >=60% of OOS windows: {'YES' if pnl_consistent else 'NO '}")
+    print(f"    Combined OOS profit factor >= 1.2:  {'YES' if pf_ok else 'NO '}")
+    if pnl_consistent and pf_ok:
+        verdict = "OOS robustness confirmed. Consider promotion."
+    elif pnl_consistent or pf_ok:
+        verdict = "Partial OOS robustness. Review carefully before promoting."
+    else:
+        verdict = "No OOS robustness. Do not promote this config."
+    print(f"    --> {verdict}")
+    print(sep)
+
+
+def _write_wf_outputs(window_results: list[dict], summary: dict, output_csv: str | None) -> None:
+    """Write walk-forward windows CSV and summary JSON."""
+    import csv as _csv
+
+    if output_csv:
+        out_dir = Path(output_csv).parent
+        stem = Path(output_csv).stem
+    else:
+        out_dir = Path("results")
+        stem = "walk_forward"
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for w in window_results:
+        for segment, r in (("is", w["is"]), ("oos", w["oos"])):
+            pf = r.get("profit_factor", 0.0)
+            rows.append({
+                "window": w["window_idx"],
+                "segment": segment,
+                "train_start": w["train_start"],
+                "train_end": w["train_end"],
+                "test_start": w["test_start"],
+                "test_end": w["test_end"],
+                "trades": r.get("total_trades", 0),
+                "win_rate": round(r.get("win_rate", 0.0), 2),
+                "profit_factor": round(pf, 4) if pf != float("inf") else None,
+                "realized_pnl": round(r.get("realized_pnl", 0.0), 2),
+                "total_return_pct": round(r.get("total_return_pct", 0.0), 4),
+                "sharpe_ratio": round(r.get("sharpe_ratio", 0.0), 4),
+                "max_drawdown_pct": round(r.get("max_drawdown_pct", 0.0), 4),
+            })
+
+    windows_csv = out_dir / f"{stem}_windows.csv"
+    if rows:
+        with open(windows_csv, "w", newline="") as f:
+            writer = _csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"Walk-forward windows written to {windows_csv}")
+
+    summary_json = out_dir / f"{stem}_summary.json"
+    with open(summary_json, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"Walk-forward summary written to {summary_json}")
+
+
+def run_walk_forward(
+    dataset_path: Path,
+    train_days: int,
+    test_days: int,
+    step_days: int,
+    symbols: list[str] | None,
+    output_csv: str | None,
+    **backtest_kwargs: Any,
+) -> None:
+    """Orchestrate walk-forward validation and print/write results."""
+    print(f"\nLoading dataset to determine trading days: {dataset_path}")
+    trading_days = _get_trading_days(dataset_path)
+    print(f"Dataset spans {len(trading_days)} trading days: {trading_days[0]} -> {trading_days[-1]}")
+
+    windows = _generate_walk_forward_windows(trading_days, train_days, test_days, step_days)
+    if not windows:
+        raise ValueError(
+            f"Dataset has {len(trading_days)} trading days but walk-forward requires at least "
+            f"{train_days + test_days} (train={train_days} + test={test_days}). "
+            "Use a larger dataset or smaller window sizes."
+        )
+
+    strategy_mode = backtest_kwargs.get("strategy_mode", "?")
+    oos_overlap_note = "non-overlapping OOS" if step_days >= test_days else "OVERLAPPING OOS (unsafe)"
+    print(f"\nWalk-forward config: train={train_days}d  test={test_days}d  step={step_days}d  "
+          f"windows={len(windows)}  strategy={strategy_mode}  [{oos_overlap_note}]")
+    print("=" * 66)
+
+    window_results = []
+    for w in windows:
+        print(f"\nWindow {w['window_idx']}/{len(windows)}")
+        print(f"  IS:  {w['train_start']} -> {w['train_end']}  ({train_days} trading days)")
+        print(f"  OOS: {w['test_start']} -> {w['test_end']}  ({test_days} trading days)")
+
+        is_result = run_backtest(
+            dataset_path=dataset_path,
+            symbols=symbols,
+            start_date=w["train_start"],
+            end_date=w["train_end"],
+            **backtest_kwargs,
+        )
+        oos_result = run_backtest(
+            dataset_path=dataset_path,
+            symbols=symbols,
+            start_date=w["test_start"],
+            end_date=w["test_end"],
+            **backtest_kwargs,
+        )
+
+        print(f"  IS:  {_wf_metric_line(is_result)}")
+        print(f"  OOS: {_wf_metric_line(oos_result)}")
+
+        window_results.append({**w, "is": is_result, "oos": oos_result})
+
+    summary = _compute_wf_summary(window_results)
+    _print_wf_summary(summary)
+    _write_wf_outputs(window_results, summary, output_csv)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a backtest on a historical dataset.")
     parser.add_argument("--dataset", required=True, help="Path to dataset directory")
@@ -2573,6 +2914,30 @@ def main() -> None:
     parser.add_argument("--slippage-per-share", type=float, default=0.05)
     parser.add_argument("--starting-capital", type=float, default=DEFAULT_STARTING_CAPITAL)
     parser.add_argument("--position-size", type=float, default=DEFAULT_POSITION_SIZE)
+    parser.add_argument(
+        "--vwap-z-entry-threshold",
+        type=float,
+        default=0.0,
+        help="VWAP z-score magnitude required to trigger entry (default: 0 = disabled, e.g. 2.0).",
+    )
+    parser.add_argument(
+        "--vwap-z-stop-atr-multiple",
+        type=float,
+        default=2.0,
+        help="ATR multiple used as stop distance for VWAP z-score entries (default: 2.0).",
+    )
+    parser.add_argument(
+        "--min-atr-percentile",
+        type=float,
+        default=0.0,
+        help="Skip entry if ATR percentile is below this threshold (default: 0 = disabled, e.g. 30).",
+    )
+    parser.add_argument(
+        "--max-adx-threshold",
+        type=float,
+        default=0.0,
+        help="Skip entry if ADX is above this threshold (default: 0 = disabled, e.g. 25).",
+    )
     parser.add_argument("--output-csv", help="CSV output path for sweep results")
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
@@ -2580,6 +2945,32 @@ def main() -> None:
         "--regime",
         action="append",
         help="Named regime in NAME:YYYY-MM-DD:YYYY-MM-DD format. Repeat for multiple ranges.",
+    )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Run walk-forward validation instead of a single backtest.",
+    )
+    parser.add_argument(
+        "--wf-train-days",
+        type=int,
+        default=60,
+        metavar="N",
+        help="Number of in-sample trading days per walk-forward window (default: 60).",
+    )
+    parser.add_argument(
+        "--wf-test-days",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Number of out-of-sample trading days per walk-forward window (default: 20).",
+    )
+    parser.add_argument(
+        "--wf-step-days",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Step size in trading days between walk-forward windows (default: 20).",
     )
 
     args = parser.parse_args()
@@ -2709,7 +3100,51 @@ def main() -> None:
         ml_retrain_every_bars=args.ml_retrain_every_bars,
         ml_probability_buy=args.ml_probability_buy,
         ml_probability_sell=args.ml_probability_sell,
+        vwap_z_entry_threshold=args.vwap_z_entry_threshold,
+        vwap_z_stop_atr_multiple=args.vwap_z_stop_atr_multiple,
+        min_atr_percentile=args.min_atr_percentile,
+        max_adx_threshold=args.max_adx_threshold,
     )
+
+    if args.walk_forward:
+        _sweep_list_flags = (
+            args.sma_bars_list
+            or args.strategy_mode_list
+            or args.threshold_mode_list
+            or args.entry_threshold_pct_list
+            or args.atr_multiple_list
+            or args.atr_percentile_threshold_list
+            or args.time_window_mode_list
+            or args.regime_filter_list
+            or args.mean_reversion_exit_style_list
+            or args.breakout_exit_style_list
+            or args.mean_reversion_max_atr_percentile_list
+        )
+        _validate_wf_args(
+            train_days=args.wf_train_days,
+            test_days=args.wf_test_days,
+            step_days=args.wf_step_days,
+            has_regime_specs=bool(args.regime),
+            has_sweep_lists=bool(_sweep_list_flags),
+        )
+        run_walk_forward(
+            dataset_path=dataset_path,
+            train_days=args.wf_train_days,
+            test_days=args.wf_test_days,
+            step_days=args.wf_step_days,
+            symbols=args.symbols,
+            output_csv=args.output_csv,
+            sma_bars=args.sma_bars,
+            entry_threshold_pct=args.entry_threshold_pct,
+            threshold_mode=args.threshold_mode,
+            atr_multiple=args.atr_multiple,
+            atr_percentile_threshold=args.atr_percentile_threshold,
+            time_window_mode=args.time_window_mode,
+            regime_filter_enabled=args.regime_filter_enabled,
+            symbol_strategy_modes=symbol_strategy_map or None,
+            **common_kwargs,
+        )
+        return
 
     if (
         args.sma_bars_list

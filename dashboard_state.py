@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from avatar import generate_near_miss_narration, generate_trade_narration
 from storage import BotStorage
 from symbol_state import format_symbol_list, normalize_symbols, symbols_match
 
@@ -144,6 +145,49 @@ class PersistedStartupConfig:
 
 
 @dataclass(frozen=True)
+class PersistedNarration:
+    timestamp_utc: str | None
+    symbol: str
+    narration: str
+    event_type: str  # "signal" | "risk_block" | "exit"
+
+
+@dataclass(frozen=True)
+class PersistedNearMiss:
+    timestamp_utc: str | None
+    symbol: str
+    narration: str
+    rejection: str | None  # "trend_filter" | "atr_filter" | other
+
+
+@dataclass(frozen=True)
+class DrilldownEvent:
+    """Normalised view of one decision event for the drilldown panel."""
+    timestamp_utc: str | None
+    symbol: str
+    event_type: str          # "signal.evaluated" | "risk.check" | "position.closed"
+    action: str              # "BUY" | "SELL" | "HOLD" | ""
+    strategy_mode: str | None
+    allowed: bool | None     # risk.check only
+    block_reason: str | None
+    rejection: str | None    # signal.evaluated rejection key
+    trend_filter: str | None
+    atr_filter: str | None
+    above_trend_sma: bool | None
+    deviation_pct: float | None
+    atr_pct: float | None
+    atr_percentile: float | None
+    ml_prob: float | None
+    pnl_usd: float | None    # position.closed only
+    exit_reason: str | None  # position.closed only
+    bar_close: float | None
+    sma: float | None
+    volume_ratio: float | None
+    window_open: bool | None
+    holding: bool | None
+
+
+@dataclass(frozen=True)
 class DashboardState:
     startup_config: PersistedStartupConfig | None
     storage: BotStorage
@@ -161,6 +205,9 @@ class DashboardState:
     latest_signal_rows: tuple[PersistedSignalDecision, ...] = ()
     latest_cycle_risk_checks: tuple[PersistedRiskCheck, ...] = ()
     session_first_prices: dict[str, float] = field(default_factory=dict)
+    recent_narrations: tuple[PersistedNarration, ...] = ()
+    recent_near_misses: tuple[PersistedNearMiss, ...] = ()
+    drilldown_candidates: tuple[DrilldownEvent, ...] = ()
 
 
 def _log_root() -> Path:
@@ -292,12 +339,16 @@ def _load_feed_status() -> str:
     if log_dir is None:
         return "no persisted logs yet"
     stale_warning = _load_latest_jsonl_event(log_dir / "bars.jsonl", "bar.stale_warning")
-    if stale_warning is not None:
+    bar_received = _load_latest_jsonl_event(log_dir / "bars.jsonl", "bar.received")
+    # Use whichever event is more recent so a pre-market stale_warning doesn't
+    # persist as the status after fresh bars arrive during the session.
+    stale_ts = str(stale_warning.get("ts", "")) if stale_warning else ""
+    received_ts = str(bar_received.get("ts", "")) if bar_received else ""
+    if stale_warning is not None and stale_ts >= received_ts:
         age_s = stale_warning.get("bar_age_s")
         if age_s is not None:
             return f"persisted bar stale ({float(age_s):.0f}s late)"
         return "persisted bar stale"
-    bar_received = _load_latest_jsonl_event(log_dir / "bars.jsonl", "bar.received")
     if bar_received is not None:
         age_s = bar_received.get("bar_age_s")
         if age_s is not None:
@@ -675,6 +726,233 @@ def _load_latest_signal_rows() -> tuple[PersistedSignalDecision, ...]:
     return tuple(sorted(latest_by_symbol.values(), key=lambda item: item.symbol))
 
 
+def _load_recent_narrations(limit: int = 10) -> tuple[PersistedNarration, ...]:
+    """
+    Load and narrate the most recent actionable events from today's JSONL logs.
+
+    Narrates:
+        - BUY / SELL signals that cleared all filters (signals.jsonl)
+        - Risk checks that blocked a trade (risk.jsonl)
+        - Position exits (positions.jsonl)
+
+    HOLD signals are excluded — they are too frequent and low-value for the panel.
+    """
+    log_dir = _latest_log_dir()
+    if log_dir is None:
+        return ()
+
+    raw_events: list[dict] = []
+
+    # Fetch recent signal events; filter to only actionable BUY/SELL decisions
+    for payload in _load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=60):
+        if str(payload.get("action", "")).upper() in {"BUY", "SELL"}:
+            raw_events.append(payload)
+
+    # Fetch risk blocks only
+    for payload in _load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}, limit=40):
+        if payload.get("allowed") is False:
+            raw_events.append(payload)
+
+    # Fetch position closes
+    raw_events.extend(
+        _load_jsonl_events(log_dir / "positions.jsonl", {"position.closed"}, limit=20)
+    )
+
+    # Sort newest first
+    def _ts_key(p: dict) -> datetime:
+        return _parse_iso_utc(str(p.get("ts", ""))) or datetime.min.replace(tzinfo=timezone.utc)
+
+    raw_events.sort(key=_ts_key, reverse=True)
+
+    results: list[PersistedNarration] = []
+    seen: set[tuple[str | None, str, str]] = set()
+
+    for payload in raw_events:
+        event_type = str(payload.get("event", ""))
+        symbol = str(payload.get("symbol", "")).upper()
+        ts_str = str(payload.get("ts", "")) or None
+
+        dedup_key = (ts_str, symbol, event_type)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        narration = generate_trade_narration(payload)
+
+        if event_type == "signal.evaluated":
+            kind = "signal"
+        elif event_type == "risk.check":
+            kind = "risk_block"
+        elif event_type == "position.closed":
+            kind = "exit"
+        else:
+            kind = "other"
+
+        results.append(PersistedNarration(
+            timestamp_utc=ts_str,
+            symbol=symbol,
+            narration=narration,
+            event_type=kind,
+        ))
+
+        if len(results) >= limit:
+            break
+
+    return tuple(results)
+
+
+def _qualifies_as_near_miss(event: dict) -> bool:
+    """
+    Return True if a signal.evaluated event represents a genuine near-miss:
+    a setup where the bot evaluated an entry but a specific filter rejected it.
+
+    Excludes plain "no_signal" HOLD events — those have no directional intent
+    and are not useful to surface as near-misses.
+    """
+    if str(event.get("action", "")).upper() != "HOLD":
+        return False
+    rejection = str(event.get("rejection") or "").lower().strip()
+    trend_filter = str(event.get("trend_filter") or "").lower().strip()
+    atr_filter = str(event.get("atr_filter") or "").lower().strip()
+    return (
+        rejection in {"trend_filter", "atr_filter"}
+        or trend_filter == "reject"
+        or atr_filter == "reject"
+    )
+
+
+def _load_recent_near_misses(limit: int = 5) -> tuple[PersistedNearMiss, ...]:
+    """
+    Load the most recent near-miss signal events from today's signals.jsonl.
+
+    A near-miss is a HOLD evaluation where trend_filter or atr_filter
+    explicitly rejected a potential entry — distinct from a plain "no signal"
+    hold where there was no directional setup at all.
+
+    Deduplicates by (decision_ts, symbol) so each symbol appears at most once
+    per bar cycle in the output.
+    """
+    log_dir = _latest_log_dir()
+    if log_dir is None:
+        return ()
+
+    raw: list[dict] = []
+    for payload in _load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=120):
+        if _qualifies_as_near_miss(payload):
+            raw.append(payload)
+
+    # Sort newest first
+    def _ts_key(p: dict) -> datetime:
+        return _parse_iso_utc(str(p.get("ts", ""))) or datetime.min.replace(tzinfo=timezone.utc)
+
+    raw.sort(key=_ts_key, reverse=True)
+
+    results: list[PersistedNearMiss] = []
+    # Deduplicate: one entry per (decision_ts, symbol) — keep the newest occurrence
+    seen: set[tuple[str | None, str]] = set()
+
+    for payload in raw:
+        symbol = str(payload.get("symbol", "")).upper()
+        decision_ts = str(payload.get("decision_ts", "")) or None
+        ts_str = str(payload.get("ts", "")) or None
+
+        dedup_key = (decision_ts, symbol)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        rejection = str(payload.get("rejection") or "").lower().strip() or None
+        narration = generate_near_miss_narration(payload)
+
+        results.append(PersistedNearMiss(
+            timestamp_utc=ts_str,
+            symbol=symbol,
+            narration=narration,
+            rejection=rejection,
+        ))
+
+        if len(results) >= limit:
+            break
+
+    return tuple(results)
+
+
+def _load_drilldown_candidates(
+    strategy_mode: str | None,
+    limit: int = 40,
+) -> tuple[DrilldownEvent, ...]:
+    """
+    Load recent decision events from today's JSONL logs and normalise them
+    into DrilldownEvent instances for the drilldown inspector panel.
+
+    Covers signal.evaluated, risk.check, and position.closed events.
+    Returns newest-first, deduplicated by (ts, symbol, event_type).
+    """
+    log_dir = _latest_log_dir()
+    if log_dir is None:
+        return ()
+
+    raw: list[dict] = []
+    raw.extend(_load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=60))
+    raw.extend(_load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}, limit=40))
+    raw.extend(_load_jsonl_events(log_dir / "positions.jsonl", {"position.closed"}, limit=20))
+
+    def _ts_key(p: dict) -> datetime:
+        return _parse_iso_utc(str(p.get("ts", ""))) or datetime.min.replace(tzinfo=timezone.utc)
+
+    raw.sort(key=_ts_key, reverse=True)
+
+    results: list[DrilldownEvent] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for payload in raw:
+        event_type = str(payload.get("event", ""))
+        symbol = str(payload.get("symbol", "")).upper()
+        ts_str = str(payload.get("ts", "")) or None
+
+        dedup_key = (ts_str or "", symbol, event_type)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        action = str(payload.get("action", "")).upper()
+        allowed: bool | None = None
+        if event_type == "risk.check":
+            raw_allowed = payload.get("allowed")
+            if raw_allowed is not None:
+                allowed = bool(raw_allowed)
+
+        results.append(DrilldownEvent(
+            timestamp_utc=ts_str,
+            symbol=symbol,
+            event_type=event_type,
+            action=action,
+            strategy_mode=strategy_mode,
+            allowed=allowed,
+            block_reason=str(payload.get("block_reason", "")) or None,
+            rejection=str(payload.get("rejection", "")) or None,
+            trend_filter=str(payload.get("trend_filter", "")) or None,
+            atr_filter=str(payload.get("atr_filter", "")) or None,
+            above_trend_sma=payload.get("above_trend_sma"),
+            deviation_pct=_to_float(payload.get("deviation_pct")),
+            atr_pct=_to_float(payload.get("atr_pct")),
+            atr_percentile=_to_float(payload.get("atr_percentile")),
+            ml_prob=_to_float(payload.get("ml_prob")),
+            pnl_usd=_to_float(payload.get("pnl_usd")),
+            exit_reason=str(payload.get("exit_reason", "")) or None,
+            bar_close=_to_float(payload.get("bar_close")),
+            sma=_to_float(payload.get("sma")),
+            volume_ratio=_to_float(payload.get("volume_ratio")),
+            window_open=payload.get("window_open"),
+            holding=payload.get("holding"),
+        ))
+
+        if len(results) >= limit:
+            break
+
+    return tuple(results)
+
+
 def load_dashboard_state() -> DashboardState:
     startup_configs = _load_startup_configs()
     latest_startup_config = startup_configs[-1] if startup_configs else None
@@ -713,6 +991,10 @@ def load_dashboard_state() -> DashboardState:
     latest_signal_rows = _load_latest_signal_rows()
     latest_cycle_risk_checks = _load_latest_cycle_risk_checks(last_cycle_report)
     session_first_prices = storage.get_session_first_prices(session_id=session_id)
+    recent_narrations = _load_recent_narrations()
+    recent_near_misses = _load_recent_near_misses()
+    _strategy_mode = startup_config.strategy_mode if startup_config is not None else None
+    drilldown_candidates = _load_drilldown_candidates(_strategy_mode)
     return DashboardState(
         startup_config=startup_config,
         storage=storage,
@@ -730,4 +1012,7 @@ def load_dashboard_state() -> DashboardState:
         latest_signal_rows=latest_signal_rows,
         latest_cycle_risk_checks=latest_cycle_risk_checks,
         session_first_prices=session_first_prices,
+        recent_narrations=recent_narrations,
+        recent_near_misses=recent_near_misses,
+        drilldown_candidates=drilldown_candidates,
     )

@@ -1,17 +1,47 @@
 {
-  "operator_note": "Runtime trading settings live here. Keep .env focused on secrets, account mode, and risk values unless you intentionally want this file to override them.",
-  "saved_at": "2026-04-08T00:00:00Z",
+  "saved_at": "2026-04-14T03:53:46Z",
   "source": {
-    "note": "Validated mean-reversion config: IS PF 1.189 → OOS PF 1.431 (Oct 2025–Apr 2026 / Apr–Oct 2025), 15-symbol universe"
+    "dataset": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e",
+    "dataset_symbol_source": "dataset_metadata",
+    "approved": false,
+    "rejection_reasons": [
+      "profit_factor 1.0169 >= 1.2",
+      "total_return_pct 0.4964% >= 2.0%"
+    ]
   },
   "runtime": {
-    "symbols": ["AMD", "TSLA", "GOOGL", "MSFT", "QCOM", "BAC", "C", "WFC", "JPM", "ABBV", "LLY", "HON", "XOM", "COP", "HD"],
+    "symbols": [
+      "ABBV",
+      "AMD",
+      "BAC",
+      "C",
+      "COP",
+      "GOOGL",
+      "HD",
+      "HON",
+      "JPM",
+      "LLY",
+      "MSFT",
+      "QCOM",
+      "TSLA",
+      "WFC",
+      "XOM"
+    ],
     "bar_timeframe_minutes": 15,
     "strategy_mode": "mean_reversion",
     "sma_bars": 20,
     "entry_threshold_pct": 0.002,
-    "mean_reversion_trend_filter": false,
-    "mean_reversion_max_atr_percentile": 80.0,
-    "mean_reversion_exit_style": "sma"
+    "ml_probability_buy": 0.55,
+    "ml_probability_sell": 0.45,
+    "threshold_mode": "static_pct",
+    "atr_multiple": 1.0,
+    "atr_percentile_threshold": 0.0,
+    "time_window_mode": "full_day",
+    "regime_filter_enabled": false,
+    "orb_filter_mode": "none",
+    "breakout_exit_style": "target_1x_stop_low",
+    "breakout_tight_stop_fraction": 0.5,
+    "mean_reversion_exit_style": "sma",
+    "mean_reversion_max_atr_percentile": 80.0
   }
 }
