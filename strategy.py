@@ -19,6 +19,7 @@ STRATEGY_MODE_HYBRID = "hybrid"
 STRATEGY_MODE_BREAKOUT = "breakout"
 STRATEGY_MODE_MEAN_REVERSION = "mean_reversion"
 STRATEGY_MODE_ORB = "orb"
+STRATEGY_MODE_WICK_FADE = "wick_fade"
 STRATEGY_MODE_CHOICES = (
     STRATEGY_MODE_SMA,
     STRATEGY_MODE_ML,
@@ -26,6 +27,7 @@ STRATEGY_MODE_CHOICES = (
     STRATEGY_MODE_BREAKOUT,
     STRATEGY_MODE_MEAN_REVERSION,
     STRATEGY_MODE_ORB,
+    STRATEGY_MODE_WICK_FADE,
 )
 ORB_FILTER_NONE = "none"
 ORB_FILTER_VOLUME_OR_VOLATILITY = "volume_or_volatility"
@@ -573,6 +575,13 @@ class StrategyConfig:
     vwap_z_stop_atr_multiple: float = 2.0  # long stop = entry_price - (mult * ATR)
     min_atr_percentile: float = 20.0  # VWAP MR entry: skip if atr_percentile < this; 0 = disabled
     max_adx_threshold: float = 25.0  # VWAP MR entry: skip if adx >= this (trending); 0 = disabled
+    # Wick-fade parameters
+    wick_fade_min_lower_wick_ratio: float = 0.4   # lower wick / total range must be >= this
+    wick_fade_min_close_position: float = 0.5     # (close - low) / range must be >= this (close in upper half)
+    wick_fade_min_range_pct: float = 0.003        # bar range / close must be >= this (dead tape filter)
+    wick_fade_stop_atr_multiple: float = 1.5      # stop = entry - N * ATR
+    wick_fade_target_atr_multiple: float = 1.0    # target = entry + N * ATR
+    wick_fade_max_hold_bars: int = 4              # force exit after N bars (0 = disabled)
 
 
 @dataclass(frozen=True)
@@ -726,6 +735,12 @@ class Strategy:
         trend_sma_slope: float | None = None,
         vwap: float | None = None,
         adx: float | None = None,
+        bar_high: float | None = None,
+        bar_low: float | None = None,
+        bar_open: float | None = None,
+        wick_fade_stop: float = 0.0,
+        wick_fade_target: float = 0.0,
+        wick_fade_bars_held: int = 0,
     ) -> str:
         mode = normalize_strategy_mode(self.config.strategy_mode)
 
@@ -933,6 +948,39 @@ class Strategy:
                 if price <= hard_stop:
                     return "SELL"
 
+            return "HOLD"
+
+        if mode == STRATEGY_MODE_WICK_FADE:
+            if holding:
+                # Exits run on every held bar regardless of bar geometry.
+                if wick_fade_stop > 0 and price <= wick_fade_stop:
+                    return "SELL"
+                if wick_fade_target > 0 and price >= wick_fade_target:
+                    return "SELL"
+                if self.config.wick_fade_max_hold_bars > 0 and wick_fade_bars_held >= self.config.wick_fade_max_hold_bars:
+                    return "SELL"
+                return "HOLD"
+
+            # Entry: requires valid OHLC and a wick-rejection pattern.
+            if bar_high is None or bar_low is None or bar_open is None:
+                return "HOLD"
+            bar_range = bar_high - bar_low
+            if bar_range <= 0:
+                return "HOLD"
+            bar_range_pct = bar_range / max(price, 1e-9)
+            if bar_range_pct < self.config.wick_fade_min_range_pct:
+                return "HOLD"
+            body_bottom = min(bar_open, price)
+            lower_wick = body_bottom - bar_low
+            lower_wick_ratio = lower_wick / bar_range
+            close_position = (price - bar_low) / bar_range
+            if (
+                lower_wick_ratio >= self.config.wick_fade_min_lower_wick_ratio
+                and close_position >= self.config.wick_fade_min_close_position
+                and time_window_open
+                and self._entry_allowed(atr_percentile)
+            ):
+                return "BUY"
             return "HOLD"
 
         # hybrid mode: require SMA trend confirmation for buys, allow either risk signal for sells

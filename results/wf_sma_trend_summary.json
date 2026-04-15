@@ -1,0 +1,19 @@
+{
+  "total_windows": 3,
+  "profitable_windows": 0,
+  "losing_windows": 3,
+  "combined_oos_profit_factor": 0.8200600270311909,
+  "mean_oos_profit_factor": 0.8278328199888624,
+  "median_oos_profit_factor": 0.8901597435205466,
+  "total_oos_pnl": -1024.979021403165,
+  "mean_oos_pnl": -341.659673801055,
+  "total_oos_trades": 2032,
+  "mean_oos_win_rate": 32.512544675167355,
+  "mean_oos_sharpe": -3.0825765251644808,
+  "mean_oos_return_pct": -3.416596738010709,
+  "mean_oos_max_drawdown_pct": 6.487769313949904,
+  "best_window_idx": 1,
+  "best_window_oos_pnl": -20.13773402334175,
+  "worst_window_idx": 3,
+  "worst_window_oos_pnl": -805.4143816171487
+}

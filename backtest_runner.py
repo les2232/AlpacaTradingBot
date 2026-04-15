@@ -33,6 +33,7 @@ from strategy import (
     STRATEGY_MODE_ML,
     STRATEGY_MODE_ORB,
     STRATEGY_MODE_SMA,
+    STRATEGY_MODE_WICK_FADE,
     Strategy,
     StrategyConfig,
     THRESHOLD_MODE_CHOICES,
@@ -165,6 +166,8 @@ class _SimState:
     # Precomputed per-symbol arrays (read-only after initialization)
     symbols_dfs: dict[str, pd.DataFrame]
     close_arrs: dict[str, list[float]]
+    high_arrs: dict[str, list[float]]
+    low_arrs: dict[str, list[float]]
     volume_arrs: dict[str, list[float]]
     timestamp_str_arrs: dict[str, list[str]]
     day_key_arrs: dict[str, list[pd.Timestamp]]
@@ -188,6 +191,10 @@ class _SimState:
     breakout_range_at_entry: dict[str, float]
     breakout_stored_stop: dict[str, float]
     mean_reversion_target_price: dict[str, float]
+    wick_fade_stop: dict[str, float]
+    wick_fade_target: dict[str, float]
+    wick_fade_bars_held: dict[str, int]
+    wick_fade_signal_atr_pct: dict[str, float]
     pending_buys: dict[str, tuple[float, pd.Timestamp]]
     pending_sells: set[str]
     # ORB per-day state (one trade per symbol per day)
@@ -644,6 +651,9 @@ def _execute_sell(
     breakout_range_at_entry: dict[str, float],
     breakout_stored_stop: dict[str, float],
     mean_reversion_target_price: dict[str, float],
+    wick_fade_stop: dict[str, float],
+    wick_fade_target: dict[str, float],
+    wick_fade_bars_held: dict[str, int],
     latest_mark_price: dict[str, float],
     position: dict[str, bool],
     commission: float,
@@ -679,6 +689,9 @@ def _execute_sell(
     breakout_range_at_entry[symbol] = 0.0
     breakout_stored_stop[symbol] = 0.0
     mean_reversion_target_price[symbol] = 0.0
+    wick_fade_stop[symbol] = 0.0
+    wick_fade_target[symbol] = 0.0
+    wick_fade_bars_held[symbol] = 0
     results["symbol_trade_counts"][symbol] += 1
     results["total_trades"] += 1
     symbol_stat["total_trades"] += 1
@@ -813,6 +826,12 @@ def _prepare_backtest_inputs(
     vwap_z_stop_atr_multiple: float = 2.0,
     min_atr_percentile: float = 0.0,
     max_adx_threshold: float = 0.0,
+    wick_fade_min_lower_wick_ratio: float = 0.4,
+    wick_fade_min_close_position: float = 0.5,
+    wick_fade_min_range_pct: float = 0.003,
+    wick_fade_stop_atr_multiple: float = 1.5,
+    wick_fade_target_atr_multiple: float = 1.0,
+    wick_fade_max_hold_bars: int = 4,
 ) -> _BacktestInputs:
     """Normalize all mode strings, load the dataset, validate symbol strategy modes, and build Strategy objects."""
     time_window_mode = normalize_time_window_mode(time_window_mode)
@@ -862,6 +881,12 @@ def _prepare_backtest_inputs(
             vwap_z_stop_atr_multiple=vwap_z_stop_atr_multiple,
             min_atr_percentile=min_atr_percentile,
             max_adx_threshold=max_adx_threshold,
+            wick_fade_min_lower_wick_ratio=wick_fade_min_lower_wick_ratio,
+            wick_fade_min_close_position=wick_fade_min_close_position,
+            wick_fade_min_range_pct=wick_fade_min_range_pct,
+            wick_fade_stop_atr_multiple=wick_fade_stop_atr_multiple,
+            wick_fade_target_atr_multiple=wick_fade_target_atr_multiple,
+            wick_fade_max_hold_bars=wick_fade_max_hold_bars,
         ))
         for symbol in resolved_symbols
     }
@@ -965,6 +990,8 @@ def _initialize_simulation_state(
     # Precompute per-symbol arrays — avoids repeated pandas overhead in the hot loop
     symbols_dfs: dict[str, pd.DataFrame] = {}
     close_arrs: dict[str, list[float]] = {}
+    high_arrs: dict[str, list[float]] = {}
+    low_arrs: dict[str, list[float]] = {}
     volume_arrs: dict[str, list[float]] = {}
     timestamp_str_arrs: dict[str, list[str]] = {}
     day_key_arrs: dict[str, list[pd.Timestamp]] = {}
@@ -981,9 +1008,11 @@ def _initialize_simulation_state(
         sdf = df[df["symbol"] == symbol].sort_values("timestamp").reset_index(drop=True)
         symbols_dfs[symbol] = sdf
         close_arrs[symbol] = sdf["close"].tolist()
+        high_arrs[symbol] = sdf["high"].tolist()
+        low_arrs[symbol] = sdf["low"].tolist()
         volume_arrs[symbol] = sdf["volume"].tolist()
-        high_arrs_sym = sdf["high"].tolist()
-        low_arrs_sym = sdf["low"].tolist()
+        high_arrs_sym = high_arrs[symbol]
+        low_arrs_sym = low_arrs[symbol]
         timestamp_arrs_sym = [pd.Timestamp(ts) for ts in sdf["timestamp"].tolist()]
         timestamp_str_arrs[symbol] = [str(ts) for ts in timestamp_arrs_sym]
         day_key_arrs[symbol] = [ts.tz_convert("America/New_York").normalize() for ts in timestamp_arrs_sym]
@@ -1009,6 +1038,8 @@ def _initialize_simulation_state(
     return _SimState(
         symbols_dfs=symbols_dfs,
         close_arrs=close_arrs,
+        high_arrs=high_arrs,
+        low_arrs=low_arrs,
         volume_arrs=volume_arrs,
         timestamp_str_arrs=timestamp_str_arrs,
         day_key_arrs=day_key_arrs,
@@ -1031,6 +1062,10 @@ def _initialize_simulation_state(
         breakout_range_at_entry={s: 0.0 for s in symbols},
         breakout_stored_stop={s: 0.0 for s in symbols},
         mean_reversion_target_price={s: 0.0 for s in symbols},
+        wick_fade_stop={s: 0.0 for s in symbols},
+        wick_fade_target={s: 0.0 for s in symbols},
+        wick_fade_bars_held={s: 0 for s in symbols},
+        wick_fade_signal_atr_pct={s: 0.0 for s in symbols},
         pending_buys={},
         pending_sells=set(),
         orb_entry_taken={s: False for s in symbols},
@@ -1129,6 +1164,9 @@ def _handle_pending_orders_at_time(
             breakout_range_at_entry=state.breakout_range_at_entry,
             breakout_stored_stop=state.breakout_stored_stop,
             mean_reversion_target_price=state.mean_reversion_target_price,
+            wick_fade_stop=state.wick_fade_stop,
+            wick_fade_target=state.wick_fade_target,
+            wick_fade_bars_held=state.wick_fade_bars_held,
             latest_mark_price=state.latest_mark_price,
             position=state.position,
             commission=commission,
@@ -1196,6 +1234,13 @@ def _handle_pending_orders_at_time(
                 else fill_price
             )
             state.mean_reversion_target_price[symbol] = (fill_price + current_sma) / 2.0
+        elif symbol_strategy.config.strategy_mode == STRATEGY_MODE_WICK_FADE:
+            signal_atr_pct = state.wick_fade_signal_atr_pct[symbol]
+            atr = signal_atr_pct * fill_price if signal_atr_pct > 0 else fill_price * 0.005
+            cfg = symbol_strategy.config
+            state.wick_fade_stop[symbol] = fill_price - cfg.wick_fade_stop_atr_multiple * atr
+            state.wick_fade_target[symbol] = fill_price + cfg.wick_fade_target_atr_multiple * atr
+            state.wick_fade_bars_held[symbol] = 0
         elif symbol_strategy.config.strategy_mode == STRATEGY_MODE_ORB:
             state.orb_entry_taken[symbol] = True
         state.results["max_concurrent_positions"] = max(
@@ -1260,6 +1305,9 @@ def _process_bar(
 
     if state.position[symbol] and effective_strategy_mode == STRATEGY_MODE_BREAKOUT:
         state.breakout_trailing_high[symbol] = max(state.breakout_trailing_high[symbol], price)
+
+    if state.position[symbol] and effective_strategy_mode == STRATEGY_MODE_WICK_FADE:
+        state.wick_fade_bars_held[symbol] += 1
 
     recent_volumes = volumes[max(0, p - 19): p + 1]
     avg_volume = _mean(recent_volumes) if recent_volumes else 0.0
@@ -1330,6 +1378,12 @@ def _process_bar(
             if symbol_strategy.config.max_adx_threshold > 0
             else None
         ),
+        bar_high=state.high_arrs[symbol][p],
+        bar_low=state.low_arrs[symbol][p],
+        bar_open=float(row["open"]),
+        wick_fade_stop=state.wick_fade_stop[symbol],
+        wick_fade_target=state.wick_fade_target[symbol],
+        wick_fade_bars_held=state.wick_fade_bars_held[symbol],
     )
 
     has_next_bar = p + 1 < len(state.symbols_dfs[symbol])
@@ -1342,6 +1396,8 @@ def _process_bar(
             ),
             row["timestamp"],
         )
+        if effective_strategy_mode == STRATEGY_MODE_WICK_FADE:
+            state.wick_fade_signal_atr_pct[symbol] = atr_pct or 0.0
     elif has_next_bar and action == "SELL" and state.position[symbol]:
         state.pending_sells.add(symbol)
 
@@ -1368,6 +1424,9 @@ def _process_bar(
                 breakout_range_at_entry=state.breakout_range_at_entry,
                 breakout_stored_stop=state.breakout_stored_stop,
                 mean_reversion_target_price=state.mean_reversion_target_price,
+                wick_fade_stop=state.wick_fade_stop,
+                wick_fade_target=state.wick_fade_target,
+                wick_fade_bars_held=state.wick_fade_bars_held,
                 latest_mark_price=state.latest_mark_price,
                 position=state.position,
                 commission=commission,
@@ -1410,6 +1469,9 @@ def _finalize_simulation(
                 breakout_range_at_entry=state.breakout_range_at_entry,
                 breakout_stored_stop=state.breakout_stored_stop,
                 mean_reversion_target_price=state.mean_reversion_target_price,
+                wick_fade_stop=state.wick_fade_stop,
+                wick_fade_target=state.wick_fade_target,
+                wick_fade_bars_held=state.wick_fade_bars_held,
                 latest_mark_price=state.latest_mark_price,
                 position=state.position,
                 commission=commission,
@@ -1534,6 +1596,12 @@ def run_backtest(
     vwap_z_stop_atr_multiple: float = 2.0,
     min_atr_percentile: float = 0.0,
     max_adx_threshold: float = 0.0,
+    wick_fade_min_lower_wick_ratio: float = 0.4,
+    wick_fade_min_close_position: float = 0.5,
+    wick_fade_min_range_pct: float = 0.003,
+    wick_fade_stop_atr_multiple: float = 1.5,
+    wick_fade_target_atr_multiple: float = 1.0,
+    wick_fade_max_hold_bars: int = 4,
 ) -> dict:
     total_start = perf_counter()
 
@@ -1569,6 +1637,12 @@ def run_backtest(
         vwap_z_stop_atr_multiple=vwap_z_stop_atr_multiple,
         min_atr_percentile=min_atr_percentile,
         max_adx_threshold=max_adx_threshold,
+        wick_fade_min_lower_wick_ratio=wick_fade_min_lower_wick_ratio,
+        wick_fade_min_close_position=wick_fade_min_close_position,
+        wick_fade_min_range_pct=wick_fade_min_range_pct,
+        wick_fade_stop_atr_multiple=wick_fade_stop_atr_multiple,
+        wick_fade_target_atr_multiple=wick_fade_target_atr_multiple,
+        wick_fade_max_hold_bars=wick_fade_max_hold_bars,
     )
     load_seconds = perf_counter() - load_start
 
@@ -2938,6 +3012,18 @@ def main() -> None:
         default=0.0,
         help="Skip entry if ADX is above this threshold (default: 0 = disabled, e.g. 25).",
     )
+    parser.add_argument("--wick-fade-min-lower-wick-ratio", type=float, default=0.4,
+                        help="Wick fade: lower wick / bar range threshold (default: 0.4)")
+    parser.add_argument("--wick-fade-min-close-position", type=float, default=0.5,
+                        help="Wick fade: (close - low) / range threshold — close must be in upper half (default: 0.5)")
+    parser.add_argument("--wick-fade-min-range-pct", type=float, default=0.003,
+                        help="Wick fade: min bar range as fraction of price — dead tape filter (default: 0.003)")
+    parser.add_argument("--wick-fade-stop-atr-multiple", type=float, default=1.5,
+                        help="Wick fade: stop = entry - N * ATR (default: 1.5)")
+    parser.add_argument("--wick-fade-target-atr-multiple", type=float, default=1.0,
+                        help="Wick fade: target = entry + N * ATR (default: 1.0)")
+    parser.add_argument("--wick-fade-max-hold-bars", type=int, default=4,
+                        help="Wick fade: force exit after N bars if neither stop nor target hit (default: 4)")
     parser.add_argument("--output-csv", help="CSV output path for sweep results")
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
@@ -3104,6 +3190,12 @@ def main() -> None:
         vwap_z_stop_atr_multiple=args.vwap_z_stop_atr_multiple,
         min_atr_percentile=args.min_atr_percentile,
         max_adx_threshold=args.max_adx_threshold,
+        wick_fade_min_lower_wick_ratio=args.wick_fade_min_lower_wick_ratio,
+        wick_fade_min_close_position=args.wick_fade_min_close_position,
+        wick_fade_min_range_pct=args.wick_fade_min_range_pct,
+        wick_fade_stop_atr_multiple=args.wick_fade_stop_atr_multiple,
+        wick_fade_target_atr_multiple=args.wick_fade_target_atr_multiple,
+        wick_fade_max_hold_bars=args.wick_fade_max_hold_bars,
     )
 
     if args.walk_forward:

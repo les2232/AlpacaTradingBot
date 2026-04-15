@@ -7,6 +7,7 @@ from strategy import (
     MlSignal,
     STRATEGY_MODE_MEAN_REVERSION,
     STRATEGY_MODE_SMA,
+    STRATEGY_MODE_WICK_FADE,
     Strategy,
     StrategyConfig,
     calculate_adx_series,
@@ -810,3 +811,183 @@ class TestMrVwapAdxFilter:
         assert _decide(
             s, price=90.0, vwap=100.0, atr_pct=0.05, atr_percentile=60.0, adx=15.0
         ) == "BUY"
+
+
+# ---------------------------------------------------------------------------
+# Wick-fade strategy tests
+# ---------------------------------------------------------------------------
+
+_DUMMY_ML = MlSignal(
+    probability_up=0.5, confidence=0.0, training_rows=0,
+    model_age_seconds=0.0, feature_names=(),
+    buy_threshold=0.55, sell_threshold=0.45,
+    validation_rows=0, model_name="dummy",
+)
+
+
+def _wf_strategy(**kwargs) -> Strategy:
+    defaults = dict(
+        strategy_mode=STRATEGY_MODE_WICK_FADE,
+        wick_fade_min_lower_wick_ratio=0.4,
+        wick_fade_min_close_position=0.5,
+        wick_fade_min_range_pct=0.003,
+        wick_fade_stop_atr_multiple=1.5,
+        wick_fade_target_atr_multiple=1.0,
+        wick_fade_max_hold_bars=4,
+    )
+    defaults.update(kwargs)
+    return Strategy(StrategyConfig(**defaults))
+
+
+def _wf_decide(
+    s: Strategy,
+    *,
+    close: float,
+    high: float,
+    low: float,
+    open_: float,
+    holding: bool = False,
+    wick_fade_stop: float = 0.0,
+    wick_fade_target: float = 0.0,
+    wick_fade_bars_held: int = 0,
+    time_window_open: bool = True,
+    atr_percentile: float | None = None,
+) -> str:
+    return s.decide_action(
+        close, sma=close, ml_signal=_DUMMY_ML, holding=holding,
+        time_window_open=time_window_open,
+        atr_percentile=atr_percentile,
+        bar_high=high, bar_low=low, bar_open=open_,
+        wick_fade_stop=wick_fade_stop,
+        wick_fade_target=wick_fade_target,
+        wick_fade_bars_held=wick_fade_bars_held,
+    )
+
+
+class TestWickFadeEntry:
+    def test_strong_lower_wick_triggers_buy(self):
+        """Classic rejection candle: large lower wick, close near high."""
+        s = _wf_strategy()
+        # Bar: low=95, open=99, close=100, high=101 → range=6
+        # lower_wick = min(99,100) - 95 = 4  →  ratio = 4/6 = 0.667 >= 0.4 ✓
+        # close_position = (100-95)/6 = 0.833 >= 0.5 ✓
+        assert _wf_decide(s, close=100.0, high=101.0, low=95.0, open_=99.0) == "BUY"
+
+    def test_no_lower_wick_no_buy(self):
+        """Bearish engulfing — close at low, no lower wick."""
+        s = _wf_strategy()
+        # Bar: low=95, open=101, close=95, high=101 → range=6
+        # lower_wick = min(101,95) - 95 = 0  →  ratio = 0 < 0.4
+        assert _wf_decide(s, close=95.0, high=101.0, low=95.0, open_=101.0) == "HOLD"
+
+    def test_close_in_lower_half_no_buy(self):
+        """Wick present but close is in lower half of range — no rejection confirmed."""
+        s = _wf_strategy()
+        # Bar: low=95, open=99, close=97, high=101 → range=6
+        # lower_wick = min(99,97) - 95 = 2  →  ratio = 2/6 = 0.333 < 0.4
+        assert _wf_decide(s, close=97.0, high=101.0, low=95.0, open_=99.0) == "HOLD"
+
+    def test_wick_ratio_threshold_boundary(self):
+        """Exactly at min_lower_wick_ratio should trigger; just below should not."""
+        s = _wf_strategy(wick_fade_min_lower_wick_ratio=0.4)
+        # range=10; wick=4 → ratio=0.4 exactly (meets threshold)
+        # close_position = (100-90)/10 = 1.0
+        assert _wf_decide(s, close=100.0, high=100.0, low=90.0, open_=94.0) == "BUY"
+        # wick=3 → ratio=0.3 < 0.4
+        assert _wf_decide(s, close=100.0, high=100.0, low=90.0, open_=93.0) == "HOLD"
+
+    def test_dead_tape_filter(self):
+        """Bar range below min_range_pct filter → HOLD even if wick looks good."""
+        s = _wf_strategy(wick_fade_min_range_pct=0.005)
+        # price=100, range=0.4 → range_pct=0.004 < 0.005
+        assert _wf_decide(s, close=100.0, high=100.2, low=99.8, open_=100.1) == "HOLD"
+
+    def test_zero_range_bar_no_buy(self):
+        """Doji / zero-range bar must not crash and must return HOLD."""
+        s = _wf_strategy()
+        assert _wf_decide(s, close=100.0, high=100.0, low=100.0, open_=100.0) == "HOLD"
+
+    def test_missing_bar_data_no_buy(self):
+        """None bar_high/low/open falls through to HOLD safely."""
+        s = _wf_strategy()
+        result = s.decide_action(
+            100.0, sma=100.0, ml_signal=_DUMMY_ML, holding=False,
+            bar_high=None, bar_low=None, bar_open=None,
+        )
+        assert result == "HOLD"
+
+    def test_time_window_closed_blocks_entry(self):
+        s = _wf_strategy()
+        assert _wf_decide(
+            s, close=100.0, high=101.0, low=95.0, open_=99.0,
+            time_window_open=False,
+        ) == "HOLD"
+
+    def test_already_holding_no_second_entry(self):
+        """No new BUY while already holding (stop not yet hit)."""
+        s = _wf_strategy(wick_fade_stop_atr_multiple=1.5)
+        assert _wf_decide(
+            s, close=100.0, high=101.0, low=95.0, open_=99.0,
+            holding=True, wick_fade_stop=97.0, wick_fade_target=103.0,
+        ) == "HOLD"
+
+
+class TestWickFadeExit:
+    def test_stop_hit_triggers_sell(self):
+        s = _wf_strategy()
+        # Price drops to stop
+        assert _wf_decide(
+            s, close=97.0, high=98.0, low=96.5, open_=98.0,
+            holding=True, wick_fade_stop=97.5, wick_fade_target=103.0,
+        ) == "SELL"
+
+    def test_target_hit_triggers_sell(self):
+        s = _wf_strategy()
+        assert _wf_decide(
+            s, close=103.0, high=103.5, low=101.0, open_=101.5,
+            holding=True, wick_fade_stop=97.0, wick_fade_target=103.0,
+        ) == "SELL"
+
+    def test_price_between_stop_and_target_holds(self):
+        s = _wf_strategy(wick_fade_max_hold_bars=10)
+        assert _wf_decide(
+            s, close=100.5, high=101.0, low=100.0, open_=100.2,
+            holding=True, wick_fade_stop=97.0, wick_fade_target=103.0,
+            wick_fade_bars_held=3,
+        ) == "HOLD"
+
+    def test_max_hold_bars_timeout(self):
+        """After max_hold_bars bars, force exit regardless of price."""
+        s = _wf_strategy(wick_fade_max_hold_bars=4)
+        # 4 bars held — should sell
+        assert _wf_decide(
+            s, close=101.0, high=101.5, low=100.5, open_=101.0,
+            holding=True, wick_fade_stop=97.0, wick_fade_target=103.0,
+            wick_fade_bars_held=4,
+        ) == "SELL"
+
+    def test_below_max_hold_bars_no_timeout(self):
+        s = _wf_strategy(wick_fade_max_hold_bars=4)
+        assert _wf_decide(
+            s, close=101.0, high=101.5, low=100.5, open_=101.0,
+            holding=True, wick_fade_stop=97.0, wick_fade_target=103.0,
+            wick_fade_bars_held=3,
+        ) == "HOLD"
+
+    def test_max_hold_bars_zero_disables_timeout(self):
+        """max_hold_bars=0 means never timeout."""
+        s = _wf_strategy(wick_fade_max_hold_bars=0)
+        assert _wf_decide(
+            s, close=101.0, high=101.5, low=100.5, open_=101.0,
+            holding=True, wick_fade_stop=97.0, wick_fade_target=103.0,
+            wick_fade_bars_held=999,
+        ) == "HOLD"
+
+    def test_stop_takes_priority_over_target(self):
+        """If somehow price is both at/below stop AND at/above target, stop wins."""
+        s = _wf_strategy()
+        # Degenerate config where stop > target (shouldn't happen in practice)
+        assert _wf_decide(
+            s, close=100.0, high=100.0, low=100.0, open_=100.0,
+            holding=True, wick_fade_stop=100.0, wick_fade_target=99.0,
+        ) == "SELL"
