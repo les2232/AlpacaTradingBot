@@ -81,6 +81,7 @@ class PersistedRiskCheck:
     action: str
     allowed: bool
     block_reason: str | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +205,7 @@ class DashboardState:
     recent_execution_activity: tuple[PersistedExecutionActivity, ...] = ()
     latest_signal_rows: tuple[PersistedSignalDecision, ...] = ()
     latest_cycle_risk_checks: tuple[PersistedRiskCheck, ...] = ()
+    session_block_reason_counts: tuple[tuple[str, int], ...] = ()
     session_first_prices: dict[str, float] = field(default_factory=dict)
     recent_narrations: tuple[PersistedNarration, ...] = ()
     recent_near_misses: tuple[PersistedNearMiss, ...] = ()
@@ -680,9 +682,26 @@ def _load_latest_cycle_risk_checks(
                 action=action,
                 allowed=bool(payload.get("allowed")),
                 block_reason=str(payload.get("block_reason", "")) or None,
+                detail=str(payload.get("detail", "")) or None,
             )
         )
     return tuple(checks)
+
+
+def _load_session_block_reason_counts() -> tuple[tuple[str, int], ...]:
+    log_dir = _latest_log_dir()
+    if log_dir is None:
+        return ()
+    counts: dict[str, int] = {}
+    for payload in _load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}):
+        action = str(payload.get("action", "")).upper()
+        if action not in {"BUY", "SELL"}:
+            continue
+        if bool(payload.get("allowed")):
+            continue
+        reason = str(payload.get("block_reason", "")) or "unknown_block"
+        counts[reason] = counts.get(reason, 0) + 1
+    return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
 def _load_latest_signal_rows() -> tuple[PersistedSignalDecision, ...]:
@@ -990,6 +1009,7 @@ def load_dashboard_state() -> DashboardState:
     )
     latest_signal_rows = _load_latest_signal_rows()
     latest_cycle_risk_checks = _load_latest_cycle_risk_checks(last_cycle_report)
+    session_block_reason_counts = _load_session_block_reason_counts()
     session_first_prices = storage.get_session_first_prices(session_id=session_id)
     recent_narrations = _load_recent_narrations()
     recent_near_misses = _load_recent_near_misses()
@@ -1011,6 +1031,7 @@ def load_dashboard_state() -> DashboardState:
         recent_execution_activity=_load_recent_execution_activity(last_cycle_report),
         latest_signal_rows=latest_signal_rows,
         latest_cycle_risk_checks=latest_cycle_risk_checks,
+        session_block_reason_counts=session_block_reason_counts,
         session_first_prices=session_first_prices,
         recent_narrations=recent_narrations,
         recent_near_misses=recent_near_misses,

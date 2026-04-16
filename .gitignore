@@ -10,6 +10,10 @@ bot_history.db
 test_live_lock_*.lock
 test_decision_claim_*.db
 test_dashboard_state_*.db
+test_logs_*/
+test_dashboard_logs_*/
+tmp*/
+tmp_*/
 datasets/
 logs/
 *.out.log

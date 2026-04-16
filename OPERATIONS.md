@@ -22,11 +22,13 @@ Active live mode: **`mean_reversion`** (set in `config/live_config.json`, valida
 
 Use exactly one execution process and one monitoring process.
 
-1. Start preview before the session:
+1. Start the full live session with one click:
 
 ```powershell
-tradeos preview
+.\start_dashboard.ps1
 ```
+
+This is the preferred launcher. By default it starts `tradeos live`, then starts or reuses the dashboard, and opens the browser when the dashboard is ready.
 
 2. Confirm the startup summary matches expectations:
    - `account=paper`
@@ -39,16 +41,10 @@ tradeos preview
    - `logs/<date>/risk.jsonl`
    - `logs/<date>/signals.jsonl`
 
-4. If preview looks clean, stop it and start the real paper session:
+4. If you need monitoring without starting the bot:
 
 ```powershell
-tradeos live
-```
-
-5. In a separate terminal, launch monitoring only:
-
-```powershell
-tradeos dashboard
+.\start_dashboard.ps1 -DashboardOnly
 ```
 
 ## What Not To Do

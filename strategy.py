@@ -979,6 +979,7 @@ class Strategy:
                 and close_position >= self.config.wick_fade_min_close_position
                 and time_window_open
                 and self._entry_allowed(atr_percentile)
+                and self._regime_allows_entry(bullish_regime)
             ):
                 return "BUY"
             return "HOLD"

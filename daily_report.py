@@ -29,7 +29,7 @@ import pandas as pd
 # These are the OOS numbers from the mean-reversion validation.
 # ---------------------------------------------------------------------------
 
-BACKTEST: dict[str, Any] = {
+DEFAULT_BACKTEST: dict[str, Any] = {
     "symbols":                         15,
     "bars_per_day":                    26,     # 390-min session ÷ 15-min bars
     "signal_rate_per_symbol_per_day":  2.1,    # avg BUY signals per symbol per session
@@ -38,6 +38,73 @@ BACKTEST: dict[str, Any] = {
     "rejection_rate":                  0.72,   # fraction of evaluated bars → HOLD
     "avg_slippage_bps":                5.0,    # expected adverse slippage (bps)
 }
+
+
+def _load_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _to_ratio(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric / 100.0 if numeric > 1.0 else numeric
+
+
+def load_backtest_baseline(repo_root: Path | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    base = dict(DEFAULT_BACKTEST)
+    source = {
+        "mode": "defaults",
+        "live_config_path": None,
+        "research_config_path": None,
+        "research_metrics_used": False,
+    }
+
+    root = repo_root or Path(__file__).resolve().parent
+    live_config = _load_json_file(root / "config" / "live_config.json")
+    if live_config is not None:
+        runtime = live_config.get("runtime")
+        if isinstance(runtime, dict):
+            symbols = runtime.get("symbols")
+            if isinstance(symbols, list) and symbols:
+                base["symbols"] = len(symbols)
+            try:
+                timeframe_minutes = int(runtime.get("bar_timeframe_minutes"))
+            except (TypeError, ValueError):
+                timeframe_minutes = None
+            if timeframe_minutes and timeframe_minutes > 0:
+                base["bars_per_day"] = max(1, int((6.5 * 60) / timeframe_minutes))
+            source["mode"] = "live_config"
+            source["live_config_path"] = str(root / "config" / "live_config.json")
+
+    research = _load_json_file(root / "results" / "best_config_latest.json")
+    if research is not None:
+        performance = research.get("performance")
+        if isinstance(performance, dict):
+            try:
+                trades_per_day_value = float(performance.get("trades_per_day"))
+            except (TypeError, ValueError):
+                trades_per_day_value = None
+            if trades_per_day_value is not None and base["symbols"] > 0:
+                base["signal_rate_per_symbol_per_day"] = trades_per_day_value / base["symbols"]
+            win_rate = _to_ratio(performance.get("win_rate"))
+            if win_rate is not None:
+                base["win_rate"] = win_rate
+            source["research_metrics_used"] = True
+            source["research_config_path"] = str(root / "results" / "best_config_latest.json")
+            source["mode"] = "live_config+research" if source["mode"] == "live_config" else "research"
+
+    return base, source
+
+
+BACKTEST, BACKTEST_SOURCE = load_backtest_baseline()
 
 # ---------------------------------------------------------------------------
 # Alert thresholds
@@ -65,19 +132,51 @@ def _load(path: Path) -> pd.DataFrame:
     """Read a JSONL file into a DataFrame. Returns empty DataFrame if missing."""
     if not path.exists():
         return pd.DataFrame()
-    lines = [l.strip() for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
-    if not lines:
-        return pd.DataFrame()
-    return pd.DataFrame([json.loads(l) for l in lines])
+    rows: list[dict[str, Any]] = []
+    malformed_lines = 0
+    total_lines = 0
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        total_lines += 1
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            malformed_lines += 1
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+
+    df = pd.DataFrame(rows)
+    df.attrs["source_path"] = str(path)
+    df.attrs["raw_line_count"] = total_lines
+    df.attrs["malformed_line_count"] = malformed_lines
+    df.attrs["loaded_row_count"] = len(rows)
+    return df
+
+
+def _dedupe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        df.attrs["duplicate_row_count"] = 0
+        df.attrs["unique_row_count"] = 0
+        return df
+
+    key_columns = [col for col in ("event", "trace") if col in df.columns]
+    deduped = df.drop_duplicates(subset=key_columns or None, keep="first").copy()
+    deduped.attrs.update(df.attrs)
+    deduped.attrs["duplicate_row_count"] = len(df) - len(deduped)
+    deduped.attrs["unique_row_count"] = len(deduped)
+    return deduped
 
 
 def load_logs(log_dir: Path) -> dict[str, pd.DataFrame]:
     return {
-        "bars":      _load(log_dir / "bars.jsonl"),
-        "signals":   _load(log_dir / "signals.jsonl"),
-        "risk":      _load(log_dir / "risk.jsonl"),
-        "execution": _load(log_dir / "execution.jsonl"),
-        "positions": _load(log_dir / "positions.jsonl"),
+        "bars":      _dedupe(_load(log_dir / "bars.jsonl")),
+        "signals":   _dedupe(_load(log_dir / "signals.jsonl")),
+        "risk":      _dedupe(_load(log_dir / "risk.jsonl")),
+        "execution": _dedupe(_load(log_dir / "execution.jsonl")),
+        "positions": _dedupe(_load(log_dir / "positions.jsonl")),
     }
 
 
@@ -96,6 +195,21 @@ def _flag(value: float, warn_threshold: float, low_is_bad: bool = True) -> str:
         return "WARN" if value < warn_threshold else "ok"
     else:
         return "WARN" if value > warn_threshold else "ok"
+
+
+def _session_signal_rate(sig: dict) -> tuple[float | None, float | None, float | None]:
+    total_evaluated = sig.get("total_evaluated", 0) or 0
+    buy_signals = sig.get("buy_signals", 0) or 0
+    if total_evaluated <= 0 or BACKTEST["symbols"] <= 0:
+        return None, None, None
+
+    bars_per_symbol_seen = total_evaluated / BACKTEST["symbols"]
+    if bars_per_symbol_seen <= 0:
+        return None, None, None
+
+    coverage_pct = bars_per_symbol_seen / BACKTEST["bars_per_day"]
+    full_day_equiv = (buy_signals / BACKTEST["symbols"]) * (BACKTEST["bars_per_day"] / bars_per_symbol_seen)
+    return bars_per_symbol_seen, coverage_pct, full_day_equiv
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +234,7 @@ def compute_signal_behavior(signals: pd.DataFrame) -> dict:
     if evaluated.empty:
         return {
             "total_evaluated": 0, "buy_signals": 0, "sell_signals": 0,
-            "by_symbol": {}, "rejections": {}, "rejection_rate": None,
+            "hold_count": 0, "by_symbol": {}, "rejections": {}, "rejection_rate": None,
         }
 
     buys  = evaluated[_col(evaluated, "action") == "BUY"]
@@ -253,11 +367,29 @@ def compute_positions(positions: pd.DataFrame) -> dict:
     }
 
 
+def compute_log_health(logs: dict[str, pd.DataFrame]) -> dict:
+    files: dict[str, dict[str, int]] = {}
+    for name, df in logs.items():
+        files[name] = {
+            "raw_lines": int(df.attrs.get("raw_line_count", len(df))),
+            "loaded_rows": int(df.attrs.get("loaded_row_count", len(df))),
+            "unique_rows": int(df.attrs.get("unique_row_count", len(df))),
+            "malformed_lines": int(df.attrs.get("malformed_line_count", 0)),
+            "duplicate_rows": int(df.attrs.get("duplicate_row_count", 0)),
+        }
+
+    return {
+        "files": files,
+        "malformed_lines": sum(item["malformed_lines"] for item in files.values()),
+        "duplicate_rows": sum(item["duplicate_rows"] for item in files.values()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Concern detection
 # ---------------------------------------------------------------------------
 
-def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict) -> list[str]:
+def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict, log_health: dict | None = None) -> list[str]:
     """
     Return a list of concern strings.  Empty list = everything looks normal.
     """
@@ -279,8 +411,9 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict) -> list[str]:
             )
 
     # --- Signal rate ---
-    if sig["buy_signals"] > 0 and sig["total_evaluated"] > 0:
-        live_rate = sig["buy_signals"] / n_sym
+    _, coverage_pct, full_day_signal_rate = _session_signal_rate(sig)
+    if full_day_signal_rate is not None:
+        live_rate = full_day_signal_rate
         bt_rate   = BACKTEST["signal_rate_per_symbol_per_day"]
         ratio     = live_rate / bt_rate if bt_rate > 0 else 0
         if ratio < WARN["signal_rate_pct_of_bt"]:
@@ -292,6 +425,11 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict) -> list[str]:
             concerns.append(
                 f"SIGNAL RATE HIGH: {live_rate:.1f}/symbol/day vs backtest {bt_rate} "
                 f"({ratio:.0%} of backtest) — filter may not be applying correctly in live"
+            )
+        if coverage_pct is not None and coverage_pct < 1.0:
+            concerns.append(
+                f"PARTIAL SESSION: observed {coverage_pct:.0%} of a full session "
+                f"({sig['total_evaluated']} unique signal evaluations) — normalized signal-rate estimate used"
             )
 
     # --- Win rate ---
@@ -339,6 +477,18 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict) -> list[str]:
             f"— universe liquidity may have declined; check fill quality"
         )
 
+    if log_health:
+        malformed = log_health.get("malformed_lines", 0)
+        duplicates = log_health.get("duplicate_rows", 0)
+        if malformed > 0:
+            concerns.append(
+                f"LOG PARSE WARNINGS: skipped {malformed} malformed JSONL line(s) — inspect raw logs if this day matters"
+            )
+        if duplicates > 0:
+            concerns.append(
+                f"RESTART DUPLICATES: removed {duplicates} duplicate log row(s) by trace/event before analysis"
+            )
+
     # --- Kill switch ---
     # Reported separately in the report, not as a "concern" here.
 
@@ -365,6 +515,7 @@ def print_report(
     risk: dict,
     pos: dict,
     concerns: list[str],
+    log_health: dict | None = None,
 ) -> None:
     n_sym     = BACKTEST["symbols"]
     bt_bars   = BACKTEST["bars_per_day"]
@@ -389,28 +540,38 @@ def print_report(
     expected_bars = n_sym * bt_bars
     row("Bars evaluated",        fmt(bar_q["evaluated"]),
         f"(expect ~{expected_bars} = {n_sym} syms × {bt_bars} bars)")
+    row("Baseline source",       str(BACKTEST_SOURCE.get("mode", "defaults")))
     avg_age = bar_q["avg_age_s"]
     row("Avg bar age (s)",        fmt(avg_age, ".1f"),
         flag=_flag(avg_age or 0, WARN["avg_bar_age_s"], low_is_bad=False) if avg_age else "")
     row("Stale bars",             fmt(bar_q["stale_count"]),
         flag=_flag(bar_q["stale_count"], WARN["stale_bar_count"] - 1, low_is_bad=False)
              if bar_q["stale_count"] > 0 else "")
+    if log_health is not None:
+        row("Malformed log lines", fmt(log_health.get("malformed_lines", 0)),
+            flag="WARN" if log_health.get("malformed_lines", 0) > 0 else "")
+        row("Duplicate rows removed", fmt(log_health.get("duplicate_rows", 0)),
+            flag="WARN" if log_health.get("duplicate_rows", 0) > 0 else "")
 
     # ── Signal behavior ───────────────────────────────────────────
     section("SIGNAL BEHAVIOR")
     total_eval = sig["total_evaluated"]
     buy_count  = sig["buy_signals"]
-    bt_total   = n_sym * BACKTEST["signal_rate_per_symbol_per_day"]
-    live_per_sym = buy_count / n_sym if n_sym > 0 else 0
+    bars_per_symbol_seen, coverage_pct, live_per_sym = _session_signal_rate(sig)
+    if live_per_sym is None:
+        live_per_sym = buy_count / n_sym if n_sym > 0 else 0
     bt_per_sym   = BACKTEST["signal_rate_per_symbol_per_day"]
     sig_ratio    = live_per_sym / bt_per_sym if bt_per_sym > 0 else 0
 
     row("Total bars evaluated",   fmt(total_eval))
     row("BUY signals fired",      fmt(buy_count),
-        f"({live_per_sym:.1f}/sym/day  bt={bt_per_sym:.1f}  ratio={sig_ratio:.0%})",
+        f"({live_per_sym:.1f}/sym/day equiv  bt={bt_per_sym:.1f}  ratio={sig_ratio:.0%})",
         flag=_flag(sig_ratio, WARN["signal_rate_pct_of_bt"], low_is_bad=True)
              if buy_count > 0 else "")
     row("SELL signals fired",     fmt(sig["sell_signals"]))
+    if coverage_pct is not None:
+        row("Session coverage",    f"{coverage_pct:.0%}",
+            f"(~{bars_per_symbol_seen:.1f}/{BACKTEST['bars_per_day']} bars per symbol observed)")
     rej_rate = sig["rejection_rate"]
     row("Rejection rate",         fmt(rej_rate, ".0%") if rej_rate is not None else "n/a",
         f"(backtest ~{BACKTEST['rejection_rate']:.0%})")
@@ -542,15 +703,18 @@ def build_json_output(
     risk: dict,
     pos: dict,
     concerns: list[str],
+    log_health: dict | None = None,
 ) -> dict:
     return {
         "date":          report_date,
+        "backtest_source": BACKTEST_SOURCE,
         "bar_quality":   bar_q,
         "signals":       sig,
         "execution":     ex,
         "risk":          risk,
         "positions":     pos,
         "concerns":      concerns,
+        "log_health":    log_health or {},
         "backtest":      BACKTEST,
     }
 
@@ -583,19 +747,20 @@ def main() -> None:
 
     logs = load_logs(log_dir)
 
-    bar_q    = compute_bar_quality(logs["bars"])
-    sig      = compute_signal_behavior(logs["signals"])
-    ex       = compute_execution(logs["execution"])
-    risk_    = compute_risk(logs["risk"])
-    pos      = compute_positions(logs["positions"])
-    concerns = detect_concerns(bar_q, sig, ex, pos)
+    bar_q      = compute_bar_quality(logs["bars"])
+    sig        = compute_signal_behavior(logs["signals"])
+    ex         = compute_execution(logs["execution"])
+    risk_      = compute_risk(logs["risk"])
+    pos        = compute_positions(logs["positions"])
+    log_health = compute_log_health(logs)
+    concerns   = detect_concerns(bar_q, sig, ex, pos, log_health)
 
     if args.json:
         import json as _json
-        output = build_json_output(args.date, bar_q, sig, ex, risk_, pos, concerns)
+        output = build_json_output(args.date, bar_q, sig, ex, risk_, pos, concerns, log_health)
         print(_json.dumps(output, indent=2, default=str))
     else:
-        print_report(args.date, bar_q, sig, ex, risk_, pos, concerns)
+        print_report(args.date, bar_q, sig, ex, risk_, pos, concerns, log_health)
 
 
 if __name__ == "__main__":

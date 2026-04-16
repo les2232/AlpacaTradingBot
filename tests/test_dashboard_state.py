@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,6 +15,25 @@ from dashboard_state import (
     load_dashboard_state,
 )
 from storage import BotStorage
+
+
+def _cleanup_dashboard_test_artifacts(logs_dir: str | Path, db_path: str | Path) -> None:
+    db_file = Path(db_path)
+    try:
+        if db_file.exists():
+            db_file.unlink()
+    except PermissionError:
+        pass
+    log_dir = Path(logs_dir)
+    if log_dir.exists():
+        for child in sorted(log_dir.rglob("*"), reverse=True):
+            try:
+                if child.is_file():
+                    child.unlink()
+                else:
+                    child.rmdir()
+            except OSError:
+                pass
 
 
 def test_load_dashboard_state_reads_persisted_startup_config(monkeypatch) -> None:
@@ -65,13 +85,7 @@ def test_load_dashboard_state_reads_persisted_startup_config(monkeypatch) -> Non
         assert state.symbol_state_status == "cleared_runtime_symbol_state"
         assert str(state.storage.db_path).endswith(db_path)
     finally:
-        log_dir = Path(logs_dir)
-        if log_dir.exists():
-            for child in sorted(log_dir.rglob("*"), reverse=True):
-                if child.is_file():
-                    child.unlink()
-                else:
-                    child.rmdir()
+        _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
 def test_load_dashboard_state_reports_missing_startup_config(monkeypatch) -> None:
@@ -87,13 +101,7 @@ def test_load_dashboard_state_reports_missing_startup_config(monkeypatch) -> Non
         assert state.has_persisted_startup_config is False
         assert state.startup_config is None
     finally:
-        log_dir = Path(logs_dir)
-        if log_dir.exists():
-            for child in sorted(log_dir.rglob("*"), reverse=True):
-                if child.is_file():
-                    child.unlink()
-                else:
-                    child.rmdir()
+        _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
 def test_load_dashboard_state_ignores_launches_directory(monkeypatch) -> None:
@@ -144,13 +152,7 @@ def test_load_dashboard_state_ignores_launches_directory(monkeypatch) -> None:
         assert state.startup_config is not None
         assert state.startup_config.symbols == ["QCOM"]
     finally:
-        log_dir = Path(logs_dir)
-        if log_dir.exists():
-            for child in sorted(log_dir.rglob("*"), reverse=True):
-                if child.is_file():
-                    child.unlink()
-                else:
-                    child.rmdir()
+        _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
 def test_load_dashboard_state_reports_unmatched_startup_artifact(monkeypatch) -> None:
@@ -233,13 +235,7 @@ def test_load_dashboard_state_reports_unmatched_startup_artifact(monkeypatch) ->
         assert state.symbol_state_status == "stale_persisted_symbols_ignored"
         assert any("Persisted symbol state is from a different run and is being ignored." in message for message in state.session_warnings)
     finally:
-        log_dir = Path(logs_dir)
-        if log_dir.exists():
-            for child in sorted(log_dir.rglob("*"), reverse=True):
-                if child.is_file():
-                    child.unlink()
-                else:
-                    child.rmdir()
+        _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
 def test_build_session_warnings_detects_newer_startup_and_symbol_mismatch() -> None:
@@ -491,10 +487,139 @@ def test_load_dashboard_state_ignores_snapshot_from_different_symbol_session(mon
         assert state.ignored_snapshot_symbols == ("AMD", "QCOM")
         assert any("Persisted symbol state is from a different run and is being ignored." in message for message in state.session_warnings)
     finally:
-        log_dir = Path(logs_dir)
-        if log_dir.exists():
-            for child in sorted(log_dir.rglob("*"), reverse=True):
-                if child.is_file():
-                    child.unlink()
-                else:
-                    child.rmdir()
+        _cleanup_dashboard_test_artifacts(logs_dir, db_path)
+
+
+def test_load_dashboard_state_includes_session_block_reason_counts() -> None:
+    temp_root = Path.cwd()
+    logs_dir = temp_root / f"test_logs_{uuid4().hex}"
+    day_dir = logs_dir / "2026-04-13"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    db_path = temp_root / f"test_dashboard_state_{uuid4().hex}.db"
+    storage = BotStorage(db_path)
+
+    old_log_root = os.environ.get("BOT_LOG_ROOT")
+    old_db_path = os.environ.get("BOT_DB_PATH")
+    os.environ["BOT_LOG_ROOT"] = str(logs_dir)
+    os.environ["BOT_DB_PATH"] = str(db_path)
+    try:
+        (day_dir / "startup_config.json").write_text(
+            json.dumps(
+                {
+                    "session_id": "session-amd",
+                    "started_at_utc": "2026-04-13T14:34:26+00:00",
+                    "launch_mode": "live",
+                    "execution_enabled": True,
+                    "paper": True,
+                    "account_mode": "paper",
+                    "strategy_mode": "mean_reversion",
+                    "bar_timeframe_minutes": 15,
+                    "sma_bars": 20,
+                    "symbols": ["AMD"],
+                    "symbol_count": 1,
+                    "runtime_config_path": "config/live_config.json",
+                    "runtime_overrides": ["symbols"],
+                    "max_usd_per_trade": 200.0,
+                    "max_symbol_exposure_usd": 200.0,
+                    "max_open_positions": 3,
+                    "max_daily_loss_usd": 300.0,
+                    "max_orders_per_minute": 6,
+                    "max_price_deviation_bps": 75.0,
+                    "max_live_price_age_seconds": 60,
+                    "max_data_delay_seconds": 300,
+                    "db_path": str(db_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        snapshot = type("Snapshot", (), {})()
+        snapshot.timestamp_utc = "2026-04-13T14:30:00+00:00"
+        snapshot.cash = 1.0
+        snapshot.buying_power = 1.0
+        snapshot.equity = 1.0
+        snapshot.last_equity = 1.0
+        snapshot.daily_pnl = 0.0
+        snapshot.kill_switch_triggered = False
+        snapshot.positions = {}
+        snapshot.symbols = [
+            type("Row", (), {"symbol": "AMD", "price": 1.0, "sma": 1.0, "action": "HOLD", "holding": False, "quantity": 0.0, "market_value": 0.0, "ml_probability_up": None, "ml_confidence": None, "ml_training_rows": None, "holding_minutes": None, "error": None})(),
+        ]
+        storage.save_snapshot(snapshot, [], session_id="session-amd", symbol_fingerprint="amd")
+        (day_dir / "risk.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "event": "cycle.summary",
+                            "decision_ts": "2026-04-13T14:30:00+00:00",
+                            "execute_orders": True,
+                            "processed_bar": True,
+                            "skip_reason": "signals_blocked_or_skipped",
+                            "buy_signals": 2,
+                            "sell_signals": 1,
+                            "hold_signals": 3,
+                            "error_signals": 0,
+                            "orders_submitted": 0,
+                            "ts": "2026-04-13T14:30:24+00:00",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "event": "risk.check",
+                            "trace": "AMD_1776090600",
+                            "symbol": "AMD",
+                            "action": "BUY",
+                            "allowed": False,
+                            "block_reason": "max_open_positions_reached",
+                            "detail": "portfolio already full",
+                            "ts": "2026-04-13T14:30:25+00:00",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "event": "risk.check",
+                            "trace": "TSLA_1776090600",
+                            "symbol": "TSLA",
+                            "action": "BUY",
+                            "allowed": False,
+                            "block_reason": "max_open_positions_reached",
+                            "detail": "portfolio already full",
+                            "ts": "2026-04-13T14:30:25+00:00",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "event": "risk.check",
+                            "trace": "ABBV_1776090600",
+                            "symbol": "ABBV",
+                            "action": "SELL",
+                            "allowed": False,
+                            "block_reason": "stale_live_price",
+                            "detail": "quote too old",
+                            "ts": "2026-04-13T14:30:26+00:00",
+                        }
+                    ),
+                ]
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        state = load_dashboard_state()
+
+        assert state.session_block_reason_counts == (
+            ("max_open_positions_reached", 2),
+            ("stale_live_price", 1),
+        )
+        assert state.latest_cycle_risk_checks[0].detail is not None
+    finally:
+        if old_log_root is None:
+            os.environ.pop("BOT_LOG_ROOT", None)
+        else:
+            os.environ["BOT_LOG_ROOT"] = old_log_root
+        if old_db_path is None:
+            os.environ.pop("BOT_DB_PATH", None)
+        else:
+            os.environ["BOT_DB_PATH"] = old_db_path
+        _cleanup_dashboard_test_artifacts(logs_dir, db_path)
+
+

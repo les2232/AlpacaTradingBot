@@ -852,11 +852,13 @@ def _wf_decide(
     wick_fade_bars_held: int = 0,
     time_window_open: bool = True,
     atr_percentile: float | None = None,
+    bullish_regime: bool | None = None,
 ) -> str:
     return s.decide_action(
         close, sma=close, ml_signal=_DUMMY_ML, holding=holding,
         time_window_open=time_window_open,
         atr_percentile=atr_percentile,
+        bullish_regime=bullish_regime,
         bar_high=high, bar_low=low, bar_open=open_,
         wick_fade_stop=wick_fade_stop,
         wick_fade_target=wick_fade_target,
@@ -922,6 +924,20 @@ class TestWickFadeEntry:
             s, close=100.0, high=101.0, low=95.0, open_=99.0,
             time_window_open=False,
         ) == "HOLD"
+
+    def test_regime_filter_blocks_non_bullish_entry(self):
+        s = _wf_strategy(regime_filter_enabled=True)
+        assert _wf_decide(
+            s, close=100.0, high=101.0, low=95.0, open_=99.0,
+            bullish_regime=False,
+        ) == "HOLD"
+
+    def test_regime_filter_allows_bullish_entry(self):
+        s = _wf_strategy(regime_filter_enabled=True)
+        assert _wf_decide(
+            s, close=100.0, high=101.0, low=95.0, open_=99.0,
+            bullish_regime=True,
+        ) == "BUY"
 
     def test_already_holding_no_second_entry(self):
         """No new BUY while already holding (stop not yet hit)."""

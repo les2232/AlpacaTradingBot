@@ -46,7 +46,8 @@
       "Bash(ls C:/Users/lesco/Desktop/AlpacaTradingBot-1/*.parquet)",
       "Bash(grep -E --line-buffered \"\\\\[|TOP|INTERP|Traceback|Error|error|done$|sweep\\\\]\")",
       "Bash(xargs cat *)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(git commit *)"
     ]
   }
 }

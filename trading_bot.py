@@ -212,6 +212,18 @@ def _safe_float(value: str | None, default: float) -> float:
         return default
 
 
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_default(value: Any, default: float = 0.0) -> float:
+    converted = _optional_float(value)
+    return converted if converted is not None else default
+
+
 def _normalize_enum_text(value: Any) -> str:
     text = str(value or "").strip()
     if "." in text:
@@ -268,6 +280,29 @@ def _parse_symbol_strategy_map(raw_value: str | None) -> dict[str, str]:
             )
         parsed[symbol.strip().upper()] = normalized_mode
     return parsed
+
+
+def _determine_signal_rejection(
+    *,
+    action: str,
+    holding: bool,
+    trend_filter_active: bool,
+    trend_pass: bool | None,
+    atr_pass: bool | None,
+) -> str | None:
+    if action in ("BUY", "SELL"):
+        return None
+    if holding:
+        return "holding_no_exit"
+
+    failing: list[str] = []
+    if trend_filter_active and trend_pass is False:
+        failing.append("trend_filter")
+    if atr_pass is False:
+        failing.append("atr_filter")
+    if failing:
+        return "|".join(failing)
+    return "no_signal"
 
 
 def _normalize_runtime_symbols(raw_symbols: Any) -> list[str]:
@@ -518,6 +553,7 @@ class TradeOSBot:
         self._hourly_regime_cache: dict[tuple[str, str], bool | None] = {}
         self._strategy_cache: dict[str, Strategy] = {}
         self._last_run_cycle_report: RunCycleReport | None = None
+        self._startup_market_data_validated_for_et_date: str | None = None
         self._validate_persisted_symbol_state()
         self.strategy = Strategy(
             StrategyConfig(
@@ -726,6 +762,88 @@ class TradeOSBot:
             stamp = stamp.tz_localize("UTC")
         time_et = stamp.tz_convert("America/New_York").time()
         return dt_time(9, 30) <= time_et < dt_time(16, 0)
+
+    def _validate_startup_market_data(self, decision_timestamp: datetime) -> None:
+        session_date_et = decision_timestamp.astimezone(_ET).date().isoformat()
+        if self._startup_market_data_validated_for_et_date == session_date_et:
+            return
+
+        blocking_reasons: list[str] = []
+        for symbol in self.active_symbols:
+            intraday_bars = self._get_intraday_bars(
+                symbol,
+                2,
+                decision_timestamp=decision_timestamp,
+            )
+            if not intraday_bars:
+                blocking_reasons.append(f"{symbol}:no_completed_bar")
+                continue
+            latest_bar_close = self._latest_bar_close_time(intraday_bars)
+            latest_bar_date_et = latest_bar_close.astimezone(_ET).date()
+            if latest_bar_date_et != decision_timestamp.astimezone(_ET).date():
+                blocking_reasons.append(
+                    f"{symbol}:previous_session_bar:{latest_bar_close.isoformat()}"
+                )
+                continue
+            bar_delay_seconds = max(0.0, (decision_timestamp - latest_bar_close).total_seconds())
+            if bar_delay_seconds > self.config.max_data_delay_seconds:
+                blocking_reasons.append(
+                    f"{symbol}:bar_age={bar_delay_seconds:.0f}s"
+                )
+
+        if blocking_reasons:
+            sample = ", ".join(blocking_reasons[:5])
+            remaining = len(blocking_reasons) - min(len(blocking_reasons), 5)
+            if remaining > 0:
+                sample = f"{sample}, +{remaining} more"
+            raise StaleMarketDataError(
+                "startup market data not ready; refusing to trade until every symbol has "
+                f"a same-session completed bar ({sample})"
+            )
+
+        self._startup_market_data_validated_for_et_date = session_date_et
+
+    def _log_risk_check(
+        self,
+        *,
+        symbol: str,
+        decision_ts: str,
+        action: str,
+        allowed: bool,
+        block_reason: str | None,
+        snapshot: BotSnapshot,
+        open_positions: int,
+        live_price: float | None = None,
+        signal_price: float | None = None,
+        price_deviation_bps: float | None = None,
+        live_price_age_s: float | None = None,
+        detail: str | None = None,
+        in_entry_window: bool | None = None,
+        remaining_buying_power: float | None = None,
+        trade_budget: float | None = None,
+        recent_order_count: int | None = None,
+    ) -> None:
+        self.blog.risk_check(
+            symbol=symbol,
+            decision_ts=decision_ts,
+            action=action,
+            allowed=allowed,
+            block_reason=block_reason,
+            open_positions=open_positions,
+            max_positions=self.config.max_open_positions,
+            daily_pnl=snapshot.daily_pnl,
+            daily_limit=self.config.max_daily_loss_usd,
+            live_price=live_price,
+            signal_price=signal_price,
+            price_deviation_bps=price_deviation_bps,
+            live_price_age_s=live_price_age_s,
+            detail=detail,
+            in_entry_window=in_entry_window,
+            remaining_buying_power=remaining_buying_power,
+            trade_budget=trade_budget,
+            recent_order_count=recent_order_count,
+            max_orders_per_minute=self.config.max_orders_per_minute,
+        )
 
     def _is_market_open(self) -> bool:
         return self.broker.is_market_open()
@@ -1015,7 +1133,7 @@ class TradeOSBot:
             and or_low is not None
             and position is not None
         ):
-            entry = float(position.avg_entry_price)
+            entry = _float_or_default(getattr(position, "avg_entry_price", None))
             capped_stop = get_capped_breakout_stop_price(entry, or_low, strategy.config.breakout_max_stop_pct)
             self._breakout_stored_stop[symbol] = capped_stop
             logger.info(
@@ -1039,7 +1157,7 @@ class TradeOSBot:
             bullish_regime=bullish_regime,
             opening_range_high=opening_range_highs[-1] if opening_range_highs else None,
             opening_range_low=or_low,
-            position_entry_price=float(position.avg_entry_price) if holding and position is not None else None,
+            position_entry_price=_optional_float(getattr(position, "avg_entry_price", None)) if holding and position is not None else None,
             volume_ratio=volume_ratio,
             volatility_ratio=volatility_ratio,
             effective_stop_price=effective_stop_price,
@@ -1054,24 +1172,17 @@ class TradeOSBot:
             if (_atr_pct_now_val is not None and self.config.mean_reversion_max_atr_percentile > 0)
             else None
         )
-        if action in ("BUY", "SELL"):
-            _rejection = None
-        else:
-            _failing = []
-            _trend_filter_active = (
-                strategy.config.strategy_mode != STRATEGY_MODE_MEAN_REVERSION
-                or self.config.mean_reversion_trend_filter
-            )
-            if _trend_pass is False and _trend_filter_active:
-                _failing.append("trend_filter")
-            if _atr_pass is False:
-                _failing.append("atr_filter")
-            if _failing:
-                _rejection = "|".join(_failing)
-            elif holding:
-                _rejection = "holding_no_exit"   # position open, awaiting exit signal
-            else:
-                _rejection = "no_signal"          # no entry condition met
+        _trend_filter_active = (
+            strategy.config.strategy_mode != STRATEGY_MODE_MEAN_REVERSION
+            or strategy.config.mean_reversion_trend_filter
+        )
+        _rejection = _determine_signal_rejection(
+            action=action,
+            holding=holding,
+            trend_filter_active=_trend_filter_active,
+            trend_pass=_trend_pass,
+            atr_pass=_atr_pass if not holding else None,
+        )
         self.blog.signal(
             symbol=symbol,
             decision_ts=aligned_decision_timestamp.isoformat(),
@@ -1130,7 +1241,7 @@ class TradeOSBot:
             position = positions.get(symbol)
             quantity = _position_qty_value(position)
             holding = quantity > 0
-            market_value = float(position.market_value) if position is not None else 0.0
+            market_value = _float_or_default(getattr(position, "market_value", None)) if position is not None else 0.0
             holding_minutes = self._position_holding_minutes(symbol, aligned_decision_timestamp)
             try:
                 if not evaluate_signals:
@@ -1234,7 +1345,7 @@ class TradeOSBot:
     ) -> bool:
         existing_position_value = 0.0
         if symbol in positions and getattr(positions[symbol], "market_value", None) is not None:
-            existing_position_value = abs(float(positions[symbol].market_value))
+            existing_position_value = abs(_float_or_default(getattr(positions[symbol], "market_value", None)))
         proposed_qty = int(self.config.max_usd_per_trade // live_price)
         proposed_value = proposed_qty * live_price
         return (existing_position_value + proposed_value) > self.config.max_symbol_exposure_usd
@@ -1491,7 +1602,7 @@ class TradeOSBot:
                         decision_ts=dec_ts,
                         side="buy",
                         qty=cover_qty,
-                        live_price=float(position.current_price or position.avg_entry_price),
+                        live_price=_float_or_default(getattr(position, "current_price", None) or getattr(position, "avg_entry_price", None)),
                         order_id=order_id,
                         signal_bar_close=None,
                     )
@@ -1699,7 +1810,7 @@ class TradeOSBot:
             decision_ts=dec_ts,
             side="sell",
             qty=qty,
-            live_price=float(live_price if live_price is not None else (position.current_price or position.avg_entry_price)),
+            live_price=_float_or_default(live_price if live_price is not None else (getattr(position, "current_price", None) or getattr(position, "avg_entry_price", None))),
             order_id=order_id,
             signal_bar_close=signal_price,
         )
@@ -1780,6 +1891,8 @@ class TradeOSBot:
             return snapshot
 
         try:
+            if execute_orders and should_process and self._is_regular_hours(decision_timestamp):
+                self._validate_startup_market_data(decision_timestamp)
             snapshot = self.build_snapshot(
                 decision_timestamp=decision_timestamp,
                 evaluate_signals=should_process,
@@ -1949,81 +2062,211 @@ class TradeOSBot:
 
                 if symbol in open_order_symbols:
                     print(f"Skip {symbol}: existing open order in flight")
+                    self._log_risk_check(
+                        symbol=symbol,
+                        decision_ts=decision_timestamp.isoformat(),
+                        action=action,
+                        allowed=False,
+                        block_reason="open_order_in_flight",
+                        snapshot=snapshot,
+                        open_positions=open_positions,
+                        signal_price=item.price or None,
+                        detail="symbol already has an open order working at the broker",
+                        in_entry_window=in_entry_window,
+                        remaining_buying_power=remaining_buying_power,
+                        recent_order_count=recent_order_count,
+                    )
                     continue
 
                 if recent_order_count >= self.config.max_orders_per_minute:
                     print("Skip new orders: max order rate reached")
+                    self._log_risk_check(
+                        symbol=symbol,
+                        decision_ts=decision_timestamp.isoformat(),
+                        action=action,
+                        allowed=False,
+                        block_reason="max_orders_per_minute",
+                        snapshot=snapshot,
+                        open_positions=open_positions,
+                        signal_price=item.price or None,
+                        detail="rate limiter reached before this signal could be submitted",
+                        in_entry_window=in_entry_window,
+                        remaining_buying_power=remaining_buying_power,
+                        recent_order_count=recent_order_count,
+                    )
                     break
 
                 if action == "BUY":
                     _dec_ts = decision_timestamp.isoformat() if decision_timestamp else ""
                     if not in_entry_window:
                         print(f"Skip {symbol} BUY: outside trading window ({now_et.strftime('%H:%M:%S')} ET)")
-                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
-                            allowed=False, block_reason="outside_entry_window",
-                            open_positions=open_positions, max_positions=self.config.max_open_positions,
-                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd)
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="BUY",
+                            allowed=False,
+                            block_reason="outside_entry_window",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            signal_price=item.price or None,
+                            detail=f"entry window closed at {now_et.strftime('%H:%M:%S')} ET",
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            recent_order_count=recent_order_count,
+                        )
                         continue
                     if symbol in positions:
                         print(f"Already holding {symbol}")
-                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
-                            allowed=False, block_reason="already_holding",
-                            open_positions=open_positions, max_positions=self.config.max_open_positions,
-                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd)
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="BUY",
+                            allowed=False,
+                            block_reason="already_holding",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            signal_price=item.price or None,
+                            detail="buy signal suppressed because the symbol already has a long position",
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            recent_order_count=recent_order_count,
+                        )
                         continue
                     if open_positions >= self.config.max_open_positions:
                         print("Max positions reached")
-                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
-                            allowed=False, block_reason="max_open_positions_reached",
-                            open_positions=open_positions, max_positions=self.config.max_open_positions,
-                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd)
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="BUY",
+                            allowed=False,
+                            block_reason="max_open_positions_reached",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            signal_price=item.price or None,
+                            detail=(
+                                f"portfolio already has {open_positions} open positions "
+                                f"with limit {self.config.max_open_positions}"
+                            ),
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            recent_order_count=recent_order_count,
+                        )
                         continue
                     live_price, live_price_age = self.get_latest_price_with_age(symbol)
-                    if live_price_age > self.config.max_live_price_age_seconds:
-                        print(f"Skip {symbol}: stale live price age {live_price_age:.1f}s")
-                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
-                            allowed=False, block_reason="stale_live_price",
-                            open_positions=open_positions, max_positions=self.config.max_open_positions,
-                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
-                            live_price_age_s=round(live_price_age, 1))
-                        continue
                     _signal_price = item.price or 0.0
                     _dev_bps = abs((live_price / _signal_price) - 1.0) * 10_000 if _signal_price > 0 else None
+                    trade_budget = min(self.config.max_usd_per_trade, remaining_buying_power)
+                    if live_price_age > self.config.max_live_price_age_seconds:
+                        print(f"Skip {symbol}: stale live price age {live_price_age:.1f}s")
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="BUY",
+                            allowed=False,
+                            block_reason="stale_live_price",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            live_price=live_price,
+                            signal_price=_signal_price or None,
+                            price_deviation_bps=_dev_bps,
+                            live_price_age_s=round(live_price_age, 1),
+                            detail=(
+                                f"latest trade quote age {live_price_age:.1f}s exceeds "
+                                f"{self.config.max_live_price_age_seconds}s"
+                            ),
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            trade_budget=trade_budget,
+                            recent_order_count=recent_order_count,
+                        )
+                        continue
                     if self._is_price_collar_breached(_signal_price, live_price):
                         print(
                             f"Skip {symbol}: live price {live_price:.2f} breaches collar vs decision price {_signal_price:.2f}"
                         )
-                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
-                            allowed=False, block_reason="price_collar_breached",
-                            open_positions=open_positions, max_positions=self.config.max_open_positions,
-                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
-                            live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="BUY",
+                            allowed=False,
+                            block_reason="price_collar_breached",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            live_price=live_price,
+                            signal_price=_signal_price,
+                            price_deviation_bps=_dev_bps,
+                            live_price_age_s=live_price_age,
+                            detail="live price moved outside the allowed collar versus the signal bar close",
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            trade_budget=trade_budget,
+                            recent_order_count=recent_order_count,
+                        )
                         continue
                     if self._is_symbol_exposure_exceeded(symbol, live_price, positions):
                         print(f"Skip {symbol}: max symbol exposure would be exceeded")
-                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
-                            allowed=False, block_reason="symbol_exposure_exceeded",
-                            open_positions=open_positions, max_positions=self.config.max_open_positions,
-                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd)
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="BUY",
+                            allowed=False,
+                            block_reason="symbol_exposure_exceeded",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            live_price=live_price,
+                            signal_price=_signal_price or None,
+                            price_deviation_bps=_dev_bps,
+                            live_price_age_s=live_price_age,
+                            detail="buy would exceed the configured single-symbol exposure cap",
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            trade_budget=trade_budget,
+                            recent_order_count=recent_order_count,
+                        )
                         continue
-                    trade_budget = min(self.config.max_usd_per_trade, remaining_buying_power)
                     if trade_budget < live_price:
                         print(
                             f"Skip {symbol}: trade budget ${trade_budget:.2f} "
                             f"cannot fund one share at {live_price:.2f}"
                         )
-                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
-                            allowed=False, block_reason="insufficient_buying_power",
-                            open_positions=open_positions, max_positions=self.config.max_open_positions,
-                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
-                            live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="BUY",
+                            allowed=False,
+                            block_reason="insufficient_buying_power",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            live_price=live_price,
+                            signal_price=_signal_price,
+                            price_deviation_bps=_dev_bps,
+                            live_price_age_s=live_price_age,
+                            detail="remaining buying power cannot fund the minimum one-share order",
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            trade_budget=trade_budget,
+                            recent_order_count=recent_order_count,
+                        )
                         continue
                     # All checks passed
-                    self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="BUY",
-                        allowed=True, block_reason=None,
-                        open_positions=open_positions, max_positions=self.config.max_open_positions,
-                        daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
-                        live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
+                    self._log_risk_check(
+                        symbol=symbol,
+                        decision_ts=_dec_ts,
+                        action="BUY",
+                        allowed=True,
+                        block_reason=None,
+                        snapshot=snapshot,
+                        open_positions=open_positions,
+                        live_price=live_price,
+                        signal_price=_signal_price,
+                        price_deviation_bps=_dev_bps,
+                        live_price_age_s=live_price_age,
+                        detail="all buy-side live risk checks passed",
+                        in_entry_window=in_entry_window,
+                        remaining_buying_power=remaining_buying_power,
+                        trade_budget=trade_budget,
+                        recent_order_count=recent_order_count,
+                    )
                     order = self.place_market_buy(
                         symbol,
                         buying_power_available=remaining_buying_power,
@@ -2041,31 +2284,70 @@ class TradeOSBot:
                 elif action == "SELL" and symbol in positions:
                     _dec_ts = decision_timestamp.isoformat() if decision_timestamp else ""
                     live_price, live_price_age = self.get_latest_price_with_age(symbol)
-                    if live_price_age > self.config.max_live_price_age_seconds:
-                        print(f"Skip {symbol}: stale live price age {live_price_age:.1f}s")
-                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="SELL",
-                            allowed=False, block_reason="stale_live_price",
-                            open_positions=open_positions, max_positions=self.config.max_open_positions,
-                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
-                            live_price_age_s=round(live_price_age, 1))
-                        continue
                     _signal_price = item.price or 0.0
                     _dev_bps = abs((live_price / _signal_price) - 1.0) * 10_000 if _signal_price > 0 else None
+                    if live_price_age > self.config.max_live_price_age_seconds:
+                        print(f"Skip {symbol}: stale live price age {live_price_age:.1f}s")
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="SELL",
+                            allowed=False,
+                            block_reason="stale_live_price",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            live_price=live_price,
+                            signal_price=_signal_price or None,
+                            price_deviation_bps=_dev_bps,
+                            live_price_age_s=round(live_price_age, 1),
+                            detail=(
+                                f"latest trade quote age {live_price_age:.1f}s exceeds "
+                                f"{self.config.max_live_price_age_seconds}s"
+                            ),
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            recent_order_count=recent_order_count,
+                        )
+                        continue
                     if self._is_price_collar_breached(_signal_price, live_price):
                         print(
                             f"Skip {symbol}: live price {live_price:.2f} breaches collar vs decision price {item.price:.2f}"
                         )
-                        self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="SELL",
-                            allowed=False, block_reason="price_collar_breached",
-                            open_positions=open_positions, max_positions=self.config.max_open_positions,
-                            daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
-                            live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="SELL",
+                            allowed=False,
+                            block_reason="price_collar_breached",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            live_price=live_price,
+                            signal_price=_signal_price,
+                            price_deviation_bps=_dev_bps,
+                            live_price_age_s=live_price_age,
+                            detail="live price moved outside the allowed collar versus the signal bar close",
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            recent_order_count=recent_order_count,
+                        )
                         continue
-                    self.blog.risk_check(symbol=symbol, decision_ts=_dec_ts, action="SELL",
-                        allowed=True, block_reason=None,
-                        open_positions=open_positions, max_positions=self.config.max_open_positions,
-                        daily_pnl=snapshot.daily_pnl, daily_limit=self.config.max_daily_loss_usd,
-                        live_price=live_price, signal_price=_signal_price, price_deviation_bps=_dev_bps)
+                    self._log_risk_check(
+                        symbol=symbol,
+                        decision_ts=_dec_ts,
+                        action="SELL",
+                        allowed=True,
+                        block_reason=None,
+                        snapshot=snapshot,
+                        open_positions=open_positions,
+                        live_price=live_price,
+                        signal_price=_signal_price,
+                        price_deviation_bps=_dev_bps,
+                        live_price_age_s=live_price_age,
+                        detail="all sell-side live risk checks passed",
+                        in_entry_window=in_entry_window,
+                        remaining_buying_power=remaining_buying_power,
+                        recent_order_count=recent_order_count,
+                    )
                     order = self.place_market_sell(
                         symbol,
                         positions[symbol],
@@ -2077,6 +2359,22 @@ class TradeOSBot:
                         orders_submitted += 1
                         open_positions = max(0, open_positions - 1)
                         recent_order_count += 1
+                elif action == "SELL":
+                    print(f"Skip {symbol} SELL: not currently holding")
+                    self._log_risk_check(
+                        symbol=symbol,
+                        decision_ts=decision_timestamp.isoformat(),
+                        action="SELL",
+                        allowed=False,
+                        block_reason="not_holding",
+                        snapshot=snapshot,
+                        open_positions=open_positions,
+                        signal_price=item.price or None,
+                        detail="sell signal ignored because there is no live position to exit",
+                        in_entry_window=in_entry_window,
+                        remaining_buying_power=remaining_buying_power,
+                        recent_order_count=recent_order_count,
+                    )
 
             except Exception as exc:
                 import traceback

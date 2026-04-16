@@ -131,7 +131,7 @@ MAX_DAILY_LOSS_USD=300
 
 > **Note:** Runtime trading settings (symbols, strategy mode, bar timeframe, indicator parameters) are driven by `config/live_config.json`, not `.env`. Set secrets and risk limits in `.env`; set strategy config in `config/live_config.json`.
 
-Run the live bot:
+Run the live bot directly:
 
 ```powershell
 tradeos live
@@ -209,9 +209,31 @@ This writes a dataset directory under `datasets/` containing:
 - `bars.parquet`
 - `manifest.json`
 
+### Session Launcher
+
+Start the live bot and dashboard together:
+
+```powershell
+.\start_dashboard.ps1
+```
+
+This is the preferred one-click launcher. By default it:
+
+- starts `tradeos live` unless a live bot is already running
+- starts or reuses the Streamlit dashboard
+- opens the browser when the dashboard is ready
+
+Monitoring-only alternative:
+
+```powershell
+.\start_dashboard.ps1 -DashboardOnly
+```
+
 ### Dashboard
 
-Run the local monitoring dashboard:
+Run the dashboard directly without the combined launcher:
+
+Direct CLI alternative:
 
 ```powershell
 tradeos dashboard

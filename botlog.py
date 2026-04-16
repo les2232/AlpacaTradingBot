@@ -195,6 +195,12 @@ class BotLogger:
         signal_price: float | None = None,
         price_deviation_bps: float | None = None,
         live_price_age_s: float | None = None,
+        detail: str | None = None,
+        in_entry_window: bool | None = None,
+        remaining_buying_power: float | None = None,
+        trade_budget: float | None = None,
+        recent_order_count: int | None = None,
+        max_orders_per_minute: int | None = None,
     ) -> None:
         kill_pct = round(-daily_pnl / daily_limit * 100, 1) if daily_limit > 0 else 0.0
         self._emit(self._risk, "risk.check",
@@ -211,6 +217,12 @@ class BotLogger:
             signal_price=round(signal_price, 4) if signal_price is not None else None,
             price_deviation_bps=round(price_deviation_bps, 1) if price_deviation_bps is not None else None,
             live_price_age_s=round(live_price_age_s, 1) if live_price_age_s is not None else None,
+            detail=detail,
+            in_entry_window=in_entry_window,
+            remaining_buying_power=round(remaining_buying_power, 2) if remaining_buying_power is not None else None,
+            trade_budget=round(trade_budget, 2) if trade_budget is not None else None,
+            recent_order_count=recent_order_count,
+            max_orders_per_minute=max_orders_per_minute,
         )
 
     def cycle_summary(

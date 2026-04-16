@@ -2431,7 +2431,12 @@ def _decision_logic_html(signal_row) -> str:
     )
 
 
-def _cycle_summary_html(last_cycle_report, latest_signal_rows: list, latest_cycle_risk_checks: list | None = None) -> str:
+def _cycle_summary_html(
+    last_cycle_report,
+    latest_signal_rows: list,
+    latest_cycle_risk_checks: list | None = None,
+    session_block_reason_counts: list | None = None,
+) -> str:
     if last_cycle_report is None:
         return (
             "<div class='cycle-summary'>"
@@ -2440,6 +2445,7 @@ def _cycle_summary_html(last_cycle_report, latest_signal_rows: list, latest_cycl
             "</div>"
         )
     latest_cycle_risk_checks = latest_cycle_risk_checks or []
+    session_block_reason_counts = session_block_reason_counts or []
     matching = [
         row for row in latest_signal_rows
         if row.decision_timestamp == last_cycle_report.decision_timestamp and (row.action or "").upper() == "HOLD"
@@ -2483,11 +2489,24 @@ def _cycle_summary_html(last_cycle_report, latest_signal_rows: list, latest_cycl
             for reason, count in sorted(hold_counts.items(), key=lambda item: (-item[1], item[0]))[:2]
         )
         line_two_parts.append(f"Holds: {hold_breakdown}")
+    line_three_parts: list[str] = []
+    if session_block_reason_counts:
+        session_breakdown = ", ".join(
+            f"{_pretty_reason(reason)} {count}"
+            for reason, count in session_block_reason_counts[:3]
+        )
+        line_three_parts.append(f"Session blocks: {session_breakdown}")
+    line_three_html = (
+        f"<div class='cycle-summary-line'>{' | '.join(line_three_parts)}</div>"
+        if line_three_parts
+        else ""
+    )
     return (
         "<div class='cycle-summary'>"
         "<div class='workspace-label' style='margin-bottom:0.4rem'>Cycle recap</div>"
         f"<div class='cycle-summary-line'>{' | '.join(line_one_parts)}</div>"
         f"<div class='cycle-summary-line'>{' | '.join(line_two_parts) if line_two_parts else _cycle_reason_label(last_cycle_report.skip_reason)}</div>"
+        f"{line_three_html}"
         "</div>"
     )
 
@@ -2846,7 +2865,15 @@ def _render_live(
         unsafe_allow_html=True,
     )
     st.markdown(_execution_panel_html(recent_execution_activity), unsafe_allow_html=True)
-    st.markdown(_cycle_summary_html(last_cycle_report, latest_signal_rows, latest_cycle_risk_checks), unsafe_allow_html=True)
+    st.markdown(
+        _cycle_summary_html(
+            last_cycle_report,
+            latest_signal_rows,
+            latest_cycle_risk_checks,
+            list(state.session_block_reason_counts) if hasattr(state, "session_block_reason_counts") else None,
+        ),
+        unsafe_allow_html=True,
+    )
 
     left_col, center_col, right_col = st.columns([1, 3, 1.5])
 
