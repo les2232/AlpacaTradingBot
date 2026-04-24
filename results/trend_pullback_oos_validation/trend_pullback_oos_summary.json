@@ -1,0 +1,103 @@
+{
+  "baseline": {
+    "strategy_mode": "trend_pullback",
+    "symbols": [
+      "AMD",
+      "JPM",
+      "HON",
+      "C"
+    ],
+    "hold_bars": 20,
+    "forward_horizons": [
+      4,
+      6,
+      8,
+      10,
+      15,
+      20,
+      30
+    ],
+    "dataset_path": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__sip__97d4a1837aaa__regular",
+    "runtime": {
+      "strategy_mode": "trend_pullback",
+      "sma_bars": 15,
+      "entry_threshold_pct": 0.0015,
+      "threshold_mode": "static_pct",
+      "atr_percentile_threshold": 0.0,
+      "time_window_mode": "combined_windows",
+      "regime_filter_enabled": false,
+      "trend_pullback_min_adx": 20.0,
+      "trend_pullback_min_slope": 0.0,
+      "trend_pullback_entry_threshold": 0.0015,
+      "trend_pullback_min_atr_percentile": 20.0,
+      "trend_pullback_max_atr_percentile": 0.0,
+      "trend_pullback_exit_style": "fixed_bars",
+      "trend_pullback_hold_bars": 20,
+      "trend_pullback_stop_pct": 0.0,
+      "symbols": [
+        "AMD",
+        "JPM",
+        "HON",
+        "C"
+      ]
+    }
+  },
+  "windows": [
+    {
+      "label": "month:2026-01",
+      "section": "months",
+      "start_date": "2026-01-01",
+      "end_date": "2026-01-31"
+    },
+    {
+      "label": "month:2026-02",
+      "section": "months",
+      "start_date": "2026-02-01",
+      "end_date": "2026-02-28"
+    },
+    {
+      "label": "month:2026-03",
+      "section": "months",
+      "start_date": "2026-03-01",
+      "end_date": "2026-03-31"
+    },
+    {
+      "label": "month:2026-04",
+      "section": "months",
+      "start_date": "2026-04-01",
+      "end_date": "2026-04-30"
+    },
+    {
+      "label": "segment:early",
+      "section": "segments",
+      "start_date": "2026-01-14",
+      "end_date": "2026-02-12"
+    },
+    {
+      "label": "segment:middle",
+      "section": "segments",
+      "start_date": "2026-02-13",
+      "end_date": "2026-03-13"
+    },
+    {
+      "label": "segment:late",
+      "section": "segments",
+      "start_date": "2026-03-16",
+      "end_date": "2026-04-13"
+    }
+  ],
+  "classification": "research-only",
+  "reason": "The frozen baseline is inconsistent across OOS windows and remains too fragile to trust.",
+  "diagnostics": {
+    "zero_trade_periods": [],
+    "negative_expectancy_periods": [
+      "month:2026-02",
+      "segment:middle",
+      "month:2026-03"
+    ],
+    "positive_period_ratio": 0.5714285714285714,
+    "positive_trade_ratio": 1.0,
+    "pnl_range": 174.13032479271033,
+    "max_top_positive_share": 1.0
+  }
+}

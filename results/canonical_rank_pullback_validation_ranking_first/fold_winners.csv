@@ -1,0 +1,10 @@
+window_idx,family,score_mode,selected_variant_id,selection_expectancy,selection_trade_count,train_start,train_end,test_start,test_end
+1,ranking_only,trend_consistency_20_x_slope_20_over_atr_20,ranking_only_trend_consistency_20_x_slope_20_over_atr_20_lb20_top20_hold5,2.491853830015872,77,2026-01-14,2026-02-26,2026-02-27,2026-03-12
+1,baseline,trend_consistency_20_x_slope_20_over_atr_20,baseline_trend_consistency_20_x_slope_20_over_atr_20_lb20_top20_hold2,-1.4230811792359985,78,2026-01-14,2026-02-26,2026-02-27,2026-03-12
+1,pullback,trend_consistency_20_x_slope_20_over_atr_20,pullback_trend_consistency_20_x_slope_20_over_atr_20_lb20_top30_hold10_pb0.5,-0.7741544587875553,66,2026-01-14,2026-02-26,2026-02-27,2026-03-12
+2,ranking_only,trend_consistency_20_x_slope_20_over_atr_20,ranking_only_trend_consistency_20_x_slope_20_over_atr_20_lb20_top30_hold10,-1.4103021595638625,70,2026-01-29,2026-03-12,2026-03-13,2026-03-26
+2,baseline,trend_consistency_20_x_slope_20_over_atr_20,baseline_trend_consistency_20_x_slope_20_over_atr_20_lb20_top30_hold5,-4.090429394324705,76,2026-01-29,2026-03-12,2026-03-13,2026-03-26
+2,pullback,trend_consistency_20_x_slope_20_over_atr_20,pullback_trend_consistency_20_x_slope_20_over_atr_20_lb20_top30_hold10_pb0.5,-4.931158991075166,66,2026-01-29,2026-03-12,2026-03-13,2026-03-26
+3,ranking_only,trend_consistency_20_x_slope_20_over_atr_20,ranking_only_trend_consistency_20_x_slope_20_over_atr_20_lb20_top30_hold5,-1.3076511805309068,80,2026-02-12,2026-03-26,2026-03-27,2026-04-10
+3,baseline,trend_consistency_20_x_slope_20_over_atr_20,baseline_trend_consistency_20_x_slope_20_over_atr_20_lb20_top30_hold2,-3.6207363443968057,83,2026-02-12,2026-03-26,2026-03-27,2026-04-10
+3,pullback,trend_consistency_20_x_slope_20_over_atr_20,pullback_trend_consistency_20_x_slope_20_over_atr_20_lb20_top20_hold5_pb0.5,-4.627420666126555,66,2026-02-12,2026-03-26,2026-03-27,2026-04-10

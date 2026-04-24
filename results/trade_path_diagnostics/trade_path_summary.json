@@ -1,0 +1,38 @@
+{
+  "summary": [
+    {
+      "raw_signal_count": 200,
+      "closed_trade_count": 75,
+      "avg_signal_to_entry_gap_pct": 0.030409221899089768,
+      "avg_best_net_exit_pct": 0.49815997089263875,
+      "avg_realized_return_pct": -0.08523852796494384,
+      "diagnosis": "The strategy is producing some favorable excursion, but it is not capturing it reliably."
+    }
+  ],
+  "hold_delta_summary": {
+    "sample_count": 200,
+    "avg_3b_net_return_pct": 0.03329511245129333,
+    "avg_4b_net_return_pct": 0.075406482085967,
+    "avg_delta_4m3_pct": 0.04211136963467368,
+    "profitable_3b_not_4b": 10,
+    "profitable_4b_not_3b": 23,
+    "giveback_between_3b_4b_frac": 43.0,
+    "peak_before_later_exit_frac": 100.0
+  },
+  "opportunity_summary": {
+    "trade_count": 75,
+    "avg_realized_return_pct": -0.08523852796494384,
+    "avg_best_net_exit_pct": 0.3964744766080527,
+    "avg_worst_net_exit_pct": -0.46786147544384915,
+    "avg_missed_opportunity_pct": 0.4817130045729966,
+    "avg_drawdown_before_best_pct": -0.10522540037314729,
+    "materially_worse_than_best_frac": 76.0
+  },
+  "cost_drag_summary": {
+    "trade_count": 75,
+    "avg_realized_return_pct": -0.08523852796494384,
+    "avg_gross_realized_return_pct": -0.03140040032583062,
+    "avg_cost_drag_pct": 0.05383812763911321
+  },
+  "diagnosis": "The strategy is producing some favorable excursion, but it is not capturing it reliably."
+}

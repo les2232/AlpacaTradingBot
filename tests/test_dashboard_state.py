@@ -82,6 +82,8 @@ def test_load_dashboard_state_reads_persisted_startup_config(monkeypatch) -> Non
         assert state.startup_config is not None
         assert state.startup_config.strategy_mode == "mean_reversion"
         assert state.startup_config.symbols == ["AMD", "MSFT"]
+        assert state.startup_config.mean_reversion_trend_filter is False
+        assert state.startup_config.mean_reversion_stop_pct == 0.0
         assert state.symbol_state_status == "cleared_runtime_symbol_state"
         assert str(state.storage.db_path).endswith(db_path)
     finally:
@@ -168,9 +170,9 @@ def test_load_dashboard_state_reports_unmatched_startup_artifact(monkeypatch) ->
         day_dir.mkdir(parents=True, exist_ok=True)
         (day_dir / "startup_config.20260413T143426Z.json").write_text(
             json.dumps(
-                {
-                    "session_id": "session-amd",
-                    "started_at_utc": "2026-04-13T14:34:26+00:00",
+                    {
+                        "session_id": "session-amd",
+                        "started_at_utc": "2026-04-13T14:30:00+00:00",
                     "launch_mode": "live",
                     "execution_enabled": True,
                     "paper": True,
@@ -211,9 +213,10 @@ def test_load_dashboard_state_reports_unmatched_startup_artifact(monkeypatch) ->
         storage.save_snapshot(snapshot, [], session_id="older-session", symbol_fingerprint="older")
         (day_dir / "risk.jsonl").write_text(
             json.dumps(
-                {
-                    "event": "cycle.summary",
-                    "decision_ts": "2026-04-13T14:30:00+00:00",
+                            {
+                                "event": "cycle.summary",
+                                "session_id": "session-amd",
+                                "decision_ts": "2026-04-13T14:30:00+00:00",
                     "execute_orders": True,
                     "processed_bar": True,
                     "skip_reason": "signals_blocked_or_skipped",
@@ -242,6 +245,30 @@ def test_build_session_warnings_detects_newer_startup_and_symbol_mismatch() -> N
     startup = PersistedStartupConfig(
         session_id="session-amd",
         started_at_utc="2026-04-13T14:34:26+00:00",
+        launch_mode="live",
+        execution_enabled=True,
+        paper=True,
+        account_mode="paper",
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        sma_bars=20,
+        symbols=["AMD"],
+        symbol_count=1,
+        runtime_config_path="config/live_config.json",
+        runtime_overrides=("symbols",),
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+        db_path="bot_history.db",
+    )
+    newer_startup = PersistedStartupConfig(
+        session_id="session-newer",
+        started_at_utc="2026-04-13T15:00:00+00:00",
         launch_mode="live",
         execution_enabled=True,
         paper=True,
@@ -308,12 +335,14 @@ def test_build_session_warnings_detects_newer_startup_and_symbol_mismatch() -> N
 
     warnings = _build_session_warnings(
         startup_config=startup,
+        latest_startup_config=newer_startup,
         snapshot=snapshot,
         has_persisted_snapshot=True,
         last_cycle_report=cycle,
         ignored_snapshot_symbols=("AMD", "TSLA"),
     )
 
+    assert any("newer TradeOS launch started at" in message for message in warnings)
     assert any("Current config symbols" in message for message in warnings)
     assert any("Latest persisted snapshot symbols" in message for message in warnings)
 
@@ -420,7 +449,169 @@ def test_select_startup_config_prefers_matching_run() -> None:
     )
 
     assert selected is not None
-    assert selected.artifact_path == later.artifact_path
+    assert selected.artifact_path == earlier.artifact_path
+
+
+def test_select_startup_config_ignores_later_failed_relaunch_when_snapshot_matches_earlier() -> None:
+    earlier = PersistedStartupConfig(
+        session_id="session-earlier",
+        started_at_utc="2026-04-13T14:00:00+00:00",
+        launch_mode="live",
+        execution_enabled=True,
+        paper=True,
+        account_mode="paper",
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        sma_bars=20,
+        symbols=["AMD"],
+        symbol_count=1,
+        runtime_config_path="config/live_config.json",
+        runtime_overrides=("symbols",),
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+        db_path="bot_history.db",
+        artifact_path="logs/2026-04-13/startup_config.20260413T140000Z.json",
+    )
+    later = PersistedStartupConfig(
+        session_id="session-failed-relaunch",
+        started_at_utc="2026-04-13T14:34:26+00:00",
+        launch_mode="live",
+        execution_enabled=True,
+        paper=True,
+        account_mode="paper",
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        sma_bars=20,
+        symbols=["AMD"],
+        symbol_count=1,
+        runtime_config_path="config/live_config.json",
+        runtime_overrides=("symbols",),
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+        db_path="bot_history.db",
+        artifact_path="logs/2026-04-13/startup_config.20260413T143426Z.json",
+    )
+    snapshot = PersistedBotSnapshot(
+        timestamp_utc="2026-04-13T14:30:00+00:00",
+        cash=1000.0,
+        buying_power=1000.0,
+        equity=1000.0,
+        last_equity=999.0,
+        daily_pnl=1.0,
+        kill_switch_triggered=False,
+        positions={},
+        symbols=[
+            PersistedSymbolSnapshot(
+                symbol="AMD",
+                price=1.0,
+                sma=1.0,
+                action="HOLD",
+                holding=False,
+                quantity=0.0,
+                market_value=0.0,
+            ),
+        ],
+    )
+
+    selected = _select_startup_config_for_session(
+        startup_configs=[earlier, later],
+        snapshot=snapshot,
+        has_persisted_snapshot=True,
+        last_cycle_report=None,
+    )
+
+    assert selected is not None
+    assert selected.session_id == "session-earlier"
+
+
+def test_select_startup_config_prefers_latest_run_session_id() -> None:
+    earlier = PersistedStartupConfig(
+        session_id="session-earlier",
+        started_at_utc="2026-04-13T14:00:00+00:00",
+        launch_mode="live",
+        execution_enabled=True,
+        paper=True,
+        account_mode="paper",
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        sma_bars=20,
+        symbols=["AMD", "TSLA"],
+        symbol_count=2,
+        runtime_config_path="config/live_config.json",
+        runtime_overrides=("symbols",),
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+        db_path="bot_history.db",
+        artifact_path="logs/2026-04-13/startup_config.20260413T140000Z.json",
+    )
+    later = PersistedStartupConfig(
+        session_id="session-current",
+        started_at_utc="2026-04-13T14:34:26+00:00",
+        launch_mode="live",
+        execution_enabled=True,
+        paper=True,
+        account_mode="paper",
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        sma_bars=20,
+        symbols=["AMD"],
+        symbol_count=1,
+        runtime_config_path="config/live_config.json",
+        runtime_overrides=("symbols",),
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+        db_path="bot_history.db",
+        resync_status="RESYNC_OK",
+        gate_allows_entries=True,
+        gate_allows_exits=True,
+        artifact_path="logs/2026-04-13/startup_config.20260413T143426Z.json",
+    )
+    snapshot = PersistedBotSnapshot(
+        timestamp_utc="2026-04-13T14:30:00+00:00",
+        cash=1000.0,
+        buying_power=1000.0,
+        equity=1000.0,
+        last_equity=999.0,
+        daily_pnl=1.0,
+        kill_switch_triggered=False,
+        positions={},
+        symbols=[],
+    )
+
+    selected = _select_startup_config_for_session(
+        startup_configs=[earlier, later],
+        snapshot=snapshot,
+        has_persisted_snapshot=True,
+        last_cycle_report=None,
+        latest_run_session_id="session-current",
+    )
+
+    assert selected is not None
+    assert selected.session_id == "session-current"
 
 
 def test_load_dashboard_state_ignores_snapshot_from_different_symbol_session(monkeypatch) -> None:
@@ -507,7 +698,7 @@ def test_load_dashboard_state_includes_session_block_reason_counts() -> None:
             json.dumps(
                 {
                     "session_id": "session-amd",
-                    "started_at_utc": "2026-04-13T14:34:26+00:00",
+                    "started_at_utc": "2026-04-13T14:30:00+00:00",
                     "launch_mode": "live",
                     "execution_enabled": True,
                     "paper": True,
@@ -551,6 +742,7 @@ def test_load_dashboard_state_includes_session_block_reason_counts() -> None:
                     json.dumps(
                         {
                             "event": "cycle.summary",
+                            "session_id": "session-amd",
                             "decision_ts": "2026-04-13T14:30:00+00:00",
                             "execute_orders": True,
                             "processed_bar": True,
@@ -564,9 +756,10 @@ def test_load_dashboard_state_includes_session_block_reason_counts() -> None:
                         }
                     ),
                     json.dumps(
-                        {
-                            "event": "risk.check",
-                            "trace": "AMD_1776090600",
+                            {
+                                "event": "risk.check",
+                                "session_id": "session-amd",
+                                "trace": "AMD_1776090600",
                             "symbol": "AMD",
                             "action": "BUY",
                             "allowed": False,
@@ -576,9 +769,10 @@ def test_load_dashboard_state_includes_session_block_reason_counts() -> None:
                         }
                     ),
                     json.dumps(
-                        {
-                            "event": "risk.check",
-                            "trace": "TSLA_1776090600",
+                            {
+                                "event": "risk.check",
+                                "session_id": "session-amd",
+                                "trace": "TSLA_1776090600",
                             "symbol": "TSLA",
                             "action": "BUY",
                             "allowed": False,
@@ -588,9 +782,10 @@ def test_load_dashboard_state_includes_session_block_reason_counts() -> None:
                         }
                     ),
                     json.dumps(
-                        {
-                            "event": "risk.check",
-                            "trace": "ABBV_1776090600",
+                            {
+                                "event": "risk.check",
+                                "session_id": "session-amd",
+                                "trace": "ABBV_1776090600",
                             "symbol": "ABBV",
                             "action": "SELL",
                             "allowed": False,
@@ -611,6 +806,248 @@ def test_load_dashboard_state_includes_session_block_reason_counts() -> None:
             ("stale_live_price", 1),
         )
         assert state.latest_cycle_risk_checks[0].detail is not None
+    finally:
+        if old_log_root is None:
+            os.environ.pop("BOT_LOG_ROOT", None)
+        else:
+            os.environ["BOT_LOG_ROOT"] = old_log_root
+        if old_db_path is None:
+            os.environ.pop("BOT_DB_PATH", None)
+        else:
+            os.environ["BOT_DB_PATH"] = old_db_path
+        _cleanup_dashboard_test_artifacts(logs_dir, db_path)
+
+
+def test_load_dashboard_state_filters_day_logs_to_selected_session(monkeypatch) -> None:
+    temp_root = Path.cwd()
+    logs_dir = temp_root / f"test_logs_{uuid4().hex}"
+    day_dir = logs_dir / "2026-04-13"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    db_path = temp_root / f"test_dashboard_state_{uuid4().hex}.db"
+    storage = BotStorage(db_path)
+
+    old_log_root = os.environ.get("BOT_LOG_ROOT")
+    old_db_path = os.environ.get("BOT_DB_PATH")
+    os.environ["BOT_LOG_ROOT"] = str(logs_dir)
+    os.environ["BOT_DB_PATH"] = str(db_path)
+    try:
+        (day_dir / "startup_config.20260413T140000Z.json").write_text(
+            json.dumps(
+                {
+                    "session_id": "session-old",
+                    "started_at_utc": "2026-04-13T14:00:00+00:00",
+                    "launch_mode": "live",
+                    "execution_enabled": True,
+                    "paper": True,
+                    "account_mode": "paper",
+                    "strategy_mode": "mean_reversion",
+                    "bar_timeframe_minutes": 15,
+                    "sma_bars": 20,
+                    "symbols": ["AMD"],
+                    "symbol_count": 1,
+                    "runtime_config_path": "config/live_config.json",
+                    "runtime_overrides": ["symbols"],
+                    "max_usd_per_trade": 200.0,
+                    "max_symbol_exposure_usd": 200.0,
+                    "max_open_positions": 3,
+                    "max_daily_loss_usd": 300.0,
+                    "max_orders_per_minute": 6,
+                    "max_price_deviation_bps": 75.0,
+                    "max_live_price_age_seconds": 60,
+                    "max_data_delay_seconds": 300,
+                    "db_path": str(db_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        (day_dir / "startup_config.20260413T160000Z.json").write_text(
+            json.dumps(
+                {
+                    "session_id": "session-current",
+                    "started_at_utc": "2026-04-13T16:00:00+00:00",
+                    "launch_mode": "live",
+                    "execution_enabled": True,
+                    "paper": True,
+                    "account_mode": "paper",
+                    "strategy_mode": "mean_reversion",
+                    "bar_timeframe_minutes": 15,
+                    "sma_bars": 20,
+                    "symbols": ["AMD"],
+                    "symbol_count": 1,
+                    "runtime_config_path": "config/live_config.json",
+                    "runtime_overrides": ["symbols"],
+                    "max_usd_per_trade": 200.0,
+                    "max_symbol_exposure_usd": 200.0,
+                    "max_open_positions": 3,
+                    "max_daily_loss_usd": 300.0,
+                    "max_orders_per_minute": 6,
+                    "max_price_deviation_bps": 75.0,
+                    "max_live_price_age_seconds": 60,
+                    "max_data_delay_seconds": 300,
+                    "db_path": str(db_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = type("Snapshot", (), {})()
+        snapshot.timestamp_utc = "2026-04-13T16:15:00+00:00"
+        snapshot.cash = 1.0
+        snapshot.buying_power = 1.0
+        snapshot.equity = 1.0
+        snapshot.last_equity = 1.0
+        snapshot.daily_pnl = 0.0
+        snapshot.kill_switch_triggered = False
+        snapshot.positions = {}
+        snapshot.symbols = [
+            type("Row", (), {"symbol": "AMD", "price": 1.0, "sma": 1.0, "action": "HOLD", "holding": False, "quantity": 0.0, "market_value": 0.0, "ml_probability_up": None, "ml_confidence": None, "ml_training_rows": None, "holding_minutes": None, "error": None})(),
+        ]
+        storage.save_snapshot(snapshot, [], session_id="session-current", symbol_fingerprint="amd")
+
+        (day_dir / "risk.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "event": "cycle.summary",
+                            "session_id": "session-old",
+                            "decision_ts": "2026-04-13T14:15:00+00:00",
+                            "execute_orders": True,
+                            "processed_bar": True,
+                            "skip_reason": "signals_blocked_or_skipped",
+                            "buy_signals": 1,
+                            "sell_signals": 0,
+                            "hold_signals": 1,
+                            "error_signals": 0,
+                            "orders_submitted": 0,
+                            "ts": "2026-04-13T14:15:20+00:00",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "event": "cycle.summary",
+                            "session_id": "session-current",
+                            "decision_ts": "2026-04-13T16:15:00+00:00",
+                            "execute_orders": True,
+                            "processed_bar": True,
+                            "skip_reason": "signals_blocked_or_skipped",
+                            "buy_signals": 2,
+                            "sell_signals": 0,
+                            "hold_signals": 1,
+                            "error_signals": 0,
+                            "orders_submitted": 0,
+                            "ts": "2026-04-13T16:15:20+00:00",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "event": "risk.check",
+                            "session_id": "session-old",
+                            "trace": "AMD_1776090600",
+                            "symbol": "AMD",
+                            "action": "BUY",
+                            "allowed": False,
+                            "block_reason": "max_open_positions_reached",
+                            "detail": "old session block",
+                            "ts": "2026-04-13T14:15:25+00:00",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "event": "risk.check",
+                            "session_id": "session-current",
+                            "trace": "AMD_1776097800",
+                            "symbol": "AMD",
+                            "action": "BUY",
+                            "allowed": False,
+                            "block_reason": "stale_live_price",
+                            "detail": "current session block",
+                            "ts": "2026-04-13T16:15:25+00:00",
+                        }
+                    ),
+                ]
+            ) + "\n",
+            encoding="utf-8",
+        )
+        (day_dir / "signals.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "event": "signal.evaluated",
+                            "session_id": "session-old",
+                            "symbol": "AMD",
+                            "decision_ts": "2026-04-13T14:15:00+00:00",
+                            "bar_close": 100.0,
+                            "sma": 101.0,
+                            "deviation_pct": -1.0,
+                            "trend_sma": 102.0,
+                            "above_trend_sma": False,
+                            "atr_pct": 1.0,
+                            "atr_percentile": 50.0,
+                            "volume_ratio": 1.2,
+                            "trend_filter": "reject",
+                            "atr_filter": "pass",
+                            "window_open": True,
+                            "action": "HOLD",
+                            "holding": False,
+                            "rejection": "trend_filter",
+                            "ts": "2026-04-13T14:15:10+00:00",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "event": "signal.evaluated",
+                            "session_id": "session-current",
+                            "symbol": "AMD",
+                            "decision_ts": "2026-04-13T16:15:00+00:00",
+                            "bar_close": 99.5,
+                            "sma": 101.0,
+                            "deviation_pct": -1.5,
+                            "trend_sma": 100.0,
+                            "above_trend_sma": False,
+                            "atr_pct": 1.1,
+                            "atr_percentile": 55.0,
+                            "volume_ratio": 1.4,
+                            "trend_filter": "pass",
+                            "atr_filter": "reject",
+                            "window_open": True,
+                            "action": "HOLD",
+                            "holding": False,
+                            "rejection": "atr_filter",
+                            "strategy_mode": "mean_reversion",
+                            "final_signal_reason": "mean_reversion_no_signal",
+                            "decision_summary": "HOLD in mean reversion mode. reason: mean reversion no signal.",
+                            "entry_reference_price": 98.75,
+                            "exit_reference_price": 101.0,
+                            "vwap": 100.2,
+                            "adx": 21.4,
+                            "regime_state": "bearish",
+                            "ts": "2026-04-13T16:15:10+00:00",
+                        }
+                    ),
+                ]
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        state = load_dashboard_state()
+
+        assert state.startup_config is not None
+        assert state.startup_config.session_id == "session-current"
+        assert state.last_cycle_report is not None
+        assert state.last_cycle_report.decision_timestamp == "2026-04-13T16:15:00+00:00"
+        assert state.session_block_reason_counts == (("stale_live_price", 1),)
+        assert state.recent_near_misses[0].rejection == "atr_filter"
+        assert state.latest_signal_rows[0].strategy_mode == "mean_reversion"
+        assert state.latest_signal_rows[0].final_signal_reason == "mean_reversion_no_signal"
+        assert state.latest_signal_rows[0].entry_reference_price == 98.75
+        assert state.latest_signal_rows[0].regime_state == "bearish"
+        assert state.drift_report is not None
+        assert state.drift_report.live.total_evaluated == 1
+        assert state.drift_report.live.stale_bar_count == 0
+        assert all(item.rejection != "trend_filter" for item in state.recent_near_misses)
+        assert all("old session block" not in item.narration for item in state.recent_narrations)
     finally:
         if old_log_root is None:
             os.environ.pop("BOT_LOG_ROOT", None)

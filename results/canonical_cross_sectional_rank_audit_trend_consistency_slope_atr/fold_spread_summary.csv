@@ -1,0 +1,4 @@
+score_mode,window_idx,test_start,test_end,bucket,horizon_bars,observation_count,mean_return_pct,median_return_pct,std_return_pct,hit_rate_pct
+trend_consistency_20_x_slope_20_over_atr_20,1,2026-03-16,2026-04-13,top_minus_bottom,5,514,0.06409588512084406,0.03883539615437415,0.6555173825318913,54.474708171206224
+trend_consistency_20_x_slope_20_over_atr_20,1,2026-03-16,2026-04-13,top_minus_bottom,10,509,0.13514489163792345,0.11665848228855413,0.885604572073694,58.93909626719057
+trend_consistency_20_x_slope_20_over_atr_20,1,2026-03-16,2026-04-13,top_minus_bottom,20,499,0.2037372092344261,0.29896300344802507,1.2319605826524078,64.12825651302605

@@ -1,0 +1,53 @@
+{
+  "diagnostics": {
+    "dataset_path": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e",
+    "symbol_count": 15,
+    "symbols": [
+      "ABBV",
+      "AMD",
+      "BAC",
+      "C",
+      "COP",
+      "GOOGL",
+      "HD",
+      "HON",
+      "JPM",
+      "LLY",
+      "MSFT",
+      "QCOM",
+      "TSLA",
+      "WFC",
+      "XOM"
+    ],
+    "timeframe": "15Min",
+    "feed": "iex",
+    "tested_variant_count": 2,
+    "fold_count": 1,
+    "rank_lookbacks": [
+      20
+    ],
+    "eligible_percents": [
+      0.2
+    ],
+    "pullback_depths": [
+      0.5
+    ],
+    "hold_bars": [
+      5
+    ],
+    "success_criteria": {
+      "pullback_improves_quality_metric": false,
+      "pullback_trade_count_ok": true,
+      "robustness_ok": true,
+      "promotion_ready": false,
+      "family_top_positive_share": {
+        "baseline": 0.36438925331544986,
+        "pullback": 0.3784621422148297
+      }
+    }
+  },
+  "promotion_discipline": {
+    "selection_rule": "Best in-sample variant is selected separately inside each fold and family; stitched OOS behavior is reported for comparison.",
+    "selected_from_single_is_run": false
+  }
+}

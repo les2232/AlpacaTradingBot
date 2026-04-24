@@ -1,0 +1,10 @@
+{
+  "trend_pullback": {
+    "materiality": "slightly cleaner but same conclusion",
+    "reason": "SIP changes the metrics somewhat, but not enough to overturn the core conclusion."
+  },
+  "volatility_expansion": {
+    "materiality": "requires re-evaluation",
+    "reason": "The headline classification stayed similar, but the signal count or expectancy shifted enough to warrant a closer follow-up."
+  }
+}

@@ -12,6 +12,8 @@ from typing import Any
 import pandas as pd
 
 from strategy import (
+    BOLLINGER_EXIT_CHOICES,
+    BOLLINGER_EXIT_MIDDLE_BAND,
     BREAKOUT_EXIT_CHOICES,
     BREAKOUT_EXIT_EOD_ONLY,
     BREAKOUT_EXIT_TARGET_1X_STOP_LOW,
@@ -27,13 +29,26 @@ from strategy import (
     ORB_FILTER_NONE,
     REGIME_SMA_PERIOD,
     STRATEGY_MODE_BREAKOUT,
+    STRATEGY_MODE_BOLLINGER_SQUEEZE,
     STRATEGY_MODE_CHOICES,
     STRATEGY_MODE_HYBRID,
+    STRATEGY_MODE_HYBRID_BB_MR,
     STRATEGY_MODE_MEAN_REVERSION,
+    STRATEGY_MODE_MOMENTUM_BREAKOUT,
     STRATEGY_MODE_ML,
     STRATEGY_MODE_ORB,
     STRATEGY_MODE_SMA,
+    STRATEGY_MODE_TREND_PULLBACK,
+    STRATEGY_MODE_VOLATILITY_EXPANSION,
     STRATEGY_MODE_WICK_FADE,
+    MOMENTUM_BREAKOUT_EXIT_CHOICES,
+    MOMENTUM_BREAKOUT_EXIT_FIXED_BARS,
+    TREND_PULLBACK_EXIT_CHOICES,
+    TREND_PULLBACK_EXIT_FIXED_BARS,
+    TREND_PULLBACK_EXIT_HYBRID_TP_OR_TIME,
+    TREND_PULLBACK_EXIT_TAKE_PROFIT,
+    VOLATILITY_EXPANSION_EXIT_CHOICES,
+    VOLATILITY_EXPANSION_EXIT_FIXED_BARS,
     Strategy,
     StrategyConfig,
     THRESHOLD_MODE_CHOICES,
@@ -44,6 +59,7 @@ from strategy import (
     calculate_adx_series,
     calculate_atr_pct_values,
     calculate_atr_percentile_series,
+    calculate_bollinger_squeeze_features,
     calculate_hourly_regime_series,
     calculate_opening_range_series,
     calculate_vwap_series,
@@ -53,12 +69,28 @@ from strategy import (
     normalize_threshold_mode,
     normalize_time_window_mode,
     normalize_orb_filter_mode,
+    normalize_bollinger_exit_mode,
     normalize_breakout_exit_style,
     normalize_mean_reversion_exit_style,
+    normalize_momentum_breakout_exit_style,
+    normalize_trend_pullback_exit_style,
+    normalize_volatility_expansion_exit_style,
+    strategy_requires_adx,
 )
 
 logger = logging.getLogger(__name__)
 _LOGGED_DATASET_SYMBOL_MESSAGES: set[tuple[str, str, tuple[str, ...]]] = set()
+
+TREND_PULLBACK_RESEARCH_EXIT_FILL_NEXT_OPEN = "next_open"
+TREND_PULLBACK_RESEARCH_EXIT_FILL_BAR_CLOSE = "bar_close"
+TREND_PULLBACK_RESEARCH_EXIT_FILL_CHOICES = (
+    TREND_PULLBACK_RESEARCH_EXIT_FILL_NEXT_OPEN,
+    TREND_PULLBACK_RESEARCH_EXIT_FILL_BAR_CLOSE,
+)
+
+
+def normalize_trend_pullback_research_exit_fill(exit_fill: str) -> str:
+    return str(exit_fill or TREND_PULLBACK_RESEARCH_EXIT_FILL_NEXT_OPEN).strip().lower()
 
 
 DEFAULT_SMA_BARS = 20
@@ -93,6 +125,53 @@ class BacktestConfig:
     sma_stop_pct: float = 0.0
     mean_reversion_exit_style: str = MEAN_REVERSION_EXIT_SMA
     mean_reversion_max_atr_percentile: float = 0.0
+    mean_reversion_stop_pct: float = 0.0
+    mean_reversion_trend_filter: bool = False
+    mean_reversion_trend_slope_filter: bool = False
+    vwap_z_entry_threshold: float = 0.0
+    vwap_z_stop_atr_multiple: float = 2.0
+    min_atr_percentile: float = 0.0
+    max_adx_threshold: float = 0.0
+    trend_pullback_min_adx: float = 20.0
+    trend_pullback_min_slope: float = 0.0
+    trend_pullback_entry_threshold: float = 0.0015
+    trend_pullback_min_atr_percentile: float = 20.0
+    trend_pullback_max_atr_percentile: float = 0.0
+    trend_pullback_exit_style: str = "fixed_bars"
+    trend_pullback_hold_bars: int = 4
+    trend_pullback_take_profit_pct: float = 0.0
+    trend_pullback_stop_pct: float = 0.0
+    trend_pullback_research_exit_fill: str = "next_open"
+    momentum_breakout_lookback_bars: int = 20
+    momentum_breakout_entry_buffer_pct: float = 0.001
+    momentum_breakout_min_adx: float = 20.0
+    momentum_breakout_min_slope: float = 0.0
+    momentum_breakout_min_atr_percentile: float = 20.0
+    momentum_breakout_exit_style: str = MOMENTUM_BREAKOUT_EXIT_FIXED_BARS
+    momentum_breakout_hold_bars: int = 3
+    momentum_breakout_stop_pct: float = 0.0
+    momentum_breakout_take_profit_pct: float = 0.0
+    volatility_expansion_lookback_bars: int = 20
+    volatility_expansion_entry_buffer_pct: float = 0.001
+    volatility_expansion_max_atr_percentile: float = 0.0
+    volatility_expansion_trend_filter: bool = False
+    volatility_expansion_min_slope: float = 0.0
+    volatility_expansion_use_volume_confirm: bool = True
+    volatility_expansion_exit_style: str = VOLATILITY_EXPANSION_EXIT_FIXED_BARS
+    volatility_expansion_hold_bars: int = 4
+    volatility_expansion_stop_pct: float = 0.0
+    volatility_expansion_take_profit_pct: float = 0.0
+    bb_period: int = 20
+    bb_stddev_mult: float = 2.0
+    bb_width_lookback: int = 100
+    bb_squeeze_quantile: float = 0.20
+    bb_slope_lookback: int = 3
+    bb_use_volume_confirm: bool = True
+    bb_volume_mult: float = 1.2
+    bb_breakout_buffer_pct: float = 0.0
+    bb_min_mid_slope: float = 0.0
+    bb_trend_filter: bool = False
+    bb_exit_mode: str = BOLLINGER_EXIT_MIDDLE_BAND
     starting_capital: float = DEFAULT_STARTING_CAPITAL
     position_size: float = DEFAULT_POSITION_SIZE
     start_date: str | None = None
@@ -151,6 +230,50 @@ class _BacktestInputs:
     mean_reversion_exit_style: str
     mean_reversion_max_atr_percentile: float
     mean_reversion_stop_pct: float
+    vwap_z_entry_threshold: float
+    vwap_z_stop_atr_multiple: float
+    min_atr_percentile: float
+    max_adx_threshold: float
+    trend_pullback_min_adx: float
+    trend_pullback_min_slope: float
+    trend_pullback_entry_threshold: float
+    trend_pullback_min_atr_percentile: float
+    trend_pullback_max_atr_percentile: float
+    trend_pullback_exit_style: str
+    trend_pullback_hold_bars: int
+    trend_pullback_take_profit_pct: float
+    trend_pullback_stop_pct: float
+    trend_pullback_research_exit_fill: str
+    momentum_breakout_lookback_bars: int
+    momentum_breakout_entry_buffer_pct: float
+    momentum_breakout_min_adx: float
+    momentum_breakout_min_slope: float
+    momentum_breakout_min_atr_percentile: float
+    momentum_breakout_exit_style: str
+    momentum_breakout_hold_bars: int
+    momentum_breakout_stop_pct: float
+    momentum_breakout_take_profit_pct: float
+    volatility_expansion_lookback_bars: int
+    volatility_expansion_entry_buffer_pct: float
+    volatility_expansion_max_atr_percentile: float
+    volatility_expansion_trend_filter: bool
+    volatility_expansion_min_slope: float
+    volatility_expansion_use_volume_confirm: bool
+    volatility_expansion_exit_style: str
+    volatility_expansion_hold_bars: int
+    volatility_expansion_stop_pct: float
+    volatility_expansion_take_profit_pct: float
+    bb_period: int
+    bb_stddev_mult: float
+    bb_width_lookback: int
+    bb_squeeze_quantile: float
+    bb_slope_lookback: int
+    bb_use_volume_confirm: bool
+    bb_volume_mult: float
+    bb_breakout_buffer_pct: float
+    bb_min_mid_slope: float
+    bb_trend_filter: bool
+    bb_exit_mode: str
     sma_stop_pct: float
     mean_reversion_trend_filter: bool
     mean_reversion_trend_slope_filter: bool
@@ -179,6 +302,16 @@ class _SimState:
     opening_range_low_arrs: dict[str, list[float | None]]
     vwap_arrs: dict[str, list[float | None]]
     adx_arrs: dict[str, list[float | None]]
+    bb_middle_arrs: dict[str, list[float | None]]
+    bb_upper_arrs: dict[str, list[float | None]]
+    bb_lower_arrs: dict[str, list[float | None]]
+    bb_width_arrs: dict[str, list[float | None]]
+    bb_squeeze_arrs: dict[str, list[bool]]
+    bb_mid_slope_arrs: dict[str, list[float | None]]
+    bb_bias_arrs: dict[str, list[str]]
+    bb_breakout_up_arrs: dict[str, list[bool | None]]
+    bb_breakout_down_arrs: dict[str, list[bool | None]]
+    bb_volume_confirm_arrs: dict[str, list[bool | None]]
     # Mutable position / trade tracking
     pointers: dict[str, int]
     position: dict[str, bool]
@@ -191,12 +324,17 @@ class _SimState:
     breakout_range_at_entry: dict[str, float]
     breakout_stored_stop: dict[str, float]
     mean_reversion_target_price: dict[str, float]
+    hybrid_entry_branch: dict[str, str | None]
+    entry_bar_index: dict[str, int | None]
     wick_fade_stop: dict[str, float]
     wick_fade_target: dict[str, float]
     wick_fade_bars_held: dict[str, int]
+    trend_pullback_bars_held: dict[str, int]
+    momentum_breakout_bars_held: dict[str, int]
+    volatility_expansion_bars_held: dict[str, int]
     wick_fade_signal_atr_pct: dict[str, float]
-    pending_buys: dict[str, tuple[float, pd.Timestamp]]
-    pending_sells: set[str]
+    pending_buys: dict[str, tuple[float, pd.Timestamp, str | None]]
+    pending_sells: dict[str, dict[str, Any]]
     # ORB per-day state (one trade per symbol per day)
     orb_entry_taken: dict[str, bool]
     orb_last_day: dict[str, pd.Timestamp | None]
@@ -216,6 +354,23 @@ def _mean(values: list[float]) -> float:
 def _stddev(values: list[float], mean_val: float) -> float:
     variance = sum((v - mean_val) ** 2 for v in values) / max(1, len(values))
     return math.sqrt(max(variance, 1e-12))
+
+
+def _trend_pullback_should_exit_on_close(strategy_mode: str, exit_fill: str) -> bool:
+    return (
+        normalize_strategy_mode(strategy_mode) == STRATEGY_MODE_TREND_PULLBACK
+        and normalize_trend_pullback_research_exit_fill(exit_fill) == TREND_PULLBACK_RESEARCH_EXIT_FILL_BAR_CLOSE
+    )
+
+
+def _resolve_bar_close_exit_fill_price(
+    *,
+    row_close: float,
+    slippage: float,
+    exit_price_hint: float | None = None,
+) -> float:
+    fill_reference_price = float(exit_price_hint) if exit_price_hint is not None else float(row_close)
+    return max(fill_reference_price - slippage, 0.0)
 
 
 def _build_feature_vector(closes: list[float], volumes: list[float], idx: int) -> list[float]:
@@ -606,6 +761,44 @@ def _build_performance_summary(
     }
 
 
+def _summarize_hybrid_branch_stats(trades: list[dict[str, Any]]) -> dict[str, dict[str, float | int | str | None]]:
+    branch_closed_trades: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        trade_side = trade.get("side") or trade.get("action")
+        if trade_side != "SELL":
+            continue
+        entry_branch = trade.get("entry_branch")
+        if not isinstance(entry_branch, str) or not entry_branch:
+            continue
+        branch_closed_trades.setdefault(entry_branch, []).append(trade)
+
+    summary: dict[str, dict[str, float | int | str | None]] = {}
+    for branch, branch_trades in branch_closed_trades.items():
+        pnls = [float(trade.get("pnl", 0.0) or 0.0) for trade in branch_trades]
+        winning_pnls = [pnl for pnl in pnls if pnl > 0]
+        losing_pnls = [pnl for pnl in pnls if pnl < 0]
+        hold_bars = [
+            float(trade["holding_bars"])
+            for trade in branch_trades
+            if trade.get("holding_bars") is not None
+        ]
+        total_trades = len(branch_trades)
+        realized_pnl = sum(pnls)
+        summary[branch] = {
+            "branch": branch,
+            "total_trades": total_trades,
+            "wins": len(winning_pnls),
+            "losses": len(losing_pnls),
+            "win_rate": (len(winning_pnls) / total_trades * 100.0) if total_trades else 0.0,
+            "realized_pnl": realized_pnl,
+            "avg_pnl_per_trade": (realized_pnl / total_trades) if total_trades else 0.0,
+            "avg_hold_bars": (_mean(hold_bars) if hold_bars else None),
+            "avg_winning_trade": (_mean(winning_pnls) if winning_pnls else 0.0),
+            "avg_losing_trade": (_mean(losing_pnls) if losing_pnls else 0.0),
+        }
+    return summary
+
+
 def _update_mark_to_market(
     symbols: list[str],
     position: dict[str, bool],
@@ -651,13 +844,19 @@ def _execute_sell(
     breakout_range_at_entry: dict[str, float],
     breakout_stored_stop: dict[str, float],
     mean_reversion_target_price: dict[str, float],
+    hybrid_entry_branch: dict[str, str | None],
+    entry_bar_index: dict[str, int | None],
     wick_fade_stop: dict[str, float],
     wick_fade_target: dict[str, float],
     wick_fade_bars_held: dict[str, int],
+    trend_pullback_bars_held: dict[str, int],
+    momentum_breakout_bars_held: dict[str, int],
+    volatility_expansion_bars_held: dict[str, int],
     latest_mark_price: dict[str, float],
     position: dict[str, bool],
     commission: float,
     cash: float,
+    current_bar_index: int | None = None,
     extra_trade_fields: dict[str, Any] | None = None,
 ) -> float:
     exit_proceeds = shares_held[symbol] * fill_price
@@ -678,6 +877,12 @@ def _execute_sell(
         "shares": shares_held[symbol],
         "timestamp": timestamp_str,
         "pnl": pnl,
+        "entry_branch": hybrid_entry_branch[symbol],
+        "holding_bars": (
+            (current_bar_index - entry_bar_index[symbol] + 1)
+            if current_bar_index is not None and entry_bar_index[symbol] is not None
+            else None
+        ),
     }
     if extra_trade_fields:
         trade_record.update(extra_trade_fields)
@@ -689,9 +894,14 @@ def _execute_sell(
     breakout_range_at_entry[symbol] = 0.0
     breakout_stored_stop[symbol] = 0.0
     mean_reversion_target_price[symbol] = 0.0
+    hybrid_entry_branch[symbol] = None
+    entry_bar_index[symbol] = None
     wick_fade_stop[symbol] = 0.0
     wick_fade_target[symbol] = 0.0
     wick_fade_bars_held[symbol] = 0
+    trend_pullback_bars_held[symbol] = 0
+    momentum_breakout_bars_held[symbol] = 0
+    volatility_expansion_bars_held[symbol] = 0
     results["symbol_trade_counts"][symbol] += 1
     results["total_trades"] += 1
     symbol_stat["total_trades"] += 1
@@ -712,8 +922,12 @@ def _execute_buy(
     shares_held: dict[str, float],
     entry_price: dict[str, float],
     entry_cost: dict[str, float],
+    hybrid_entry_branch: dict[str, str | None],
+    entry_bar_index: dict[str, int | None],
     latest_mark_price: dict[str, float],
     position: dict[str, bool],
+    current_bar_index: int,
+    entry_branch: str | None = None,
 ) -> float:
     total_cash_needed = position_size + commission
     if cash < total_cash_needed:
@@ -722,6 +936,8 @@ def _execute_buy(
     shares_held[symbol] = position_size / fill_price
     entry_price[symbol] = fill_price
     entry_cost[symbol] = position_size + commission
+    hybrid_entry_branch[symbol] = entry_branch
+    entry_bar_index[symbol] = current_bar_index
     symbol_stat = symbol_stats[symbol]
     cash -= total_cash_needed
     symbol_stat["cash"] -= total_cash_needed
@@ -733,6 +949,7 @@ def _execute_buy(
         "price": fill_price,
         "shares": shares_held[symbol],
         "timestamp": timestamp_str,
+        "entry_branch": entry_branch,
     })
     results["symbol_trade_counts"][symbol] += 1
     results["total_trades"] += 1
@@ -822,10 +1039,50 @@ def _prepare_backtest_inputs(
     atr_multiple: float,
     atr_percentile_threshold: float,
     regime_filter_enabled: bool,
+    bb_period: int = 20,
+    bb_stddev_mult: float = 2.0,
+    bb_width_lookback: int = 100,
+    bb_squeeze_quantile: float = 0.20,
+    bb_slope_lookback: int = 3,
+    bb_use_volume_confirm: bool = True,
+    bb_volume_mult: float = 1.2,
+    bb_breakout_buffer_pct: float = 0.0,
+    bb_min_mid_slope: float = 0.0,
+    bb_trend_filter: bool = False,
+    bb_exit_mode: str = BOLLINGER_EXIT_MIDDLE_BAND,
     vwap_z_entry_threshold: float = 0.0,
     vwap_z_stop_atr_multiple: float = 2.0,
     min_atr_percentile: float = 0.0,
     max_adx_threshold: float = 0.0,
+    trend_pullback_min_adx: float = 20.0,
+    trend_pullback_min_slope: float = 0.0,
+    trend_pullback_entry_threshold: float = 0.0015,
+    trend_pullback_min_atr_percentile: float = 20.0,
+    trend_pullback_max_atr_percentile: float = 0.0,
+    trend_pullback_exit_style: str = "fixed_bars",
+    trend_pullback_hold_bars: int = 4,
+    trend_pullback_take_profit_pct: float = 0.0,
+    trend_pullback_stop_pct: float = 0.0,
+    trend_pullback_research_exit_fill: str = "next_open",
+    momentum_breakout_lookback_bars: int = 20,
+    momentum_breakout_entry_buffer_pct: float = 0.001,
+    momentum_breakout_min_adx: float = 20.0,
+    momentum_breakout_min_slope: float = 0.0,
+    momentum_breakout_min_atr_percentile: float = 20.0,
+    momentum_breakout_exit_style: str = MOMENTUM_BREAKOUT_EXIT_FIXED_BARS,
+    momentum_breakout_hold_bars: int = 3,
+    momentum_breakout_stop_pct: float = 0.0,
+    momentum_breakout_take_profit_pct: float = 0.0,
+    volatility_expansion_lookback_bars: int = 20,
+    volatility_expansion_entry_buffer_pct: float = 0.001,
+    volatility_expansion_max_atr_percentile: float = 0.0,
+    volatility_expansion_trend_filter: bool = False,
+    volatility_expansion_min_slope: float = 0.0,
+    volatility_expansion_use_volume_confirm: bool = True,
+    volatility_expansion_exit_style: str = VOLATILITY_EXPANSION_EXIT_FIXED_BARS,
+    volatility_expansion_hold_bars: int = 4,
+    volatility_expansion_stop_pct: float = 0.0,
+    volatility_expansion_take_profit_pct: float = 0.0,
     wick_fade_min_lower_wick_ratio: float = 0.4,
     wick_fade_min_close_position: float = 0.5,
     wick_fade_min_range_pct: float = 0.003,
@@ -840,6 +1097,24 @@ def _prepare_backtest_inputs(
     orb_filter_mode = normalize_orb_filter_mode(orb_filter_mode)
     breakout_exit_style = normalize_breakout_exit_style(breakout_exit_style)
     mean_reversion_exit_style = normalize_mean_reversion_exit_style(mean_reversion_exit_style)
+    momentum_breakout_exit_style = normalize_momentum_breakout_exit_style(momentum_breakout_exit_style)
+    volatility_expansion_exit_style = normalize_volatility_expansion_exit_style(volatility_expansion_exit_style)
+    bb_exit_mode = normalize_bollinger_exit_mode(bb_exit_mode)
+    if bb_exit_mode not in BOLLINGER_EXIT_CHOICES:
+        raise ValueError(
+            f"Unsupported Bollinger exit mode: {bb_exit_mode}. "
+            f"Choose from {', '.join(BOLLINGER_EXIT_CHOICES)}."
+        )
+    if momentum_breakout_exit_style not in MOMENTUM_BREAKOUT_EXIT_CHOICES:
+        raise ValueError(
+            f"Unsupported momentum breakout exit style: {momentum_breakout_exit_style}. "
+            f"Choose from {', '.join(MOMENTUM_BREAKOUT_EXIT_CHOICES)}."
+        )
+    if volatility_expansion_exit_style not in VOLATILITY_EXPANSION_EXIT_CHOICES:
+        raise ValueError(
+            f"Unsupported volatility expansion exit style: {volatility_expansion_exit_style}. "
+            f"Choose from {', '.join(VOLATILITY_EXPANSION_EXIT_CHOICES)}."
+        )
 
     df, manifest, resolved_symbols = _load_filtered_dataset(dataset_path, symbols, start_date, end_date)
 
@@ -877,10 +1152,49 @@ def _prepare_backtest_inputs(
             sma_stop_pct=sma_stop_pct,
             mean_reversion_trend_filter=mean_reversion_trend_filter,
             mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
+            bb_period=bb_period,
+            bb_stddev_mult=bb_stddev_mult,
+            bb_width_lookback=bb_width_lookback,
+            bb_squeeze_quantile=bb_squeeze_quantile,
+            bb_slope_lookback=bb_slope_lookback,
+            bb_use_volume_confirm=bb_use_volume_confirm,
+            bb_volume_mult=bb_volume_mult,
+            bb_breakout_buffer_pct=bb_breakout_buffer_pct,
+            bb_min_mid_slope=bb_min_mid_slope,
+            bb_trend_filter=bb_trend_filter,
+            bb_exit_mode=bb_exit_mode,
             vwap_z_entry_threshold=vwap_z_entry_threshold,
             vwap_z_stop_atr_multiple=vwap_z_stop_atr_multiple,
             min_atr_percentile=min_atr_percentile,
             max_adx_threshold=max_adx_threshold,
+            trend_pullback_min_adx=trend_pullback_min_adx,
+            trend_pullback_min_slope=trend_pullback_min_slope,
+            trend_pullback_entry_threshold=trend_pullback_entry_threshold,
+            trend_pullback_min_atr_percentile=trend_pullback_min_atr_percentile,
+            trend_pullback_max_atr_percentile=trend_pullback_max_atr_percentile,
+            trend_pullback_exit_style=normalize_trend_pullback_exit_style(trend_pullback_exit_style),
+            trend_pullback_hold_bars=trend_pullback_hold_bars,
+            trend_pullback_take_profit_pct=trend_pullback_take_profit_pct,
+            trend_pullback_stop_pct=trend_pullback_stop_pct,
+            momentum_breakout_lookback_bars=momentum_breakout_lookback_bars,
+            momentum_breakout_entry_buffer_pct=momentum_breakout_entry_buffer_pct,
+            momentum_breakout_min_adx=momentum_breakout_min_adx,
+            momentum_breakout_min_slope=momentum_breakout_min_slope,
+            momentum_breakout_min_atr_percentile=momentum_breakout_min_atr_percentile,
+            momentum_breakout_exit_style=normalize_momentum_breakout_exit_style(momentum_breakout_exit_style),
+            momentum_breakout_hold_bars=momentum_breakout_hold_bars,
+            momentum_breakout_stop_pct=momentum_breakout_stop_pct,
+            momentum_breakout_take_profit_pct=momentum_breakout_take_profit_pct,
+            volatility_expansion_lookback_bars=volatility_expansion_lookback_bars,
+            volatility_expansion_entry_buffer_pct=volatility_expansion_entry_buffer_pct,
+            volatility_expansion_max_atr_percentile=volatility_expansion_max_atr_percentile,
+            volatility_expansion_trend_filter=volatility_expansion_trend_filter,
+            volatility_expansion_min_slope=volatility_expansion_min_slope,
+            volatility_expansion_use_volume_confirm=volatility_expansion_use_volume_confirm,
+            volatility_expansion_exit_style=normalize_volatility_expansion_exit_style(volatility_expansion_exit_style),
+            volatility_expansion_hold_bars=volatility_expansion_hold_bars,
+            volatility_expansion_stop_pct=volatility_expansion_stop_pct,
+            volatility_expansion_take_profit_pct=volatility_expansion_take_profit_pct,
             wick_fade_min_lower_wick_ratio=wick_fade_min_lower_wick_ratio,
             wick_fade_min_close_position=wick_fade_min_close_position,
             wick_fade_min_range_pct=wick_fade_min_range_pct,
@@ -916,6 +1230,52 @@ def _prepare_backtest_inputs(
         mean_reversion_exit_style=mean_reversion_exit_style,
         mean_reversion_max_atr_percentile=mean_reversion_max_atr_percentile,
         mean_reversion_stop_pct=mean_reversion_stop_pct,
+        vwap_z_entry_threshold=vwap_z_entry_threshold,
+        vwap_z_stop_atr_multiple=vwap_z_stop_atr_multiple,
+        min_atr_percentile=min_atr_percentile,
+        max_adx_threshold=max_adx_threshold,
+        trend_pullback_min_adx=trend_pullback_min_adx,
+        trend_pullback_min_slope=trend_pullback_min_slope,
+        trend_pullback_entry_threshold=trend_pullback_entry_threshold,
+        trend_pullback_min_atr_percentile=trend_pullback_min_atr_percentile,
+        trend_pullback_max_atr_percentile=trend_pullback_max_atr_percentile,
+        trend_pullback_exit_style=normalize_trend_pullback_exit_style(trend_pullback_exit_style),
+        trend_pullback_hold_bars=trend_pullback_hold_bars,
+        trend_pullback_take_profit_pct=trend_pullback_take_profit_pct,
+        trend_pullback_stop_pct=trend_pullback_stop_pct,
+        trend_pullback_research_exit_fill=normalize_trend_pullback_research_exit_fill(
+            trend_pullback_research_exit_fill
+        ),
+        momentum_breakout_lookback_bars=momentum_breakout_lookback_bars,
+        momentum_breakout_entry_buffer_pct=momentum_breakout_entry_buffer_pct,
+        momentum_breakout_min_adx=momentum_breakout_min_adx,
+        momentum_breakout_min_slope=momentum_breakout_min_slope,
+        momentum_breakout_min_atr_percentile=momentum_breakout_min_atr_percentile,
+        momentum_breakout_exit_style=normalize_momentum_breakout_exit_style(momentum_breakout_exit_style),
+        momentum_breakout_hold_bars=momentum_breakout_hold_bars,
+        momentum_breakout_stop_pct=momentum_breakout_stop_pct,
+        momentum_breakout_take_profit_pct=momentum_breakout_take_profit_pct,
+        volatility_expansion_lookback_bars=volatility_expansion_lookback_bars,
+        volatility_expansion_entry_buffer_pct=volatility_expansion_entry_buffer_pct,
+        volatility_expansion_max_atr_percentile=volatility_expansion_max_atr_percentile,
+        volatility_expansion_trend_filter=volatility_expansion_trend_filter,
+        volatility_expansion_min_slope=volatility_expansion_min_slope,
+        volatility_expansion_use_volume_confirm=volatility_expansion_use_volume_confirm,
+        volatility_expansion_exit_style=normalize_volatility_expansion_exit_style(volatility_expansion_exit_style),
+        volatility_expansion_hold_bars=volatility_expansion_hold_bars,
+        volatility_expansion_stop_pct=volatility_expansion_stop_pct,
+        volatility_expansion_take_profit_pct=volatility_expansion_take_profit_pct,
+        bb_period=bb_period,
+        bb_stddev_mult=bb_stddev_mult,
+        bb_width_lookback=bb_width_lookback,
+        bb_squeeze_quantile=bb_squeeze_quantile,
+        bb_slope_lookback=bb_slope_lookback,
+        bb_use_volume_confirm=bb_use_volume_confirm,
+        bb_volume_mult=bb_volume_mult,
+        bb_breakout_buffer_pct=bb_breakout_buffer_pct,
+        bb_min_mid_slope=bb_min_mid_slope,
+        bb_trend_filter=bb_trend_filter,
+        bb_exit_mode=bb_exit_mode,
         sma_stop_pct=sma_stop_pct,
         mean_reversion_trend_filter=mean_reversion_trend_filter,
         mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
@@ -947,6 +1307,40 @@ def _initialize_simulation_state(
         "breakout_tight_stop_fraction": inputs.breakout_tight_stop_fraction,
         "mean_reversion_exit_style": inputs.mean_reversion_exit_style,
         "mean_reversion_max_atr_percentile": inputs.mean_reversion_max_atr_percentile,
+        "trend_pullback_exit_style": inputs.trend_pullback_exit_style,
+        "trend_pullback_hold_bars": inputs.trend_pullback_hold_bars,
+        "trend_pullback_take_profit_pct": inputs.trend_pullback_take_profit_pct,
+        "trend_pullback_research_exit_fill": inputs.trend_pullback_research_exit_fill,
+        "momentum_breakout_lookback_bars": inputs.momentum_breakout_lookback_bars,
+        "momentum_breakout_entry_buffer_pct": inputs.momentum_breakout_entry_buffer_pct,
+        "momentum_breakout_min_adx": inputs.momentum_breakout_min_adx,
+        "momentum_breakout_min_slope": inputs.momentum_breakout_min_slope,
+        "momentum_breakout_min_atr_percentile": inputs.momentum_breakout_min_atr_percentile,
+        "momentum_breakout_exit_style": inputs.momentum_breakout_exit_style,
+        "momentum_breakout_hold_bars": inputs.momentum_breakout_hold_bars,
+        "momentum_breakout_stop_pct": inputs.momentum_breakout_stop_pct,
+        "momentum_breakout_take_profit_pct": inputs.momentum_breakout_take_profit_pct,
+        "volatility_expansion_lookback_bars": inputs.volatility_expansion_lookback_bars,
+        "volatility_expansion_entry_buffer_pct": inputs.volatility_expansion_entry_buffer_pct,
+        "volatility_expansion_max_atr_percentile": inputs.volatility_expansion_max_atr_percentile,
+        "volatility_expansion_trend_filter": inputs.volatility_expansion_trend_filter,
+        "volatility_expansion_min_slope": inputs.volatility_expansion_min_slope,
+        "volatility_expansion_use_volume_confirm": inputs.volatility_expansion_use_volume_confirm,
+        "volatility_expansion_exit_style": inputs.volatility_expansion_exit_style,
+        "volatility_expansion_hold_bars": inputs.volatility_expansion_hold_bars,
+        "volatility_expansion_stop_pct": inputs.volatility_expansion_stop_pct,
+        "volatility_expansion_take_profit_pct": inputs.volatility_expansion_take_profit_pct,
+        "bb_period": inputs.bb_period,
+        "bb_stddev_mult": inputs.bb_stddev_mult,
+        "bb_width_lookback": inputs.bb_width_lookback,
+        "bb_squeeze_quantile": inputs.bb_squeeze_quantile,
+        "bb_slope_lookback": inputs.bb_slope_lookback,
+        "bb_use_volume_confirm": inputs.bb_use_volume_confirm,
+        "bb_volume_mult": inputs.bb_volume_mult,
+        "bb_breakout_buffer_pct": inputs.bb_breakout_buffer_pct,
+        "bb_min_mid_slope": inputs.bb_min_mid_slope,
+        "bb_trend_filter": inputs.bb_trend_filter,
+        "bb_exit_mode": inputs.bb_exit_mode,
         "threshold_mode": inputs.threshold_mode,
         "sma_bars": None,
         "entry_threshold_pct": inputs.entry_threshold_pct,
@@ -1003,6 +1397,16 @@ def _initialize_simulation_state(
     opening_range_low_arrs: dict[str, list[float | None]] = {}
     vwap_arrs: dict[str, list[float | None]] = {}
     adx_arrs:  dict[str, list[float | None]] = {}
+    bb_middle_arrs: dict[str, list[float | None]] = {}
+    bb_upper_arrs: dict[str, list[float | None]] = {}
+    bb_lower_arrs: dict[str, list[float | None]] = {}
+    bb_width_arrs: dict[str, list[float | None]] = {}
+    bb_squeeze_arrs: dict[str, list[bool]] = {}
+    bb_mid_slope_arrs: dict[str, list[float | None]] = {}
+    bb_bias_arrs: dict[str, list[str]] = {}
+    bb_breakout_up_arrs: dict[str, list[bool | None]] = {}
+    bb_breakout_down_arrs: dict[str, list[bool | None]] = {}
+    bb_volume_confirm_arrs: dict[str, list[bool | None]] = {}
 
     for symbol in symbols:
         sdf = df[df["symbol"] == symbol].sort_values("timestamp").reset_index(drop=True)
@@ -1034,6 +1438,27 @@ def _initialize_simulation_state(
             timestamp_arrs_sym, high_arrs_sym, low_arrs_sym, close_arrs[symbol], volume_arrs[symbol],
         )
         adx_arrs[symbol] = calculate_adx_series(high_arrs_sym, low_arrs_sym, close_arrs[symbol])
+        bb_features = calculate_bollinger_squeeze_features(
+            close_arrs[symbol],
+            volume_arrs[symbol],
+            period=inputs.bb_period,
+            stddev_mult=inputs.bb_stddev_mult,
+            width_lookback=inputs.bb_width_lookback,
+            squeeze_quantile=inputs.bb_squeeze_quantile,
+            slope_lookback=inputs.bb_slope_lookback,
+            use_volume_confirm=inputs.bb_use_volume_confirm,
+            volume_mult=inputs.bb_volume_mult,
+        )
+        bb_middle_arrs[symbol] = bb_features["middle"]  # type: ignore[assignment]
+        bb_upper_arrs[symbol] = bb_features["upper"]  # type: ignore[assignment]
+        bb_lower_arrs[symbol] = bb_features["lower"]  # type: ignore[assignment]
+        bb_width_arrs[symbol] = bb_features["width"]  # type: ignore[assignment]
+        bb_squeeze_arrs[symbol] = bb_features["squeeze"]  # type: ignore[assignment]
+        bb_mid_slope_arrs[symbol] = bb_features["mid_slope"]  # type: ignore[assignment]
+        bb_bias_arrs[symbol] = bb_features["bias"]  # type: ignore[assignment]
+        bb_breakout_up_arrs[symbol] = bb_features["breakout_up"]  # type: ignore[assignment]
+        bb_breakout_down_arrs[symbol] = bb_features["breakout_down"]  # type: ignore[assignment]
+        bb_volume_confirm_arrs[symbol] = bb_features["volume_confirm"]  # type: ignore[assignment]
 
     return _SimState(
         symbols_dfs=symbols_dfs,
@@ -1051,6 +1476,16 @@ def _initialize_simulation_state(
         opening_range_low_arrs=opening_range_low_arrs,
         vwap_arrs=vwap_arrs,
         adx_arrs=adx_arrs,
+        bb_middle_arrs=bb_middle_arrs,
+        bb_upper_arrs=bb_upper_arrs,
+        bb_lower_arrs=bb_lower_arrs,
+        bb_width_arrs=bb_width_arrs,
+        bb_squeeze_arrs=bb_squeeze_arrs,
+        bb_mid_slope_arrs=bb_mid_slope_arrs,
+        bb_bias_arrs=bb_bias_arrs,
+        bb_breakout_up_arrs=bb_breakout_up_arrs,
+        bb_breakout_down_arrs=bb_breakout_down_arrs,
+        bb_volume_confirm_arrs=bb_volume_confirm_arrs,
         pointers={s: 0 for s in symbols},
         position={s: False for s in symbols},
         entry_price={s: 0.0 for s in symbols},
@@ -1062,12 +1497,17 @@ def _initialize_simulation_state(
         breakout_range_at_entry={s: 0.0 for s in symbols},
         breakout_stored_stop={s: 0.0 for s in symbols},
         mean_reversion_target_price={s: 0.0 for s in symbols},
+        hybrid_entry_branch={s: None for s in symbols},
+        entry_bar_index={s: None for s in symbols},
         wick_fade_stop={s: 0.0 for s in symbols},
         wick_fade_target={s: 0.0 for s in symbols},
         wick_fade_bars_held={s: 0 for s in symbols},
+        trend_pullback_bars_held={s: 0 for s in symbols},
+        momentum_breakout_bars_held={s: 0 for s in symbols},
+        volatility_expansion_bars_held={s: 0 for s in symbols},
         wick_fade_signal_atr_pct={s: 0.0 for s in symbols},
         pending_buys={},
-        pending_sells=set(),
+        pending_sells={},
         orb_entry_taken={s: False for s in symbols},
         orb_last_day={s: None for s in symbols},
         breakout_day_gap_pct={s: 0.0 for s in symbols},
@@ -1149,6 +1589,7 @@ def _handle_pending_orders_at_time(
 
     sell_actions = [(symbol, rows_at_time[symbol]) for symbol in rows_at_time if symbol in state.pending_sells]
     for symbol, row in sell_actions:
+        pending_payload = state.pending_sells.get(symbol, {})
         fill_price = float(row["open"]) - slippage
         cash = _execute_sell(
             results=state.results,
@@ -1164,18 +1605,25 @@ def _handle_pending_orders_at_time(
             breakout_range_at_entry=state.breakout_range_at_entry,
             breakout_stored_stop=state.breakout_stored_stop,
             mean_reversion_target_price=state.mean_reversion_target_price,
+            hybrid_entry_branch=state.hybrid_entry_branch,
+            entry_bar_index=state.entry_bar_index,
             wick_fade_stop=state.wick_fade_stop,
             wick_fade_target=state.wick_fade_target,
             wick_fade_bars_held=state.wick_fade_bars_held,
+            trend_pullback_bars_held=state.trend_pullback_bars_held,
+            momentum_breakout_bars_held=state.momentum_breakout_bars_held,
+            volatility_expansion_bars_held=state.volatility_expansion_bars_held,
             latest_mark_price=state.latest_mark_price,
             position=state.position,
             commission=commission,
             cash=cash,
+            current_bar_index=state.pointers[symbol],
+            extra_trade_fields=dict(pending_payload),
         )
-        state.pending_sells.discard(symbol)
+        state.pending_sells.pop(symbol, None)
 
     buy_candidates = [
-        (state.pending_buys[symbol][0], symbol, rows_at_time[symbol])
+        (state.pending_buys[symbol][0], symbol, rows_at_time[symbol], state.pending_buys[symbol][2])
         for symbol in rows_at_time
         if symbol in state.pending_buys
     ]
@@ -1184,7 +1632,7 @@ def _handle_pending_orders_at_time(
     if len(buy_candidates) > 1:
         state.results["competing_timestamps"] += 1
 
-    for _, symbol, row in buy_candidates:
+    for _, symbol, row, entry_branch in buy_candidates:
         fill_price = float(row["open"]) + slippage
         prior_cash = cash
         cash = _execute_buy(
@@ -1200,8 +1648,12 @@ def _handle_pending_orders_at_time(
             shares_held=state.shares_held,
             entry_price=state.entry_price,
             entry_cost=state.entry_cost,
+            hybrid_entry_branch=state.hybrid_entry_branch,
+            entry_bar_index=state.entry_bar_index,
             latest_mark_price=state.latest_mark_price,
             position=state.position,
+            current_bar_index=state.pointers[symbol],
+            entry_branch=entry_branch,
         )
         if math.isclose(cash, prior_cash):
             skipped += 1
@@ -1234,6 +1686,16 @@ def _handle_pending_orders_at_time(
                 else fill_price
             )
             state.mean_reversion_target_price[symbol] = (fill_price + current_sma) / 2.0
+        elif (
+            symbol_strategy.config.strategy_mode == STRATEGY_MODE_HYBRID_BB_MR
+            and entry_branch == "mean_reversion"
+        ):
+            current_sma = (
+                _mean(state.close_arrs[symbol][p - sma_bars + 1: p + 1])
+                if p >= sma_bars - 1
+                else fill_price
+            )
+            state.mean_reversion_target_price[symbol] = (fill_price + current_sma) / 2.0
         elif symbol_strategy.config.strategy_mode == STRATEGY_MODE_WICK_FADE:
             signal_atr_pct = state.wick_fade_signal_atr_pct[symbol]
             atr = signal_atr_pct * fill_price if signal_atr_pct > 0 else fill_price * 0.005
@@ -1260,6 +1722,7 @@ def _process_bar(
     time_window_mode: str,
     slippage: float,
     commission: float,
+    trend_pullback_research_exit_fill: str,
     ml_lookback_bars: int,
     ml_retrain_every_bars: int,
     ml_probability_buy: float,
@@ -1275,7 +1738,29 @@ def _process_bar(
     effective_strategy_mode = symbol_strategy.config.strategy_mode
     state.latest_mark_price[symbol] = float(row["close"])
 
-    min_history_bars = 2 if effective_strategy_mode in (STRATEGY_MODE_BREAKOUT, STRATEGY_MODE_ORB) else sma_bars
+    if effective_strategy_mode in (STRATEGY_MODE_BREAKOUT, STRATEGY_MODE_ORB):
+        min_history_bars = 2
+    elif effective_strategy_mode == STRATEGY_MODE_MOMENTUM_BREAKOUT:
+        min_history_bars = max(
+            sma_bars,
+            55,
+            symbol_strategy.config.momentum_breakout_lookback_bars + 1,
+        )
+    elif effective_strategy_mode == STRATEGY_MODE_VOLATILITY_EXPANSION:
+        min_history_bars = max(
+            sma_bars,
+            55,
+            symbol_strategy.config.volatility_expansion_lookback_bars + 1,
+            symbol_strategy.config.bb_period + symbol_strategy.config.bb_width_lookback,
+            symbol_strategy.config.bb_period + symbol_strategy.config.bb_slope_lookback,
+        )
+    elif effective_strategy_mode in (STRATEGY_MODE_BOLLINGER_SQUEEZE, STRATEGY_MODE_HYBRID_BB_MR):
+        min_history_bars = max(
+            symbol_strategy.config.bb_period + symbol_strategy.config.bb_width_lookback,
+            symbol_strategy.config.bb_period + symbol_strategy.config.bb_slope_lookback,
+        )
+    else:
+        min_history_bars = sma_bars
     if p < min_history_bars - 1:
         return cash
 
@@ -1308,6 +1793,24 @@ def _process_bar(
 
     if state.position[symbol] and effective_strategy_mode == STRATEGY_MODE_WICK_FADE:
         state.wick_fade_bars_held[symbol] += 1
+    if state.position[symbol] and effective_strategy_mode == STRATEGY_MODE_TREND_PULLBACK:
+        state.trend_pullback_bars_held[symbol] = (
+            (p - state.entry_bar_index[symbol] + 1)
+            if state.entry_bar_index[symbol] is not None
+            else 0
+        )
+    if state.position[symbol] and effective_strategy_mode == STRATEGY_MODE_MOMENTUM_BREAKOUT:
+        state.momentum_breakout_bars_held[symbol] = (
+            (p - state.entry_bar_index[symbol] + 1)
+            if state.entry_bar_index[symbol] is not None
+            else 0
+        )
+    if state.position[symbol] and effective_strategy_mode == STRATEGY_MODE_VOLATILITY_EXPANSION:
+        state.volatility_expansion_bars_held[symbol] = (
+            (p - state.entry_bar_index[symbol] + 1)
+            if state.entry_bar_index[symbol] is not None
+            else 0
+        )
 
     recent_volumes = volumes[max(0, p - 19): p + 1]
     avg_volume = _mean(recent_volumes) if recent_volumes else 0.0
@@ -1329,6 +1832,16 @@ def _process_bar(
         state.ml_signals,
         dummy_ml,
     )
+    breakout_lookback = 0
+    if effective_strategy_mode == STRATEGY_MODE_MOMENTUM_BREAKOUT:
+        breakout_lookback = symbol_strategy.config.momentum_breakout_lookback_bars
+    elif effective_strategy_mode == STRATEGY_MODE_VOLATILITY_EXPANSION:
+        breakout_lookback = symbol_strategy.config.volatility_expansion_lookback_bars
+    recent_breakout_high = (
+        max(state.high_arrs[symbol][p - breakout_lookback: p])
+        if breakout_lookback > 0 and p >= breakout_lookback
+        else None
+    )
 
     next_entry_timestamp = (
         pd.Timestamp(state.symbols_dfs[symbol].iloc[p + 1]["timestamp"])
@@ -1344,7 +1857,7 @@ def _process_bar(
         elif exit_style == BREAKOUT_EXIT_TRAILING_FULL_RANGE:
             trailing_stop_price = state.breakout_trailing_high[symbol] - state.breakout_range_at_entry[symbol]
 
-    action = symbol_strategy.decide_action(
+    decision_details = symbol_strategy.decide_action_details(
         price,
         sma,
         ml_signal,
@@ -1375,16 +1888,31 @@ def _process_bar(
         ),
         adx=(
             state.adx_arrs[symbol][p]
-            if symbol_strategy.config.max_adx_threshold > 0
+            if strategy_requires_adx(symbol_strategy.config)
             else None
         ),
+        bb_middle=state.bb_middle_arrs[symbol][p],
+        bb_upper=state.bb_upper_arrs[symbol][p],
+        bb_lower=state.bb_lower_arrs[symbol][p],
+        bb_prev_squeeze=state.bb_squeeze_arrs[symbol][p - 1] if p > 0 else None,
+        bb_mid_slope=state.bb_mid_slope_arrs[symbol][p],
+        bb_bias=state.bb_bias_arrs[symbol][p],
+        bb_breakout_up=state.bb_breakout_up_arrs[symbol][p],
+        bb_breakout_down=state.bb_breakout_down_arrs[symbol][p],
+        bb_volume_confirm=state.bb_volume_confirm_arrs[symbol][p],
+        hybrid_entry_branch=state.hybrid_entry_branch[symbol] if state.position[symbol] else None,
         bar_high=state.high_arrs[symbol][p],
         bar_low=state.low_arrs[symbol][p],
         bar_open=float(row["open"]),
         wick_fade_stop=state.wick_fade_stop[symbol],
         wick_fade_target=state.wick_fade_target[symbol],
         wick_fade_bars_held=state.wick_fade_bars_held[symbol],
+        trend_pullback_bars_held=state.trend_pullback_bars_held[symbol],
+        recent_breakout_high=recent_breakout_high,
+        momentum_breakout_bars_held=state.momentum_breakout_bars_held[symbol],
+        volatility_expansion_bars_held=state.volatility_expansion_bars_held[symbol],
     )
+    action = decision_details.action
 
     has_next_bar = p + 1 < len(state.symbols_dfs[symbol])
     if has_next_bar and action == "BUY" and not state.position[symbol]:
@@ -1395,18 +1923,69 @@ def _process_bar(
                 state.opening_range_low_arrs[symbol][p],
             ),
             row["timestamp"],
+            decision_details.hybrid_entry_branch,
         )
         if effective_strategy_mode == STRATEGY_MODE_WICK_FADE:
             state.wick_fade_signal_atr_pct[symbol] = atr_pct or 0.0
-    elif has_next_bar and action == "SELL" and state.position[symbol]:
-        state.pending_sells.add(symbol)
+    elif action == "SELL" and state.position[symbol]:
+        sell_payload = {
+            "exit_reason": decision_details.reason,
+            "research_exit_fill": trend_pullback_research_exit_fill,
+        }
+        if decision_details.exit_price is not None:
+            sell_payload["exit_price_hint"] = float(decision_details.exit_price)
+        if _trend_pullback_should_exit_on_close(
+            effective_strategy_mode,
+            trend_pullback_research_exit_fill,
+        ):
+            fill_price = _resolve_bar_close_exit_fill_price(
+                row_close=float(row["close"]),
+                slippage=slippage,
+                exit_price_hint=decision_details.exit_price,
+            )
+            cash = _execute_sell(
+                results=state.results,
+                symbol_stats=state.symbol_stats,
+                trades=state.trades,
+                symbol=symbol,
+                fill_price=fill_price,
+                timestamp_str=state.timestamp_str_arrs[symbol][p],
+                shares_held=state.shares_held,
+                entry_price=state.entry_price,
+                entry_cost=state.entry_cost,
+                breakout_trailing_high=state.breakout_trailing_high,
+                breakout_range_at_entry=state.breakout_range_at_entry,
+                breakout_stored_stop=state.breakout_stored_stop,
+                mean_reversion_target_price=state.mean_reversion_target_price,
+                hybrid_entry_branch=state.hybrid_entry_branch,
+                entry_bar_index=state.entry_bar_index,
+                wick_fade_stop=state.wick_fade_stop,
+                wick_fade_target=state.wick_fade_target,
+                wick_fade_bars_held=state.wick_fade_bars_held,
+                trend_pullback_bars_held=state.trend_pullback_bars_held,
+                momentum_breakout_bars_held=state.momentum_breakout_bars_held,
+                volatility_expansion_bars_held=state.volatility_expansion_bars_held,
+                latest_mark_price=state.latest_mark_price,
+                position=state.position,
+                commission=commission,
+                cash=cash,
+                current_bar_index=p,
+                extra_trade_fields=sell_payload,
+            )
+        elif has_next_bar:
+            state.pending_sells[symbol] = sell_payload
 
     if state.position[symbol] and state.is_eod_arrs[symbol][p]:
+        active_entry_branch = state.hybrid_entry_branch[symbol]
         if (
             effective_strategy_mode == STRATEGY_MODE_BREAKOUT
             and symbol_strategy.config.breakout_exit_style == BREAKOUT_EXIT_EOD_ONLY
         ) or (
             effective_strategy_mode == STRATEGY_MODE_MEAN_REVERSION
+            and symbol_strategy.config.mean_reversion_exit_style == MEAN_REVERSION_EXIT_EOD
+        ) or (
+            effective_strategy_mode == STRATEGY_MODE_HYBRID_BB_MR
+            and active_entry_branch == "mean_reversion"
             and symbol_strategy.config.mean_reversion_exit_style == MEAN_REVERSION_EXIT_EOD
         ) or effective_strategy_mode == STRATEGY_MODE_ORB:
             fill_price = float(row["close"]) - slippage
@@ -1424,16 +2003,22 @@ def _process_bar(
                 breakout_range_at_entry=state.breakout_range_at_entry,
                 breakout_stored_stop=state.breakout_stored_stop,
                 mean_reversion_target_price=state.mean_reversion_target_price,
+                hybrid_entry_branch=state.hybrid_entry_branch,
+                entry_bar_index=state.entry_bar_index,
                 wick_fade_stop=state.wick_fade_stop,
                 wick_fade_target=state.wick_fade_target,
                 wick_fade_bars_held=state.wick_fade_bars_held,
+                trend_pullback_bars_held=state.trend_pullback_bars_held,
+                momentum_breakout_bars_held=state.momentum_breakout_bars_held,
+                volatility_expansion_bars_held=state.volatility_expansion_bars_held,
                 latest_mark_price=state.latest_mark_price,
                 position=state.position,
                 commission=commission,
                 cash=cash,
+                current_bar_index=p,
                 extra_trade_fields={"eod_exit": True},
             )
-            state.pending_sells.discard(symbol)
+            state.pending_sells.pop(symbol, None)
 
     return cash
 
@@ -1469,13 +2054,19 @@ def _finalize_simulation(
                 breakout_range_at_entry=state.breakout_range_at_entry,
                 breakout_stored_stop=state.breakout_stored_stop,
                 mean_reversion_target_price=state.mean_reversion_target_price,
+                hybrid_entry_branch=state.hybrid_entry_branch,
+                entry_bar_index=state.entry_bar_index,
                 wick_fade_stop=state.wick_fade_stop,
                 wick_fade_target=state.wick_fade_target,
                 wick_fade_bars_held=state.wick_fade_bars_held,
+                trend_pullback_bars_held=state.trend_pullback_bars_held,
+                momentum_breakout_bars_held=state.momentum_breakout_bars_held,
+                volatility_expansion_bars_held=state.volatility_expansion_bars_held,
                 latest_mark_price=state.latest_mark_price,
                 position=state.position,
                 commission=commission,
                 cash=cash,
+                current_bar_index=len(state.symbols_dfs[symbol]) - 1,
                 extra_trade_fields={"forced_close": True},
             )
 
@@ -1551,6 +2142,11 @@ def _build_final_results(
             if abs(total_realized_pnl) > 1e-12
             else 0.0
         )
+    results["hybrid_branch_stats"] = (
+        _summarize_hybrid_branch_stats(state.trades)
+        if inputs.strategy_mode == STRATEGY_MODE_HYBRID_BB_MR
+        else {}
+    )
     return results
 
 
@@ -1582,6 +2178,17 @@ def run_backtest(
     sma_stop_pct: float = 0.0,
     mean_reversion_trend_filter: bool = False,
     mean_reversion_trend_slope_filter: bool = False,
+    bb_period: int = 20,
+    bb_stddev_mult: float = 2.0,
+    bb_width_lookback: int = 100,
+    bb_squeeze_quantile: float = 0.20,
+    bb_slope_lookback: int = 3,
+    bb_use_volume_confirm: bool = True,
+    bb_volume_mult: float = 1.2,
+    bb_breakout_buffer_pct: float = 0.0,
+    bb_min_mid_slope: float = 0.0,
+    bb_trend_filter: bool = False,
+    bb_exit_mode: str = BOLLINGER_EXIT_MIDDLE_BAND,
     starting_capital: float = DEFAULT_STARTING_CAPITAL,
     position_size: float = DEFAULT_POSITION_SIZE,
     start_date: str | None = None,
@@ -1596,6 +2203,35 @@ def run_backtest(
     vwap_z_stop_atr_multiple: float = 2.0,
     min_atr_percentile: float = 0.0,
     max_adx_threshold: float = 0.0,
+    trend_pullback_min_adx: float = 20.0,
+    trend_pullback_min_slope: float = 0.0,
+    trend_pullback_entry_threshold: float = 0.0015,
+    trend_pullback_min_atr_percentile: float = 20.0,
+    trend_pullback_max_atr_percentile: float = 0.0,
+    trend_pullback_exit_style: str = "fixed_bars",
+    trend_pullback_hold_bars: int = 4,
+    trend_pullback_take_profit_pct: float = 0.0,
+    trend_pullback_stop_pct: float = 0.0,
+    trend_pullback_research_exit_fill: str = "next_open",
+    momentum_breakout_lookback_bars: int = 20,
+    momentum_breakout_entry_buffer_pct: float = 0.001,
+    momentum_breakout_min_adx: float = 20.0,
+    momentum_breakout_min_slope: float = 0.0,
+    momentum_breakout_min_atr_percentile: float = 20.0,
+    momentum_breakout_exit_style: str = MOMENTUM_BREAKOUT_EXIT_FIXED_BARS,
+    momentum_breakout_hold_bars: int = 3,
+    momentum_breakout_stop_pct: float = 0.0,
+    momentum_breakout_take_profit_pct: float = 0.0,
+    volatility_expansion_lookback_bars: int = 20,
+    volatility_expansion_entry_buffer_pct: float = 0.001,
+    volatility_expansion_max_atr_percentile: float = 0.0,
+    volatility_expansion_trend_filter: bool = False,
+    volatility_expansion_min_slope: float = 0.0,
+    volatility_expansion_use_volume_confirm: bool = True,
+    volatility_expansion_exit_style: str = VOLATILITY_EXPANSION_EXIT_FIXED_BARS,
+    volatility_expansion_hold_bars: int = 4,
+    volatility_expansion_stop_pct: float = 0.0,
+    volatility_expansion_take_profit_pct: float = 0.0,
     wick_fade_min_lower_wick_ratio: float = 0.4,
     wick_fade_min_close_position: float = 0.5,
     wick_fade_min_range_pct: float = 0.003,
@@ -1627,6 +2263,17 @@ def run_backtest(
         sma_stop_pct=sma_stop_pct,
         mean_reversion_trend_filter=mean_reversion_trend_filter,
         mean_reversion_trend_slope_filter=mean_reversion_trend_slope_filter,
+        bb_period=bb_period,
+        bb_stddev_mult=bb_stddev_mult,
+        bb_width_lookback=bb_width_lookback,
+        bb_squeeze_quantile=bb_squeeze_quantile,
+        bb_slope_lookback=bb_slope_lookback,
+        bb_use_volume_confirm=bb_use_volume_confirm,
+        bb_volume_mult=bb_volume_mult,
+        bb_breakout_buffer_pct=bb_breakout_buffer_pct,
+        bb_min_mid_slope=bb_min_mid_slope,
+        bb_trend_filter=bb_trend_filter,
+        bb_exit_mode=bb_exit_mode,
         ml_probability_buy=ml_probability_buy,
         ml_probability_sell=ml_probability_sell,
         entry_threshold_pct=entry_threshold_pct,
@@ -1637,6 +2284,35 @@ def run_backtest(
         vwap_z_stop_atr_multiple=vwap_z_stop_atr_multiple,
         min_atr_percentile=min_atr_percentile,
         max_adx_threshold=max_adx_threshold,
+        trend_pullback_min_adx=trend_pullback_min_adx,
+        trend_pullback_min_slope=trend_pullback_min_slope,
+        trend_pullback_entry_threshold=trend_pullback_entry_threshold,
+        trend_pullback_min_atr_percentile=trend_pullback_min_atr_percentile,
+        trend_pullback_max_atr_percentile=trend_pullback_max_atr_percentile,
+        trend_pullback_exit_style=trend_pullback_exit_style,
+        trend_pullback_hold_bars=trend_pullback_hold_bars,
+        trend_pullback_take_profit_pct=trend_pullback_take_profit_pct,
+        trend_pullback_stop_pct=trend_pullback_stop_pct,
+        trend_pullback_research_exit_fill=trend_pullback_research_exit_fill,
+        momentum_breakout_lookback_bars=momentum_breakout_lookback_bars,
+        momentum_breakout_entry_buffer_pct=momentum_breakout_entry_buffer_pct,
+        momentum_breakout_min_adx=momentum_breakout_min_adx,
+        momentum_breakout_min_slope=momentum_breakout_min_slope,
+        momentum_breakout_min_atr_percentile=momentum_breakout_min_atr_percentile,
+        momentum_breakout_exit_style=momentum_breakout_exit_style,
+        momentum_breakout_hold_bars=momentum_breakout_hold_bars,
+        momentum_breakout_stop_pct=momentum_breakout_stop_pct,
+        momentum_breakout_take_profit_pct=momentum_breakout_take_profit_pct,
+        volatility_expansion_lookback_bars=volatility_expansion_lookback_bars,
+        volatility_expansion_entry_buffer_pct=volatility_expansion_entry_buffer_pct,
+        volatility_expansion_max_atr_percentile=volatility_expansion_max_atr_percentile,
+        volatility_expansion_trend_filter=volatility_expansion_trend_filter,
+        volatility_expansion_min_slope=volatility_expansion_min_slope,
+        volatility_expansion_use_volume_confirm=volatility_expansion_use_volume_confirm,
+        volatility_expansion_exit_style=volatility_expansion_exit_style,
+        volatility_expansion_hold_bars=volatility_expansion_hold_bars,
+        volatility_expansion_stop_pct=volatility_expansion_stop_pct,
+        volatility_expansion_take_profit_pct=volatility_expansion_take_profit_pct,
         wick_fade_min_lower_wick_ratio=wick_fade_min_lower_wick_ratio,
         wick_fade_min_close_position=wick_fade_min_close_position,
         wick_fade_min_range_pct=wick_fade_min_range_pct,
@@ -1729,6 +2405,7 @@ def run_backtest(
                 time_window_mode=inputs.time_window_mode,
                 slippage=slippage,
                 commission=commission,
+                trend_pullback_research_exit_fill=inputs.trend_pullback_research_exit_fill,
                 ml_lookback_bars=ml_lookback_bars,
                 ml_retrain_every_bars=ml_retrain_every_bars,
                 ml_probability_buy=ml_probability_buy,
@@ -1807,6 +2484,17 @@ def extract_clean_columns(result_dict: dict) -> dict:
         "strategy_mode", "time_window_mode", "regime_filter_enabled", "threshold_mode",
         "entry_threshold_pct", "atr_multiple", "atr_percentile_threshold", "sma_bars", "orb_filter_mode",
         "breakout_exit_style", "breakout_tight_stop_fraction", "mean_reversion_exit_style", "mean_reversion_max_atr_percentile",
+        "trend_pullback_exit_style", "trend_pullback_hold_bars", "trend_pullback_take_profit_pct",
+        "trend_pullback_research_exit_fill",
+        "momentum_breakout_lookback_bars", "momentum_breakout_entry_buffer_pct",
+        "momentum_breakout_min_adx", "momentum_breakout_min_slope", "momentum_breakout_min_atr_percentile",
+        "momentum_breakout_exit_style", "momentum_breakout_hold_bars",
+        "momentum_breakout_stop_pct", "momentum_breakout_take_profit_pct",
+        "volatility_expansion_lookback_bars", "volatility_expansion_entry_buffer_pct",
+        "volatility_expansion_max_atr_percentile", "volatility_expansion_trend_filter",
+        "volatility_expansion_min_slope", "volatility_expansion_use_volume_confirm",
+        "volatility_expansion_exit_style", "volatility_expansion_hold_bars",
+        "volatility_expansion_stop_pct", "volatility_expansion_take_profit_pct",
         "ml_probability_buy", "ml_probability_sell",
         "total_return_pct", "max_drawdown_pct",
         "total_trades", "total_buy_candidates", "skipped_trades",
@@ -1856,6 +2544,29 @@ def _build_per_symbol_rows(result_dict: dict) -> list[dict]:
         "breakout_tight_stop_fraction": result_dict.get("breakout_tight_stop_fraction"),
         "mean_reversion_exit_style": result_dict.get("mean_reversion_exit_style"),
         "mean_reversion_max_atr_percentile": result_dict.get("mean_reversion_max_atr_percentile"),
+        "trend_pullback_exit_style": result_dict.get("trend_pullback_exit_style"),
+        "trend_pullback_hold_bars": result_dict.get("trend_pullback_hold_bars"),
+        "trend_pullback_take_profit_pct": result_dict.get("trend_pullback_take_profit_pct"),
+        "trend_pullback_research_exit_fill": result_dict.get("trend_pullback_research_exit_fill"),
+        "momentum_breakout_lookback_bars": result_dict.get("momentum_breakout_lookback_bars"),
+        "momentum_breakout_entry_buffer_pct": result_dict.get("momentum_breakout_entry_buffer_pct"),
+        "momentum_breakout_min_adx": result_dict.get("momentum_breakout_min_adx"),
+        "momentum_breakout_min_slope": result_dict.get("momentum_breakout_min_slope"),
+        "momentum_breakout_min_atr_percentile": result_dict.get("momentum_breakout_min_atr_percentile"),
+        "momentum_breakout_exit_style": result_dict.get("momentum_breakout_exit_style"),
+        "momentum_breakout_hold_bars": result_dict.get("momentum_breakout_hold_bars"),
+        "momentum_breakout_stop_pct": result_dict.get("momentum_breakout_stop_pct"),
+        "momentum_breakout_take_profit_pct": result_dict.get("momentum_breakout_take_profit_pct"),
+        "volatility_expansion_lookback_bars": result_dict.get("volatility_expansion_lookback_bars"),
+        "volatility_expansion_entry_buffer_pct": result_dict.get("volatility_expansion_entry_buffer_pct"),
+        "volatility_expansion_max_atr_percentile": result_dict.get("volatility_expansion_max_atr_percentile"),
+        "volatility_expansion_trend_filter": result_dict.get("volatility_expansion_trend_filter"),
+        "volatility_expansion_min_slope": result_dict.get("volatility_expansion_min_slope"),
+        "volatility_expansion_use_volume_confirm": result_dict.get("volatility_expansion_use_volume_confirm"),
+        "volatility_expansion_exit_style": result_dict.get("volatility_expansion_exit_style"),
+        "volatility_expansion_hold_bars": result_dict.get("volatility_expansion_hold_bars"),
+        "volatility_expansion_stop_pct": result_dict.get("volatility_expansion_stop_pct"),
+        "volatility_expansion_take_profit_pct": result_dict.get("volatility_expansion_take_profit_pct"),
     }
     rows = [{
         **base_cols,
@@ -1899,6 +2610,32 @@ def _build_per_symbol_rows(result_dict: dict) -> list[dict]:
             "pnl_stability": symbol_result["pnl_stability"],
             "total_trades": symbol_result["total_trades"],
             "symbol_contribution_pct": symbol_result.get("symbol_contribution_pct", 0.0),
+        })
+    for branch_name, branch_result in result_dict.get("hybrid_branch_stats", {}).items():
+        rows.append({
+            **base_cols,
+            "scope": "hybrid_branch",
+            "symbol": branch_name,
+            "symbol_strategy_mode": result_dict.get("strategy_mode"),
+            "realized_pnl": branch_result["realized_pnl"],
+            "total_return_pct": None,
+            "max_drawdown_pct": None,
+            "win_rate": branch_result["win_rate"],
+            "avg_winning_trade": branch_result["avg_winning_trade"],
+            "avg_losing_trade": branch_result["avg_losing_trade"],
+            "expectancy": branch_result["avg_pnl_per_trade"],
+            "max_loss_trade": None,
+            "avg_return_per_trade_pct": None,
+            "avg_move_captured_pct": None,
+            "profit_factor": None,
+            "sharpe_ratio": None,
+            "trades_per_day": None,
+            "pnl_stability": None,
+            "total_trades": branch_result["total_trades"],
+            "wins": branch_result["wins"],
+            "losses": branch_result["losses"],
+            "avg_pnl_per_trade": branch_result["avg_pnl_per_trade"],
+            "avg_hold_bars": branch_result["avg_hold_bars"],
         })
     return rows
 
@@ -2597,6 +3334,20 @@ def _print_single_result(results: dict) -> None:
     for symbol, count in results["symbol_trade_counts"].items():
         print(f"  {symbol}: {count}")
     print("Final Positions: All flat (forced close at end)")
+    if results.get("hybrid_branch_stats"):
+        print("\nHybrid Branch Attribution:")
+        for branch_name, branch_result in results["hybrid_branch_stats"].items():
+            avg_hold_bars = branch_result.get("avg_hold_bars")
+            avg_hold_text = f"{avg_hold_bars:.2f}" if isinstance(avg_hold_bars, (int, float)) else "n/a"
+            print(f"\n{branch_name}:")
+            print(f"  Total Trades:         {branch_result['total_trades']}")
+            print(f"  Wins / Losses:        {branch_result['wins']} / {branch_result['losses']}")
+            print(f"  Win Rate:             {branch_result['win_rate']:.1f}%")
+            print(f"  Realized PnL:         ${branch_result['realized_pnl']:.2f}")
+            print(f"  Avg PnL / Trade:      ${branch_result['avg_pnl_per_trade']:.2f}")
+            print(f"  Avg Hold Bars:        {avg_hold_text}")
+            print(f"  Average Winning Trade:${branch_result['avg_winning_trade']:.2f}")
+            print(f"  Average Losing Trade: ${branch_result['avg_losing_trade']:.2f}")
     print("\nPer-Symbol Results:")
     for symbol, symbol_result in results.get("per_symbol", {}).items():
         print(f"\n{symbol}:")
@@ -2980,6 +3731,19 @@ def main() -> None:
                         help="Only enter mean reversion trades when SMA_50 slope >= 0 (rising trend filter)")
     parser.add_argument("--mean-reversion-max-atr-percentile-list",
                         help="Comma-separated max ATR percentile values for mean reversion entry")
+    parser.add_argument("--bb-period", type=int, default=20)
+    parser.add_argument("--bb-stddev-mult", type=float, default=2.0)
+    parser.add_argument("--bb-width-lookback", type=int, default=100)
+    parser.add_argument("--bb-squeeze-quantile", type=float, default=0.20)
+    parser.add_argument("--bb-slope-lookback", type=int, default=3)
+    parser.add_argument("--bb-use-volume-confirm", action="store_true", default=True)
+    parser.add_argument("--no-bb-use-volume-confirm", dest="bb_use_volume_confirm", action="store_false")
+    parser.add_argument("--bb-volume-mult", type=float, default=1.2)
+    parser.add_argument("--bb-breakout-buffer-pct", type=float, default=0.0)
+    parser.add_argument("--bb-min-mid-slope", type=float, default=0.0)
+    parser.add_argument("--bb-trend-filter", action="store_true", default=False)
+    parser.add_argument("--bb-exit-mode", default=BOLLINGER_EXIT_MIDDLE_BAND,
+                        help="Bollinger squeeze exit mode")
     parser.add_argument("--ml-lookback-bars", type=int, default=DEFAULT_ML_LOOKBACK_BARS)
     parser.add_argument("--ml-retrain-every-bars", type=int, default=DEFAULT_ML_RETRAIN_EVERY_BARS)
     parser.add_argument("--ml-probability-buy", type=float, default=DEFAULT_ML_PROBABILITY_BUY)
@@ -3012,6 +3776,64 @@ def main() -> None:
         default=0.0,
         help="Skip entry if ADX is above this threshold (default: 0 = disabled, e.g. 25).",
     )
+    parser.add_argument("--trend-pullback-min-adx", type=float, default=20.0,
+                        help="Trend pullback: minimum ADX required for trend confirmation.")
+    parser.add_argument("--trend-pullback-min-slope", type=float, default=0.0,
+                        help="Trend pullback: minimum 50-bar SMA slope required for trend confirmation.")
+    parser.add_argument("--trend-pullback-entry-threshold", type=float, default=0.0015,
+                        help="Trend pullback: buy when price is this fraction below the signal SMA.")
+    parser.add_argument("--trend-pullback-min-atr-percentile", type=float, default=20.0,
+                        help="Trend pullback: minimum ATR percentile required for entry.")
+    parser.add_argument("--trend-pullback-max-atr-percentile", type=float, default=0.0,
+                        help="Trend pullback: maximum ATR percentile allowed for entry (0 disables).")
+    parser.add_argument("--trend-pullback-exit-style", default="fixed_bars",
+                        help="Trend pullback exit style.")
+    parser.add_argument("--trend-pullback-hold-bars", type=int, default=4,
+                        help="Trend pullback: force exit after N held bars.")
+    parser.add_argument("--trend-pullback-take-profit-pct", type=float, default=0.0,
+                        help="Trend pullback: optional take-profit threshold as a fraction of entry.")
+    parser.add_argument("--trend-pullback-stop-pct", type=float, default=0.0,
+                        help="Trend pullback: optional stop below entry (0 disables).")
+    parser.add_argument("--trend-pullback-research-exit-fill", default=TREND_PULLBACK_RESEARCH_EXIT_FILL_NEXT_OPEN,
+                        help="Trend pullback research-only exit fill timing: next_open or bar_close.")
+    parser.add_argument("--momentum-breakout-lookback-bars", type=int, default=20,
+                        help="Momentum breakout: prior-bar high lookback used for breakout reference.")
+    parser.add_argument("--momentum-breakout-entry-buffer-pct", type=float, default=0.001,
+                        help="Momentum breakout: required buffer above the recent high.")
+    parser.add_argument("--momentum-breakout-min-adx", type=float, default=20.0,
+                        help="Momentum breakout: minimum ADX required for entry.")
+    parser.add_argument("--momentum-breakout-min-slope", type=float, default=0.0,
+                        help="Momentum breakout: minimum 50-bar SMA slope required for entry.")
+    parser.add_argument("--momentum-breakout-min-atr-percentile", type=float, default=20.0,
+                        help="Momentum breakout: minimum ATR percentile required for entry.")
+    parser.add_argument("--momentum-breakout-exit-style", default=MOMENTUM_BREAKOUT_EXIT_FIXED_BARS,
+                        help="Momentum breakout exit style.")
+    parser.add_argument("--momentum-breakout-hold-bars", type=int, default=3,
+                        help="Momentum breakout: force exit after N held bars.")
+    parser.add_argument("--momentum-breakout-stop-pct", type=float, default=0.0,
+                        help="Momentum breakout: optional stop below entry (0 disables).")
+    parser.add_argument("--momentum-breakout-take-profit-pct", type=float, default=0.0,
+                        help="Momentum breakout: optional take-profit threshold as a fraction of entry.")
+    parser.add_argument("--volatility-expansion-lookback-bars", type=int, default=20,
+                        help="Volatility expansion: recent-high lookback used for breakout reference.")
+    parser.add_argument("--volatility-expansion-entry-buffer-pct", type=float, default=0.001,
+                        help="Volatility expansion: required buffer above the compression range high.")
+    parser.add_argument("--volatility-expansion-max-atr-percentile", type=float, default=0.0,
+                        help="Volatility expansion: optional maximum ATR percentile allowed for compression (0 disables).")
+    parser.add_argument("--volatility-expansion-trend-filter", action="store_true", default=False,
+                        help="Volatility expansion: require price above trend SMA and slope floor.")
+    parser.add_argument("--volatility-expansion-min-slope", type=float, default=0.0,
+                        help="Volatility expansion: minimum 50-bar SMA slope when trend filter is enabled.")
+    parser.add_argument("--volatility-expansion-use-volume-confirm", action="store_true", default=True)
+    parser.add_argument("--no-volatility-expansion-use-volume-confirm", dest="volatility_expansion_use_volume_confirm", action="store_false")
+    parser.add_argument("--volatility-expansion-exit-style", default=VOLATILITY_EXPANSION_EXIT_FIXED_BARS,
+                        help="Volatility expansion exit style.")
+    parser.add_argument("--volatility-expansion-hold-bars", type=int, default=4,
+                        help="Volatility expansion: force exit after N held bars.")
+    parser.add_argument("--volatility-expansion-stop-pct", type=float, default=0.0,
+                        help="Volatility expansion: optional stop below entry (0 disables).")
+    parser.add_argument("--volatility-expansion-take-profit-pct", type=float, default=0.0,
+                        help="Volatility expansion: optional take-profit threshold as a fraction of entry.")
     parser.add_argument("--wick-fade-min-lower-wick-ratio", type=float, default=0.4,
                         help="Wick fade: lower wick / bar range threshold (default: 0.4)")
     parser.add_argument("--wick-fade-min-close-position", type=float, default=0.5,
@@ -3066,6 +3888,13 @@ def main() -> None:
     args.orb_filter_mode = normalize_orb_filter_mode(args.orb_filter_mode)
     args.breakout_exit_style = normalize_breakout_exit_style(args.breakout_exit_style)
     args.mean_reversion_exit_style = normalize_mean_reversion_exit_style(args.mean_reversion_exit_style)
+    args.trend_pullback_exit_style = normalize_trend_pullback_exit_style(args.trend_pullback_exit_style)
+    args.momentum_breakout_exit_style = normalize_momentum_breakout_exit_style(args.momentum_breakout_exit_style)
+    args.volatility_expansion_exit_style = normalize_volatility_expansion_exit_style(args.volatility_expansion_exit_style)
+    args.trend_pullback_research_exit_fill = normalize_trend_pullback_research_exit_fill(
+        args.trend_pullback_research_exit_fill
+    )
+    args.bb_exit_mode = normalize_bollinger_exit_mode(args.bb_exit_mode)
     if args.orb_filter_mode not in ORB_FILTER_CHOICES:
         raise ValueError(
             f"Unsupported orb filter mode: {args.orb_filter_mode}. "
@@ -3081,6 +3910,25 @@ def main() -> None:
             f"Unsupported mean reversion exit style: {args.mean_reversion_exit_style}. "
             f"Choose from {', '.join(MEAN_REVERSION_EXIT_CHOICES)}."
         )
+    if args.bb_exit_mode not in BOLLINGER_EXIT_CHOICES:
+        raise ValueError(
+            f"Unsupported Bollinger exit mode: {args.bb_exit_mode}. "
+            f"Choose from {', '.join(BOLLINGER_EXIT_CHOICES)}."
+        )
+    if args.trend_pullback_exit_style not in TREND_PULLBACK_EXIT_CHOICES:
+        raise ValueError(
+            f"Unsupported trend pullback exit style. Choose from {', '.join(TREND_PULLBACK_EXIT_CHOICES)}."
+        )
+    if args.momentum_breakout_exit_style not in MOMENTUM_BREAKOUT_EXIT_CHOICES:
+        raise ValueError(
+            f"Unsupported momentum breakout exit style. Choose from {', '.join(MOMENTUM_BREAKOUT_EXIT_CHOICES)}."
+        )
+    if args.volatility_expansion_exit_style not in VOLATILITY_EXPANSION_EXIT_CHOICES:
+        raise ValueError(
+            f"Unsupported volatility expansion exit style. Choose from {', '.join(VOLATILITY_EXPANSION_EXIT_CHOICES)}."
+        )
+    if args.trend_pullback_research_exit_fill not in TREND_PULLBACK_RESEARCH_EXIT_FILL_CHOICES:
+        raise ValueError("Unsupported trend pullback research exit fill. Choose from next_open, bar_close.")
     strategy_modes = (
         _parse_strategy_mode_list(args.strategy_mode_list)
         if args.strategy_mode_list
@@ -3182,6 +4030,17 @@ def main() -> None:
         sma_stop_pct=args.sma_stop_pct,
         mean_reversion_trend_filter=args.mean_reversion_trend_filter,
         mean_reversion_trend_slope_filter=args.mean_reversion_trend_slope_filter,
+        bb_period=args.bb_period,
+        bb_stddev_mult=args.bb_stddev_mult,
+        bb_width_lookback=args.bb_width_lookback,
+        bb_squeeze_quantile=args.bb_squeeze_quantile,
+        bb_slope_lookback=args.bb_slope_lookback,
+        bb_use_volume_confirm=args.bb_use_volume_confirm,
+        bb_volume_mult=args.bb_volume_mult,
+        bb_breakout_buffer_pct=args.bb_breakout_buffer_pct,
+        bb_min_mid_slope=args.bb_min_mid_slope,
+        bb_trend_filter=args.bb_trend_filter,
+        bb_exit_mode=args.bb_exit_mode,
         ml_lookback_bars=args.ml_lookback_bars,
         ml_retrain_every_bars=args.ml_retrain_every_bars,
         ml_probability_buy=args.ml_probability_buy,
@@ -3190,6 +4049,35 @@ def main() -> None:
         vwap_z_stop_atr_multiple=args.vwap_z_stop_atr_multiple,
         min_atr_percentile=args.min_atr_percentile,
         max_adx_threshold=args.max_adx_threshold,
+        trend_pullback_min_adx=args.trend_pullback_min_adx,
+        trend_pullback_min_slope=args.trend_pullback_min_slope,
+        trend_pullback_entry_threshold=args.trend_pullback_entry_threshold,
+        trend_pullback_min_atr_percentile=args.trend_pullback_min_atr_percentile,
+        trend_pullback_max_atr_percentile=args.trend_pullback_max_atr_percentile,
+        trend_pullback_exit_style=args.trend_pullback_exit_style,
+        trend_pullback_hold_bars=args.trend_pullback_hold_bars,
+        trend_pullback_take_profit_pct=args.trend_pullback_take_profit_pct,
+        trend_pullback_stop_pct=args.trend_pullback_stop_pct,
+        trend_pullback_research_exit_fill=args.trend_pullback_research_exit_fill,
+        momentum_breakout_lookback_bars=args.momentum_breakout_lookback_bars,
+        momentum_breakout_entry_buffer_pct=args.momentum_breakout_entry_buffer_pct,
+        momentum_breakout_min_adx=args.momentum_breakout_min_adx,
+        momentum_breakout_min_slope=args.momentum_breakout_min_slope,
+        momentum_breakout_min_atr_percentile=args.momentum_breakout_min_atr_percentile,
+        momentum_breakout_exit_style=args.momentum_breakout_exit_style,
+        momentum_breakout_hold_bars=args.momentum_breakout_hold_bars,
+        momentum_breakout_stop_pct=args.momentum_breakout_stop_pct,
+        momentum_breakout_take_profit_pct=args.momentum_breakout_take_profit_pct,
+        volatility_expansion_lookback_bars=args.volatility_expansion_lookback_bars,
+        volatility_expansion_entry_buffer_pct=args.volatility_expansion_entry_buffer_pct,
+        volatility_expansion_max_atr_percentile=args.volatility_expansion_max_atr_percentile,
+        volatility_expansion_trend_filter=args.volatility_expansion_trend_filter,
+        volatility_expansion_min_slope=args.volatility_expansion_min_slope,
+        volatility_expansion_use_volume_confirm=args.volatility_expansion_use_volume_confirm,
+        volatility_expansion_exit_style=args.volatility_expansion_exit_style,
+        volatility_expansion_hold_bars=args.volatility_expansion_hold_bars,
+        volatility_expansion_stop_pct=args.volatility_expansion_stop_pct,
+        volatility_expansion_take_profit_pct=args.volatility_expansion_take_profit_pct,
         wick_fade_min_lower_wick_ratio=args.wick_fade_min_lower_wick_ratio,
         wick_fade_min_close_position=args.wick_fade_min_close_position,
         wick_fade_min_range_pct=args.wick_fade_min_range_pct,
@@ -3407,6 +4295,29 @@ def main() -> None:
         results["breakout_tight_stop_fraction"] = args.breakout_tight_stop_fraction
         results["mean_reversion_exit_style"] = args.mean_reversion_exit_style
         results["mean_reversion_max_atr_percentile"] = args.mean_reversion_max_atr_percentile
+        results["trend_pullback_exit_style"] = args.trend_pullback_exit_style
+        results["trend_pullback_hold_bars"] = args.trend_pullback_hold_bars
+        results["trend_pullback_take_profit_pct"] = args.trend_pullback_take_profit_pct
+        results["trend_pullback_research_exit_fill"] = args.trend_pullback_research_exit_fill
+        results["momentum_breakout_lookback_bars"] = args.momentum_breakout_lookback_bars
+        results["momentum_breakout_entry_buffer_pct"] = args.momentum_breakout_entry_buffer_pct
+        results["momentum_breakout_min_adx"] = args.momentum_breakout_min_adx
+        results["momentum_breakout_min_slope"] = args.momentum_breakout_min_slope
+        results["momentum_breakout_min_atr_percentile"] = args.momentum_breakout_min_atr_percentile
+        results["momentum_breakout_exit_style"] = args.momentum_breakout_exit_style
+        results["momentum_breakout_hold_bars"] = args.momentum_breakout_hold_bars
+        results["momentum_breakout_stop_pct"] = args.momentum_breakout_stop_pct
+        results["momentum_breakout_take_profit_pct"] = args.momentum_breakout_take_profit_pct
+        results["volatility_expansion_lookback_bars"] = args.volatility_expansion_lookback_bars
+        results["volatility_expansion_entry_buffer_pct"] = args.volatility_expansion_entry_buffer_pct
+        results["volatility_expansion_max_atr_percentile"] = args.volatility_expansion_max_atr_percentile
+        results["volatility_expansion_trend_filter"] = args.volatility_expansion_trend_filter
+        results["volatility_expansion_min_slope"] = args.volatility_expansion_min_slope
+        results["volatility_expansion_use_volume_confirm"] = args.volatility_expansion_use_volume_confirm
+        results["volatility_expansion_exit_style"] = args.volatility_expansion_exit_style
+        results["volatility_expansion_hold_bars"] = args.volatility_expansion_hold_bars
+        results["volatility_expansion_stop_pct"] = args.volatility_expansion_stop_pct
+        results["volatility_expansion_take_profit_pct"] = args.volatility_expansion_take_profit_pct
         results["entry_threshold_pct"] = args.entry_threshold_pct
         results["atr_multiple"] = args.atr_multiple
         results["atr_percentile_threshold"] = args.atr_percentile_threshold

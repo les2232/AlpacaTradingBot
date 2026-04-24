@@ -1,0 +1,4 @@
+symbol,signal_count,avg_forward_return_pct,realized_trade_count,realized_expectancy,realized_win_rate
+AMD,2,-1.0452572154037059,2,-10.442756300646636,50.0
+C,1,0.29513202997158033,1,3.0805081388338067,100.0
+JPM,1,-0.14764116790346407,1,-1.2683528677439426,0.0

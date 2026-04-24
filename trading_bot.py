@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
+from enum import Enum
 from pathlib import Path
 from typing import Any
 import pandas as pd
@@ -31,23 +32,37 @@ from symbol_state import (
     symbols_match,
 )
 from strategy import (
+    BOLLINGER_EXIT_CHOICES,
+    BOLLINGER_EXIT_MIDDLE_BAND,
     BREAKOUT_EXIT_CHOICES,
     BREAKOUT_EXIT_TARGET_1X_STOP_LOW,
     MEAN_REVERSION_EXIT_CHOICES,
     MEAN_REVERSION_EXIT_SMA,
     ORB_FILTER_CHOICES,
     ORB_FILTER_NONE,
+    STRATEGY_MODE_BOLLINGER_SQUEEZE,
     STRATEGY_MODE_BREAKOUT,
     STRATEGY_MODE_CHOICES,
     STRATEGY_MODE_HYBRID,
+    STRATEGY_MODE_HYBRID_BB_MR,
     STRATEGY_MODE_MEAN_REVERSION,
     STRATEGY_MODE_ML,
     STRATEGY_MODE_ORB,
+    STRATEGY_MODE_SMA,
+    STRATEGY_MODE_MOMENTUM_BREAKOUT,
+    STRATEGY_MODE_TREND_PULLBACK,
+    STRATEGY_MODE_VOLATILITY_EXPANSION,
+    MOMENTUM_BREAKOUT_EXIT_CHOICES,
+    MOMENTUM_BREAKOUT_EXIT_FIXED_BARS,
+    TREND_PULLBACK_EXIT_CHOICES,
+    VOLATILITY_EXPANSION_EXIT_CHOICES,
+    VOLATILITY_EXPANSION_EXIT_FIXED_BARS,
     Strategy,
     StrategyConfig,
     MlSignal,
     THRESHOLD_MODE_CHOICES,
     THRESHOLD_MODE_STATIC_PCT,
+    calculate_bollinger_squeeze_features,
     calculate_opening_range_series,
     calculate_atr_pct_values,
     calculate_atr_percentile_series,
@@ -57,10 +72,15 @@ from strategy import (
     REGIME_SMA_PERIOD,
     REGIME_TIMEFRAME_MINUTES,
     estimate_atr_percentile_lookback_bars,
+    estimate_bollinger_lookback_bars,
     estimate_regime_lookback_bars,
     is_entry_window_open,
+    normalize_bollinger_exit_mode,
     normalize_breakout_exit_style,
     normalize_mean_reversion_exit_style,
+    normalize_momentum_breakout_exit_style,
+    normalize_trend_pullback_exit_style,
+    normalize_volatility_expansion_exit_style,
     normalize_orb_filter_mode,
     normalize_strategy_mode,
     normalize_threshold_mode,
@@ -72,10 +92,20 @@ from strategy import (
 logger = logging.getLogger(__name__)
 
 Position = BrokerPosition
+DATA_FEED_CHOICES = ("iex", "sip", "delayed_sip")
+BAR_BUILD_MODE_CHOICES = ("stream_minute_aggregate", "historical_preaggregated")
 
 
 class StaleMarketDataError(RuntimeError):
     """Raised when the most recent completed bar is too old to trust."""
+
+
+@dataclass(frozen=True)
+class SymbolEventBlackout:
+    symbol: str
+    start_utc: str
+    end_utc: str
+    reason: str = "event_blackout"
 
 
 @dataclass(frozen=True)
@@ -87,6 +117,17 @@ class BotConfig:
     max_daily_loss_usd: float
     sma_bars: int
     bar_timeframe_minutes: int
+    excluded_symbols: tuple[str, ...] = ()
+    symbol_event_blackouts: tuple[SymbolEventBlackout, ...] = ()
+    historical_feed: str = "iex"
+    live_feed: str = "iex"
+    latest_bar_feed: str = "iex"
+    bar_build_mode: str = "stream_minute_aggregate"
+    apply_updated_bars: bool = True
+    post_bar_reconcile_poll: bool = True
+    block_trading_until_resync: bool = True
+    assert_feed_on_startup: bool = True
+    log_bar_components: bool = True
     paper: bool = True
     strategy_mode: str = "hybrid"
     symbol_strategy_modes: dict[str, str] | None = None
@@ -107,7 +148,51 @@ class BotConfig:
     mean_reversion_exit_style: str = MEAN_REVERSION_EXIT_SMA
     mean_reversion_max_atr_percentile: float = 0.0
     mean_reversion_trend_filter: bool = False
+    mean_reversion_trend_slope_filter: bool = False
     mean_reversion_stop_pct: float = 0.0
+    vwap_z_entry_threshold: float = 1.5
+    vwap_z_stop_atr_multiple: float = 2.0
+    min_atr_percentile: float = 20.0
+    max_adx_threshold: float = 25.0
+    trend_pullback_min_adx: float = 20.0
+    trend_pullback_min_slope: float = 0.0
+    trend_pullback_entry_threshold: float = 0.0015
+    trend_pullback_min_atr_percentile: float = 20.0
+    trend_pullback_max_atr_percentile: float = 0.0
+    trend_pullback_exit_style: str = "fixed_bars"
+    trend_pullback_hold_bars: int = 4
+    trend_pullback_take_profit_pct: float = 0.0
+    trend_pullback_stop_pct: float = 0.0
+    momentum_breakout_lookback_bars: int = 20
+    momentum_breakout_entry_buffer_pct: float = 0.001
+    momentum_breakout_min_adx: float = 20.0
+    momentum_breakout_min_slope: float = 0.0
+    momentum_breakout_min_atr_percentile: float = 20.0
+    momentum_breakout_exit_style: str = MOMENTUM_BREAKOUT_EXIT_FIXED_BARS
+    momentum_breakout_hold_bars: int = 3
+    momentum_breakout_stop_pct: float = 0.0
+    momentum_breakout_take_profit_pct: float = 0.0
+    volatility_expansion_lookback_bars: int = 20
+    volatility_expansion_entry_buffer_pct: float = 0.001
+    volatility_expansion_max_atr_percentile: float = 0.0
+    volatility_expansion_trend_filter: bool = False
+    volatility_expansion_min_slope: float = 0.0
+    volatility_expansion_use_volume_confirm: bool = True
+    volatility_expansion_exit_style: str = VOLATILITY_EXPANSION_EXIT_FIXED_BARS
+    volatility_expansion_hold_bars: int = 4
+    volatility_expansion_stop_pct: float = 0.0
+    volatility_expansion_take_profit_pct: float = 0.0
+    bb_period: int = 20
+    bb_stddev_mult: float = 2.0
+    bb_width_lookback: int = 100
+    bb_squeeze_quantile: float = 0.20
+    bb_slope_lookback: int = 3
+    bb_use_volume_confirm: bool = True
+    bb_volume_mult: float = 1.2
+    bb_breakout_buffer_pct: float = 0.0
+    bb_min_mid_slope: float = 0.0
+    bb_trend_filter: bool = False
+    bb_exit_mode: str = BOLLINGER_EXIT_MIDDLE_BAND
     max_orders_per_minute: int = 6
     max_price_deviation_bps: float = 75.0
     max_data_delay_seconds: int = 300
@@ -120,6 +205,10 @@ class RuntimeConfigDetails:
     config: BotConfig
     runtime_config_path: str | None
     overridden_fields: tuple[str, ...]
+    runtime_config_approved: bool | None
+    runtime_config_rejection_reasons: tuple[str, ...]
+    baseline_valid_for_comparison: bool | None = None
+    baseline_validation_errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -142,6 +231,10 @@ class SymbolSnapshot:
     hold_reason: str | None = None  # why action is HOLD: "trend_filter", "atr_filter", "no_signal", "holding_no_exit"
     signal_pct: float | None = None   # normalized 0–1 signal strength for non-ML modes
     signal_label: str | None = None   # e.g. "Distance to Entry" or "Recovery Progress"
+    hybrid_branch_active: str | None = None
+    hybrid_entry_branch: str | None = None
+    hybrid_regime_branch: str | None = None
+    final_signal_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +247,10 @@ class SymbolEvaluation:
     hold_reason: str | None = None  # populated when action == "HOLD"; e.g. "trend_filter", "atr_filter", "no_signal"
     signal_pct: float | None = None
     signal_label: str | None = None
+    hybrid_branch_active: str | None = None
+    hybrid_entry_branch: str | None = None
+    hybrid_regime_branch: str | None = None
+    final_signal_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,11 +295,40 @@ class RunCycleReport:
     orders_submitted: int
 
 
+class ResyncStatus(str, Enum):
+    LOCKED = "RESYNC_LOCKED"
+    OK = "RESYNC_OK"
+    DEGRADED = "RESYNC_DEGRADED"
+    FAILED = "RESYNC_FAILED"
+
+
+@dataclass(frozen=True)
+class ResyncDiscrepancy:
+    symbol: str | None
+    kind: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class ResyncResult:
+    status: ResyncStatus
+    started_at_utc: str
+    completed_at_utc: str | None
+    positions_recovered: tuple[dict[str, Any], ...] = ()
+    open_orders_recovered: tuple[dict[str, Any], ...] = ()
+    recent_fills_recovered: tuple[dict[str, Any], ...] = ()
+    discrepancies: tuple[ResyncDiscrepancy, ...] = ()
+    reason_codes: tuple[str, ...] = ()
+    gate_allows_entries: bool = False
+    gate_allows_exits: bool = False
+
+
 _ET = pytz.timezone("America/New_York")
 _SESSION_ENTRY_START = dt_time(9, 45)   # no new entries before this
 _SESSION_ENTRY_END   = dt_time(15, 45)  # no new entries after this
 _SESSION_FLATTEN_AT  = dt_time(15, 55)  # forced EOD flatten deadline
 DEFAULT_RUNTIME_CONFIG_PATH = Path("config") / "live_config.json"
+STARTUP_ARTIFACT_PATH_ENV = "TRADEOS_STARTUP_ARTIFACT_PATH"
 
 
 def _safe_float(value: str | None, default: float) -> float:
@@ -246,6 +372,109 @@ def _parse_iso_timestamp(raw_value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def normalize_data_feed_name(raw_value: Any) -> str:
+    normalized = str(raw_value or "").strip().lower()
+    if normalized not in DATA_FEED_CHOICES:
+        raise RuntimeError(
+            f"Unsupported data feed {raw_value!r}. Choose from {', '.join(DATA_FEED_CHOICES)}."
+        )
+    return normalized
+
+
+def normalize_bar_build_mode(raw_value: Any) -> str:
+    normalized = str(raw_value or "").strip().lower()
+    if normalized not in BAR_BUILD_MODE_CHOICES:
+        raise RuntimeError(
+            f"Unsupported bar build mode {raw_value!r}. Choose from {', '.join(BAR_BUILD_MODE_CHOICES)}."
+        )
+    return normalized
+
+
+def _normalize_runtime_symbol_tuple(raw_value: Any, field_name: str) -> tuple[str, ...]:
+    if raw_value is None:
+        return ()
+    if isinstance(raw_value, str):
+        values = [item.strip() for item in raw_value.split(",") if item.strip()]
+    elif isinstance(raw_value, list):
+        values = [str(item).strip() for item in raw_value if str(item).strip()]
+    else:
+        raise RuntimeError(
+            f"Runtime config field {field_name!r} must be a string or array of ticker symbols."
+        )
+    return tuple(sorted(normalize_symbols(values)))
+
+
+def _coerce_runtime_symbol_event_blackouts(runtime: dict[str, Any], key: str) -> tuple[SymbolEventBlackout, ...]:
+    raw_value = runtime.get(key)
+    if raw_value is None:
+        return ()
+    if not isinstance(raw_value, list):
+        raise RuntimeError(f"Runtime config field {key!r} must be an array of blackout objects.")
+
+    blackouts: list[SymbolEventBlackout] = []
+    for index, item in enumerate(raw_value):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Runtime config field {key!r}[{index}] must be an object.")
+        symbol = str(item.get("symbol", "") or "").strip().upper()
+        start_utc = str(item.get("start_utc", "") or "").strip()
+        end_utc = str(item.get("end_utc", "") or "").strip()
+        reason = str(item.get("reason", "event_blackout") or "event_blackout").strip()
+        if not symbol:
+            raise RuntimeError(f"Runtime config field {key!r}[{index}] is missing symbol.")
+        if not start_utc or _parse_iso_timestamp(start_utc) is None:
+            raise RuntimeError(f"Runtime config field {key!r}[{index}] has invalid start_utc.")
+        if not end_utc or _parse_iso_timestamp(end_utc) is None:
+            raise RuntimeError(f"Runtime config field {key!r}[{index}] has invalid end_utc.")
+        start_ts = _parse_iso_timestamp(start_utc)
+        end_ts = _parse_iso_timestamp(end_utc)
+        if start_ts is None or end_ts is None or start_ts > end_ts:
+            raise RuntimeError(f"Runtime config field {key!r}[{index}] must satisfy start_utc <= end_utc.")
+        blackouts.append(
+            SymbolEventBlackout(
+                symbol=symbol,
+                start_utc=start_utc,
+                end_utc=end_utc,
+                reason=reason or "event_blackout",
+            )
+        )
+    return tuple(blackouts)
+
+
+def _load_open_position_state_from_logs(log_root: str | Path = "logs") -> dict[str, dict[str, Any]]:
+    open_positions: dict[str, dict[str, Any]] = {}
+    log_path = Path(log_root)
+    if not log_path.exists():
+        return open_positions
+
+    position_logs = sorted(log_path.glob("*/positions.jsonl"))
+    for positions_file in position_logs:
+        try:
+            lines = positions_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = payload.get("event")
+            symbol = str(payload.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            if event == "position.opened":
+                open_positions[symbol] = {
+                    "entry_price": _optional_float(payload.get("entry_price")),
+                    "qty": _optional_float(payload.get("qty")),
+                    "decision_ts": payload.get("decision_ts"),
+                    "entry_branch": payload.get("entry_branch"),
+                }
+            elif event == "position.closed":
+                open_positions.pop(symbol, None)
+    return open_positions
+
+
 def _position_qty_value(position: Position | None) -> float:
     if position is None:
         return 0.0
@@ -258,6 +487,14 @@ def _position_qty_value(position: Position | None) -> float:
 
 def _has_long_position(position: Position | None) -> bool:
     return _position_qty_value(position) > 0
+
+
+def _has_short_position(position: Position | None) -> bool:
+    return _position_qty_value(position) < 0
+
+
+def _has_open_position(position: Position | None) -> bool:
+    return _position_qty_value(position) != 0
 
 
 def _parse_symbol_strategy_map(raw_value: str | None) -> dict[str, str]:
@@ -305,6 +542,73 @@ def _determine_signal_rejection(
     return "no_signal"
 
 
+def _format_reason_label(reason: str | None) -> str:
+    if not reason:
+        return "decision context unavailable"
+    return reason.replace("_", " ")
+
+
+def _build_signal_explanation(
+    *,
+    strategy_mode: str,
+    action: str,
+    reason: str | None,
+    price: float,
+    sma: float,
+    holding: bool,
+    time_window_open: bool,
+    atr_percentile: float | None,
+    trend_sma: float | None,
+    bullish_regime: bool | None,
+    entry_reference_price: float | None,
+    exit_reference_price: float | None,
+    stop_reference_price: float | None,
+    vwap: float | None,
+    adx: float | None,
+    hybrid_branch_active: str | None = None,
+) -> str:
+    parts: list[str] = []
+    mode_label = strategy_mode.replace("_", " ")
+    parts.append(f"{action} in {mode_label} mode")
+    if reason:
+        parts.append(f"reason: {_format_reason_label(reason)}")
+
+    if entry_reference_price is not None and action != "SELL":
+        relation = "above" if price >= entry_reference_price else "below"
+        move_pct = abs(price - entry_reference_price) / max(entry_reference_price, 1e-9) * 100.0
+        parts.append(f"price {relation} entry trigger by {move_pct:.2f}%")
+    elif sma > 0:
+        move_pct = abs(price - sma) / sma * 100.0
+        relation = "above" if price >= sma else "below"
+        parts.append(f"price {relation} SMA by {move_pct:.2f}%")
+
+    if exit_reference_price is not None and holding:
+        relation = "above" if price >= exit_reference_price else "below"
+        parts.append(f"price {relation} exit reference")
+
+    if stop_reference_price is not None and holding:
+        cushion_pct = (price - stop_reference_price) / max(stop_reference_price, 1e-9) * 100.0
+        parts.append(f"stop cushion {cushion_pct:.2f}%")
+
+    if atr_percentile is not None:
+        parts.append(f"ATR percentile {atr_percentile:.1f}")
+    if bullish_regime is True:
+        parts.append("regime bullish")
+    elif bullish_regime is False:
+        parts.append("regime bearish")
+    if trend_sma is not None:
+        parts.append("above trend SMA" if price >= trend_sma else "below trend SMA")
+    if not time_window_open and not holding:
+        parts.append("entry window closed")
+    if vwap is not None:
+        parts.append("below VWAP" if price < vwap else "above VWAP")
+    if adx is not None:
+        parts.append(f"ADX {adx:.1f}")
+    if hybrid_branch_active:
+        parts.append(f"branch {hybrid_branch_active.replace('_', ' ')}")
+    return ". ".join(parts) + "."
+
+
 def _normalize_runtime_symbols(raw_symbols: Any) -> list[str]:
     if not isinstance(raw_symbols, list):
         raise RuntimeError("Runtime config field 'symbols' must be a list of ticker strings.")
@@ -347,10 +651,10 @@ def _coerce_runtime_bool(runtime: dict[str, Any], key: str) -> bool:
     raise RuntimeError(f"Runtime config field {key!r} must be a boolean, got {value!r}.")
 
 
-def _load_runtime_config_payload() -> tuple[Path | None, dict[str, Any] | None]:
+def _load_runtime_config_payload() -> tuple[Path | None, dict[str, Any] | None, dict[str, Any] | None]:
     runtime_path = Path(os.getenv("BOT_RUNTIME_CONFIG_PATH", str(DEFAULT_RUNTIME_CONFIG_PATH)))
     if not runtime_path.exists():
-        return None, None
+        return None, None, None
 
     try:
         payload = json.loads(runtime_path.read_text(encoding="utf-8"))
@@ -364,7 +668,7 @@ def _load_runtime_config_payload() -> tuple[Path | None, dict[str, Any] | None]:
     if not isinstance(runtime, dict):
         raise RuntimeError(f"Runtime config field 'runtime' must be a JSON object: {runtime_path}")
 
-    return runtime_path, runtime
+    return runtime_path, runtime, payload
 
 
 def _apply_runtime_config(
@@ -376,8 +680,41 @@ def _apply_runtime_config(
         return base_config, ()
 
     overrides: dict[str, Any] = {}
+    data_parity = runtime.get("data_parity")
+    if data_parity is not None and not isinstance(data_parity, dict):
+        raise RuntimeError("Runtime config field 'data_parity' must be an object when present.")
+    data_parity = data_parity or {}
     if "symbols" in runtime:
         overrides["symbols"] = _normalize_runtime_symbols(runtime["symbols"])
+    if "excluded_symbols" in runtime:
+        overrides["excluded_symbols"] = _normalize_runtime_symbol_tuple(runtime.get("excluded_symbols"), "excluded_symbols")
+    if "symbol_event_blackouts" in runtime:
+        overrides["symbol_event_blackouts"] = _coerce_runtime_symbol_event_blackouts(runtime, "symbol_event_blackouts")
+    if "historical_feed" in runtime or "historical_feed" in data_parity:
+        overrides["historical_feed"] = normalize_data_feed_name(
+            data_parity.get("historical_feed", runtime.get("historical_feed"))
+        )
+    if "live_feed" in runtime or "live_feed" in data_parity:
+        overrides["live_feed"] = normalize_data_feed_name(
+            data_parity.get("live_feed", runtime.get("live_feed"))
+        )
+    if "latest_bar_feed" in runtime or "latest_bar_feed" in data_parity:
+        overrides["latest_bar_feed"] = normalize_data_feed_name(
+            data_parity.get("latest_bar_feed", runtime.get("latest_bar_feed"))
+        )
+    if "bar_build_mode" in runtime or "bar_build_mode" in data_parity:
+        overrides["bar_build_mode"] = normalize_bar_build_mode(
+            data_parity.get("bar_build_mode", runtime.get("bar_build_mode"))
+        )
+    for key in (
+        "apply_updated_bars",
+        "post_bar_reconcile_poll",
+        "block_trading_until_resync",
+        "assert_feed_on_startup",
+        "log_bar_components",
+    ):
+        if key in runtime or key in data_parity:
+            overrides[key] = _coerce_runtime_bool({key: data_parity.get(key, runtime.get(key))}, key)
     if "bar_timeframe_minutes" in runtime:
         overrides["bar_timeframe_minutes"] = _coerce_runtime_int(runtime, "bar_timeframe_minutes")
     if "strategy_mode" in runtime:
@@ -406,6 +743,10 @@ def _apply_runtime_config(
         overrides["breakout_exit_style"] = normalize_breakout_exit_style(str(runtime["breakout_exit_style"]))
     if "breakout_tight_stop_fraction" in runtime and runtime["breakout_tight_stop_fraction"] is not None:
         overrides["breakout_tight_stop_fraction"] = _coerce_runtime_float(runtime, "breakout_tight_stop_fraction")
+    if "breakout_max_stop_pct" in runtime and runtime["breakout_max_stop_pct"] is not None:
+        overrides["breakout_max_stop_pct"] = _coerce_runtime_float(runtime, "breakout_max_stop_pct")
+    if "sma_stop_pct" in runtime and runtime["sma_stop_pct"] is not None:
+        overrides["sma_stop_pct"] = _coerce_runtime_float(runtime, "sma_stop_pct")
     if "mean_reversion_exit_style" in runtime:
         overrides["mean_reversion_exit_style"] = normalize_mean_reversion_exit_style(
             str(runtime["mean_reversion_exit_style"])
@@ -417,6 +758,106 @@ def _apply_runtime_config(
         )
     if "mean_reversion_trend_filter" in runtime:
         overrides["mean_reversion_trend_filter"] = _coerce_runtime_bool(runtime, "mean_reversion_trend_filter")
+    if "mean_reversion_trend_slope_filter" in runtime:
+        overrides["mean_reversion_trend_slope_filter"] = _coerce_runtime_bool(runtime, "mean_reversion_trend_slope_filter")
+    if "mean_reversion_stop_pct" in runtime and runtime["mean_reversion_stop_pct"] is not None:
+        overrides["mean_reversion_stop_pct"] = _coerce_runtime_float(runtime, "mean_reversion_stop_pct")
+    if "vwap_z_entry_threshold" in runtime and runtime["vwap_z_entry_threshold"] is not None:
+        overrides["vwap_z_entry_threshold"] = _coerce_runtime_float(runtime, "vwap_z_entry_threshold")
+    if "vwap_z_stop_atr_multiple" in runtime and runtime["vwap_z_stop_atr_multiple"] is not None:
+        overrides["vwap_z_stop_atr_multiple"] = _coerce_runtime_float(runtime, "vwap_z_stop_atr_multiple")
+    if "min_atr_percentile" in runtime and runtime["min_atr_percentile"] is not None:
+        overrides["min_atr_percentile"] = _coerce_runtime_float(runtime, "min_atr_percentile")
+    if "max_adx_threshold" in runtime and runtime["max_adx_threshold"] is not None:
+        overrides["max_adx_threshold"] = _coerce_runtime_float(runtime, "max_adx_threshold")
+    if "trend_pullback_min_adx" in runtime and runtime["trend_pullback_min_adx"] is not None:
+        overrides["trend_pullback_min_adx"] = _coerce_runtime_float(runtime, "trend_pullback_min_adx")
+    if "trend_pullback_min_slope" in runtime and runtime["trend_pullback_min_slope"] is not None:
+        overrides["trend_pullback_min_slope"] = _coerce_runtime_float(runtime, "trend_pullback_min_slope")
+    if "trend_pullback_entry_threshold" in runtime and runtime["trend_pullback_entry_threshold"] is not None:
+        overrides["trend_pullback_entry_threshold"] = _coerce_runtime_float(runtime, "trend_pullback_entry_threshold")
+    if "trend_pullback_min_atr_percentile" in runtime and runtime["trend_pullback_min_atr_percentile"] is not None:
+        overrides["trend_pullback_min_atr_percentile"] = _coerce_runtime_float(runtime, "trend_pullback_min_atr_percentile")
+    if "trend_pullback_max_atr_percentile" in runtime and runtime["trend_pullback_max_atr_percentile"] is not None:
+        overrides["trend_pullback_max_atr_percentile"] = _coerce_runtime_float(runtime, "trend_pullback_max_atr_percentile")
+    if "trend_pullback_exit_style" in runtime:
+        overrides["trend_pullback_exit_style"] = normalize_trend_pullback_exit_style(str(runtime["trend_pullback_exit_style"]))
+    if "trend_pullback_hold_bars" in runtime and runtime["trend_pullback_hold_bars"] is not None:
+        overrides["trend_pullback_hold_bars"] = _coerce_runtime_int(runtime, "trend_pullback_hold_bars")
+    if "trend_pullback_take_profit_pct" in runtime and runtime["trend_pullback_take_profit_pct"] is not None:
+        overrides["trend_pullback_take_profit_pct"] = _coerce_runtime_float(runtime, "trend_pullback_take_profit_pct")
+    if "trend_pullback_stop_pct" in runtime and runtime["trend_pullback_stop_pct"] is not None:
+        overrides["trend_pullback_stop_pct"] = _coerce_runtime_float(runtime, "trend_pullback_stop_pct")
+    if "momentum_breakout_lookback_bars" in runtime and runtime["momentum_breakout_lookback_bars"] is not None:
+        overrides["momentum_breakout_lookback_bars"] = _coerce_runtime_int(runtime, "momentum_breakout_lookback_bars")
+    if "momentum_breakout_entry_buffer_pct" in runtime and runtime["momentum_breakout_entry_buffer_pct"] is not None:
+        overrides["momentum_breakout_entry_buffer_pct"] = _coerce_runtime_float(runtime, "momentum_breakout_entry_buffer_pct")
+    if "momentum_breakout_min_adx" in runtime and runtime["momentum_breakout_min_adx"] is not None:
+        overrides["momentum_breakout_min_adx"] = _coerce_runtime_float(runtime, "momentum_breakout_min_adx")
+    if "momentum_breakout_min_slope" in runtime and runtime["momentum_breakout_min_slope"] is not None:
+        overrides["momentum_breakout_min_slope"] = _coerce_runtime_float(runtime, "momentum_breakout_min_slope")
+    if "momentum_breakout_min_atr_percentile" in runtime and runtime["momentum_breakout_min_atr_percentile"] is not None:
+        overrides["momentum_breakout_min_atr_percentile"] = _coerce_runtime_float(runtime, "momentum_breakout_min_atr_percentile")
+    if "momentum_breakout_exit_style" in runtime:
+        overrides["momentum_breakout_exit_style"] = normalize_momentum_breakout_exit_style(str(runtime["momentum_breakout_exit_style"]))
+    if "momentum_breakout_hold_bars" in runtime and runtime["momentum_breakout_hold_bars"] is not None:
+        overrides["momentum_breakout_hold_bars"] = _coerce_runtime_int(runtime, "momentum_breakout_hold_bars")
+    if "momentum_breakout_stop_pct" in runtime and runtime["momentum_breakout_stop_pct"] is not None:
+        overrides["momentum_breakout_stop_pct"] = _coerce_runtime_float(runtime, "momentum_breakout_stop_pct")
+    if "momentum_breakout_take_profit_pct" in runtime and runtime["momentum_breakout_take_profit_pct"] is not None:
+        overrides["momentum_breakout_take_profit_pct"] = _coerce_runtime_float(runtime, "momentum_breakout_take_profit_pct")
+    if "volatility_expansion_lookback_bars" in runtime and runtime["volatility_expansion_lookback_bars"] is not None:
+        overrides["volatility_expansion_lookback_bars"] = _coerce_runtime_int(runtime, "volatility_expansion_lookback_bars")
+    if "volatility_expansion_entry_buffer_pct" in runtime and runtime["volatility_expansion_entry_buffer_pct"] is not None:
+        overrides["volatility_expansion_entry_buffer_pct"] = _coerce_runtime_float(runtime, "volatility_expansion_entry_buffer_pct")
+    if "volatility_expansion_max_atr_percentile" in runtime and runtime["volatility_expansion_max_atr_percentile"] is not None:
+        overrides["volatility_expansion_max_atr_percentile"] = _coerce_runtime_float(runtime, "volatility_expansion_max_atr_percentile")
+    if "volatility_expansion_trend_filter" in runtime:
+        overrides["volatility_expansion_trend_filter"] = _coerce_runtime_bool(runtime, "volatility_expansion_trend_filter")
+    if "volatility_expansion_min_slope" in runtime and runtime["volatility_expansion_min_slope"] is not None:
+        overrides["volatility_expansion_min_slope"] = _coerce_runtime_float(runtime, "volatility_expansion_min_slope")
+    if "volatility_expansion_use_volume_confirm" in runtime:
+        overrides["volatility_expansion_use_volume_confirm"] = _coerce_runtime_bool(runtime, "volatility_expansion_use_volume_confirm")
+    if "volatility_expansion_exit_style" in runtime:
+        overrides["volatility_expansion_exit_style"] = normalize_volatility_expansion_exit_style(str(runtime["volatility_expansion_exit_style"]))
+    if "volatility_expansion_hold_bars" in runtime and runtime["volatility_expansion_hold_bars"] is not None:
+        overrides["volatility_expansion_hold_bars"] = _coerce_runtime_int(runtime, "volatility_expansion_hold_bars")
+    if "volatility_expansion_stop_pct" in runtime and runtime["volatility_expansion_stop_pct"] is not None:
+        overrides["volatility_expansion_stop_pct"] = _coerce_runtime_float(runtime, "volatility_expansion_stop_pct")
+    if "volatility_expansion_take_profit_pct" in runtime and runtime["volatility_expansion_take_profit_pct"] is not None:
+        overrides["volatility_expansion_take_profit_pct"] = _coerce_runtime_float(runtime, "volatility_expansion_take_profit_pct")
+    if "bb_period" in runtime and runtime["bb_period"] is not None:
+        overrides["bb_period"] = _coerce_runtime_int(runtime, "bb_period")
+    if "bb_stddev_mult" in runtime and runtime["bb_stddev_mult"] is not None:
+        overrides["bb_stddev_mult"] = _coerce_runtime_float(runtime, "bb_stddev_mult")
+    if "bb_width_lookback" in runtime and runtime["bb_width_lookback"] is not None:
+        overrides["bb_width_lookback"] = _coerce_runtime_int(runtime, "bb_width_lookback")
+    if "bb_squeeze_quantile" in runtime and runtime["bb_squeeze_quantile"] is not None:
+        overrides["bb_squeeze_quantile"] = _coerce_runtime_float(runtime, "bb_squeeze_quantile")
+    if "bb_slope_lookback" in runtime and runtime["bb_slope_lookback"] is not None:
+        overrides["bb_slope_lookback"] = _coerce_runtime_int(runtime, "bb_slope_lookback")
+    if "bb_use_volume_confirm" in runtime:
+        overrides["bb_use_volume_confirm"] = _coerce_runtime_bool(runtime, "bb_use_volume_confirm")
+    if "bb_volume_mult" in runtime and runtime["bb_volume_mult"] is not None:
+        overrides["bb_volume_mult"] = _coerce_runtime_float(runtime, "bb_volume_mult")
+    if "bb_breakout_buffer_pct" in runtime and runtime["bb_breakout_buffer_pct"] is not None:
+        overrides["bb_breakout_buffer_pct"] = _coerce_runtime_float(runtime, "bb_breakout_buffer_pct")
+    if "bb_min_mid_slope" in runtime and runtime["bb_min_mid_slope"] is not None:
+        overrides["bb_min_mid_slope"] = _coerce_runtime_float(runtime, "bb_min_mid_slope")
+    if "bb_trend_filter" in runtime:
+        overrides["bb_trend_filter"] = _coerce_runtime_bool(runtime, "bb_trend_filter")
+    if "bb_exit_mode" in runtime:
+        overrides["bb_exit_mode"] = normalize_bollinger_exit_mode(str(runtime["bb_exit_mode"]))
+    if "ml_lookback_bars" in runtime and runtime["ml_lookback_bars"] is not None:
+        overrides["ml_lookback_bars"] = _coerce_runtime_int(runtime, "ml_lookback_bars")
+    if "max_orders_per_minute" in runtime and runtime["max_orders_per_minute"] is not None:
+        overrides["max_orders_per_minute"] = _coerce_runtime_int(runtime, "max_orders_per_minute")
+    if "max_price_deviation_bps" in runtime and runtime["max_price_deviation_bps"] is not None:
+        overrides["max_price_deviation_bps"] = _coerce_runtime_float(runtime, "max_price_deviation_bps")
+    if "max_data_delay_seconds" in runtime and runtime["max_data_delay_seconds"] is not None:
+        overrides["max_data_delay_seconds"] = _coerce_runtime_int(runtime, "max_data_delay_seconds")
+    if "max_live_price_age_seconds" in runtime and runtime["max_live_price_age_seconds"] is not None:
+        overrides["max_live_price_age_seconds"] = _coerce_runtime_int(runtime, "max_live_price_age_seconds")
     if "symbol_strategy_modes" in runtime:
         if not isinstance(runtime["symbol_strategy_modes"], dict):
             raise RuntimeError("Runtime config field 'symbol_strategy_modes' must be an object mapping SYMBOL to mode.")
@@ -427,6 +868,21 @@ def _apply_runtime_config(
         }
 
     config = replace(base_config, **overrides)
+    if config.excluded_symbols:
+        excluded = set(config.excluded_symbols)
+        filtered_symbols = [symbol for symbol in config.symbols if symbol not in excluded]
+        filtered_strategy_modes = {
+            symbol: mode
+            for symbol, mode in (config.symbol_strategy_modes or {}).items()
+            if symbol in filtered_symbols
+        }
+        if not filtered_symbols:
+            raise RuntimeError("Runtime config excluded every symbol; at least one active ticker is required.")
+        config = replace(
+            config,
+            symbols=filtered_symbols,
+            symbol_strategy_modes=filtered_strategy_modes or None,
+        )
     runtime_symbols = ", ".join(config.symbols)
     changed_fields = sorted(
         field_name
@@ -464,6 +920,17 @@ def _load_base_config() -> BotConfig:
         max_daily_loss_usd=float(os.getenv("MAX_DAILY_LOSS_USD", "300")),
         sma_bars=int(sma_bars_raw),
         bar_timeframe_minutes=bar_timeframe_minutes,
+        excluded_symbols=(),
+        symbol_event_blackouts=(),
+        historical_feed=normalize_data_feed_name(os.getenv("HISTORICAL_FEED", "iex")),
+        live_feed=normalize_data_feed_name(os.getenv("LIVE_FEED", os.getenv("PRICE_STREAM_FEED", "iex"))),
+        latest_bar_feed=normalize_data_feed_name(os.getenv("LATEST_BAR_FEED", "iex")),
+        bar_build_mode=normalize_bar_build_mode(os.getenv("BAR_BUILD_MODE", "stream_minute_aggregate")),
+        apply_updated_bars=os.getenv("APPLY_UPDATED_BARS", "true").lower() != "false",
+        post_bar_reconcile_poll=os.getenv("POST_BAR_RECONCILE_POLL", "true").lower() != "false",
+        block_trading_until_resync=os.getenv("BLOCK_TRADING_UNTIL_RESYNC", "true").lower() != "false",
+        assert_feed_on_startup=os.getenv("ASSERT_FEED_ON_STARTUP", "true").lower() != "false",
+        log_bar_components=os.getenv("LOG_BAR_COMPONENTS", "true").lower() != "false",
         paper=os.getenv("ALPACA_PAPER", "true").lower() != "false",
         strategy_mode=normalize_strategy_mode(os.getenv("STRATEGY_MODE", "hybrid")),
         symbol_strategy_modes=_parse_symbol_strategy_map(os.getenv("SYMBOL_STRATEGY_MAP")),
@@ -495,7 +962,57 @@ def _load_base_config() -> BotConfig:
         ),
         mean_reversion_max_atr_percentile=_safe_float(os.getenv("MEAN_REVERSION_MAX_ATR_PERCENTILE"), 0.0),
         mean_reversion_trend_filter=os.getenv("MEAN_REVERSION_TREND_FILTER", "false").lower() == "true",
+        mean_reversion_trend_slope_filter=os.getenv("MEAN_REVERSION_TREND_SLOPE_FILTER", "false").lower() == "true",
         mean_reversion_stop_pct=_safe_float(os.getenv("MEAN_REVERSION_STOP_PCT"), 0.0),
+        vwap_z_entry_threshold=_safe_float(os.getenv("VWAP_Z_ENTRY_THRESHOLD"), 1.5),
+        vwap_z_stop_atr_multiple=_safe_float(os.getenv("VWAP_Z_STOP_ATR_MULTIPLE"), 2.0),
+        min_atr_percentile=_safe_float(os.getenv("MIN_ATR_PERCENTILE"), 20.0),
+        max_adx_threshold=_safe_float(os.getenv("MAX_ADX_THRESHOLD"), 25.0),
+        trend_pullback_min_adx=_safe_float(os.getenv("TREND_PULLBACK_MIN_ADX"), 20.0),
+        trend_pullback_min_slope=_safe_float(os.getenv("TREND_PULLBACK_MIN_SLOPE"), 0.0),
+        trend_pullback_entry_threshold=_safe_float(os.getenv("TREND_PULLBACK_ENTRY_THRESHOLD"), 0.0015),
+        trend_pullback_min_atr_percentile=_safe_float(os.getenv("TREND_PULLBACK_MIN_ATR_PERCENTILE"), 20.0),
+        trend_pullback_max_atr_percentile=_safe_float(os.getenv("TREND_PULLBACK_MAX_ATR_PERCENTILE"), 0.0),
+        trend_pullback_exit_style=normalize_trend_pullback_exit_style(
+            os.getenv("TREND_PULLBACK_EXIT_STYLE", "fixed_bars")
+        ),
+        trend_pullback_hold_bars=int(os.getenv("TREND_PULLBACK_HOLD_BARS", "4")),
+        trend_pullback_take_profit_pct=_safe_float(os.getenv("TREND_PULLBACK_TAKE_PROFIT_PCT"), 0.0),
+        trend_pullback_stop_pct=_safe_float(os.getenv("TREND_PULLBACK_STOP_PCT"), 0.0),
+        momentum_breakout_lookback_bars=int(os.getenv("MOMENTUM_BREAKOUT_LOOKBACK_BARS", "20")),
+        momentum_breakout_entry_buffer_pct=_safe_float(os.getenv("MOMENTUM_BREAKOUT_ENTRY_BUFFER_PCT"), 0.001),
+        momentum_breakout_min_adx=_safe_float(os.getenv("MOMENTUM_BREAKOUT_MIN_ADX"), 20.0),
+        momentum_breakout_min_slope=_safe_float(os.getenv("MOMENTUM_BREAKOUT_MIN_SLOPE"), 0.0),
+        momentum_breakout_min_atr_percentile=_safe_float(os.getenv("MOMENTUM_BREAKOUT_MIN_ATR_PERCENTILE"), 20.0),
+        momentum_breakout_exit_style=normalize_momentum_breakout_exit_style(
+            os.getenv("MOMENTUM_BREAKOUT_EXIT_STYLE", MOMENTUM_BREAKOUT_EXIT_FIXED_BARS)
+        ),
+        momentum_breakout_hold_bars=int(os.getenv("MOMENTUM_BREAKOUT_HOLD_BARS", "3")),
+        momentum_breakout_stop_pct=_safe_float(os.getenv("MOMENTUM_BREAKOUT_STOP_PCT"), 0.0),
+        momentum_breakout_take_profit_pct=_safe_float(os.getenv("MOMENTUM_BREAKOUT_TAKE_PROFIT_PCT"), 0.0),
+        volatility_expansion_lookback_bars=int(os.getenv("VOLATILITY_EXPANSION_LOOKBACK_BARS", "20")),
+        volatility_expansion_entry_buffer_pct=_safe_float(os.getenv("VOLATILITY_EXPANSION_ENTRY_BUFFER_PCT"), 0.001),
+        volatility_expansion_max_atr_percentile=_safe_float(os.getenv("VOLATILITY_EXPANSION_MAX_ATR_PERCENTILE"), 0.0),
+        volatility_expansion_trend_filter=os.getenv("VOLATILITY_EXPANSION_TREND_FILTER", "false").lower() == "true",
+        volatility_expansion_min_slope=_safe_float(os.getenv("VOLATILITY_EXPANSION_MIN_SLOPE"), 0.0),
+        volatility_expansion_use_volume_confirm=os.getenv("VOLATILITY_EXPANSION_USE_VOLUME_CONFIRM", "true").lower() != "false",
+        volatility_expansion_exit_style=normalize_volatility_expansion_exit_style(
+            os.getenv("VOLATILITY_EXPANSION_EXIT_STYLE", VOLATILITY_EXPANSION_EXIT_FIXED_BARS)
+        ),
+        volatility_expansion_hold_bars=int(os.getenv("VOLATILITY_EXPANSION_HOLD_BARS", "4")),
+        volatility_expansion_stop_pct=_safe_float(os.getenv("VOLATILITY_EXPANSION_STOP_PCT"), 0.0),
+        volatility_expansion_take_profit_pct=_safe_float(os.getenv("VOLATILITY_EXPANSION_TAKE_PROFIT_PCT"), 0.0),
+        bb_period=int(os.getenv("BB_PERIOD", "20")),
+        bb_stddev_mult=_safe_float(os.getenv("BB_STDDEV_MULT"), 2.0),
+        bb_width_lookback=int(os.getenv("BB_WIDTH_LOOKBACK", "100")),
+        bb_squeeze_quantile=_safe_float(os.getenv("BB_SQUEEZE_QUANTILE"), 0.20),
+        bb_slope_lookback=int(os.getenv("BB_SLOPE_LOOKBACK", "3")),
+        bb_use_volume_confirm=os.getenv("BB_USE_VOLUME_CONFIRM", "true").lower() == "true",
+        bb_volume_mult=_safe_float(os.getenv("BB_VOLUME_MULT"), 1.2),
+        bb_breakout_buffer_pct=_safe_float(os.getenv("BB_BREAKOUT_BUFFER_PCT"), 0.0),
+        bb_min_mid_slope=_safe_float(os.getenv("BB_MIN_MID_SLOPE"), 0.0),
+        bb_trend_filter=os.getenv("BB_TREND_FILTER", "false").lower() == "true",
+        bb_exit_mode=normalize_bollinger_exit_mode(os.getenv("BB_EXIT_MODE", BOLLINGER_EXIT_MIDDLE_BAND)),
         max_orders_per_minute=int(os.getenv("MAX_ORDERS_PER_MINUTE", "6")),
         max_price_deviation_bps=_safe_float(os.getenv("MAX_PRICE_DEVIATION_BPS"), 75.0),
         max_data_delay_seconds=int(os.getenv("MAX_DATA_DELAY_SECONDS", "300")),
@@ -507,12 +1024,27 @@ def _load_base_config() -> BotConfig:
 def load_config_details() -> RuntimeConfigDetails:
     load_dotenv(Path.cwd() / ".env")
     base_config = _load_base_config()
-    runtime_path, runtime = _load_runtime_config_payload()
+    runtime_path, runtime, payload = _load_runtime_config_payload()
     config, changed_fields = _apply_runtime_config(base_config, runtime_path, runtime)
+    runtime_config_approved: bool | None = None
+    runtime_config_rejection_reasons: tuple[str, ...] = ()
+    if isinstance(payload, dict):
+        source = payload.get("source")
+        if isinstance(source, dict):
+            approved = source.get("approved")
+            if isinstance(approved, bool):
+                runtime_config_approved = approved
+            rejection_reasons = source.get("rejection_reasons")
+            if isinstance(rejection_reasons, list):
+                runtime_config_rejection_reasons = tuple(
+                    str(reason) for reason in rejection_reasons if str(reason).strip()
+                )
     return RuntimeConfigDetails(
         config=config,
         runtime_config_path=str(runtime_path) if runtime_path is not None else None,
         overridden_fields=changed_fields,
+        runtime_config_approved=runtime_config_approved,
+        runtime_config_rejection_reasons=runtime_config_rejection_reasons,
     )
 
 
@@ -531,8 +1063,8 @@ class TradeOSBot:
         self.broker = self._build_broker()
         db_path = Path(os.getenv("BOT_DB_PATH", "bot_history.db"))
         self.storage = BotStorage(db_path)
-        self.blog = BotLogger(log_root="logs")
         self.session_id = session_id or f"session-{int(datetime.now(timezone.utc).timestamp())}"
+        self.blog = BotLogger(log_root="logs", session_id=self.session_id)
         self.active_symbols = normalize_symbols(config.symbols)
         self._active_symbol_fingerprint = symbol_fingerprint(self.active_symbols)
         # Fill-tracking state (keyed by order_id)
@@ -545,14 +1077,23 @@ class TradeOSBot:
         self._position_entry_price: dict[str, float] = {} # symbol → fill price at entry
         self._position_entry_ts: dict[str, str] = {}      # symbol → decision_ts at entry
         self._position_qty: dict[str, float] = {}         # symbol → qty at entry
+        self._position_entry_branch: dict[str, str] = {}  # symbol → branch that opened the position
         self._ml_disabled_reason: str | None = None
         self._order_signal_price: dict[str, float] = {}
+        self._order_entry_branch: dict[str, str] = {}     # order_id → branch intended at submit time
         self._last_processed_decision_timestamp: datetime | None = None
         self._position_first_seen_utc: dict[str, datetime] = {}
         self._bars_cache: dict[tuple[str, int, int, str], list[BrokerBar]] = {}
         self._hourly_regime_cache: dict[tuple[str, str], bool | None] = {}
         self._strategy_cache: dict[str, Strategy] = {}
         self._last_run_cycle_report: RunCycleReport | None = None
+        self._startup_resync_result = ResyncResult(
+            status=ResyncStatus.LOCKED,
+            started_at_utc=datetime.now(timezone.utc).isoformat(),
+            completed_at_utc=None,
+            gate_allows_entries=False,
+            gate_allows_exits=False,
+        )
         self._startup_market_data_validated_for_et_date: str | None = None
         self._validate_persisted_symbol_state()
         self.strategy = Strategy(
@@ -574,7 +1115,51 @@ class TradeOSBot:
                 mean_reversion_exit_style=config.mean_reversion_exit_style,
                 mean_reversion_max_atr_percentile=config.mean_reversion_max_atr_percentile,
                 mean_reversion_trend_filter=config.mean_reversion_trend_filter,
+                mean_reversion_trend_slope_filter=config.mean_reversion_trend_slope_filter,
                 mean_reversion_stop_pct=config.mean_reversion_stop_pct,
+                vwap_z_entry_threshold=config.vwap_z_entry_threshold,
+                vwap_z_stop_atr_multiple=config.vwap_z_stop_atr_multiple,
+                min_atr_percentile=config.min_atr_percentile,
+                max_adx_threshold=config.max_adx_threshold,
+                trend_pullback_min_adx=config.trend_pullback_min_adx,
+                trend_pullback_min_slope=config.trend_pullback_min_slope,
+                trend_pullback_entry_threshold=config.trend_pullback_entry_threshold,
+                trend_pullback_min_atr_percentile=config.trend_pullback_min_atr_percentile,
+                trend_pullback_max_atr_percentile=config.trend_pullback_max_atr_percentile,
+                trend_pullback_exit_style=config.trend_pullback_exit_style,
+                trend_pullback_hold_bars=config.trend_pullback_hold_bars,
+                trend_pullback_take_profit_pct=config.trend_pullback_take_profit_pct,
+                trend_pullback_stop_pct=config.trend_pullback_stop_pct,
+                momentum_breakout_lookback_bars=config.momentum_breakout_lookback_bars,
+                momentum_breakout_entry_buffer_pct=config.momentum_breakout_entry_buffer_pct,
+                momentum_breakout_min_adx=config.momentum_breakout_min_adx,
+                momentum_breakout_min_slope=config.momentum_breakout_min_slope,
+                momentum_breakout_min_atr_percentile=config.momentum_breakout_min_atr_percentile,
+                momentum_breakout_exit_style=config.momentum_breakout_exit_style,
+                momentum_breakout_hold_bars=config.momentum_breakout_hold_bars,
+                momentum_breakout_stop_pct=config.momentum_breakout_stop_pct,
+                momentum_breakout_take_profit_pct=config.momentum_breakout_take_profit_pct,
+                volatility_expansion_lookback_bars=config.volatility_expansion_lookback_bars,
+                volatility_expansion_entry_buffer_pct=config.volatility_expansion_entry_buffer_pct,
+                volatility_expansion_max_atr_percentile=config.volatility_expansion_max_atr_percentile,
+                volatility_expansion_trend_filter=config.volatility_expansion_trend_filter,
+                volatility_expansion_min_slope=config.volatility_expansion_min_slope,
+                volatility_expansion_use_volume_confirm=config.volatility_expansion_use_volume_confirm,
+                volatility_expansion_exit_style=config.volatility_expansion_exit_style,
+                volatility_expansion_hold_bars=config.volatility_expansion_hold_bars,
+                volatility_expansion_stop_pct=config.volatility_expansion_stop_pct,
+                volatility_expansion_take_profit_pct=config.volatility_expansion_take_profit_pct,
+                bb_period=config.bb_period,
+                bb_stddev_mult=config.bb_stddev_mult,
+                bb_width_lookback=config.bb_width_lookback,
+                bb_squeeze_quantile=config.bb_squeeze_quantile,
+                bb_slope_lookback=config.bb_slope_lookback,
+                bb_use_volume_confirm=config.bb_use_volume_confirm,
+                bb_volume_mult=config.bb_volume_mult,
+                bb_breakout_buffer_pct=config.bb_breakout_buffer_pct,
+                bb_min_mid_slope=config.bb_min_mid_slope,
+                bb_trend_filter=config.bb_trend_filter,
+                bb_exit_mode=config.bb_exit_mode,
             )
         )
         self._symbol_strategy_modes = config.symbol_strategy_modes or {}
@@ -618,6 +1203,26 @@ class TradeOSBot:
                 f"Unsupported MEAN_REVERSION_EXIT_STYLE={config.mean_reversion_exit_style}. "
                 f"Choose from {', '.join(MEAN_REVERSION_EXIT_CHOICES)}."
             )
+        if normalize_trend_pullback_exit_style(config.trend_pullback_exit_style) not in TREND_PULLBACK_EXIT_CHOICES:
+            raise RuntimeError(
+                f"Unsupported TREND_PULLBACK_EXIT_STYLE={config.trend_pullback_exit_style}. "
+                f"Choose from {', '.join(TREND_PULLBACK_EXIT_CHOICES)}."
+            )
+        if normalize_momentum_breakout_exit_style(config.momentum_breakout_exit_style) not in MOMENTUM_BREAKOUT_EXIT_CHOICES:
+            raise RuntimeError(
+                f"Unsupported MOMENTUM_BREAKOUT_EXIT_STYLE={config.momentum_breakout_exit_style}. "
+                f"Choose from {', '.join(MOMENTUM_BREAKOUT_EXIT_CHOICES)}."
+            )
+        if normalize_volatility_expansion_exit_style(config.volatility_expansion_exit_style) not in VOLATILITY_EXPANSION_EXIT_CHOICES:
+            raise RuntimeError(
+                f"Unsupported VOLATILITY_EXPANSION_EXIT_STYLE={config.volatility_expansion_exit_style}. "
+                f"Choose from {', '.join(VOLATILITY_EXPANSION_EXIT_CHOICES)}."
+            )
+        if config.bb_exit_mode not in BOLLINGER_EXIT_CHOICES:
+            raise RuntimeError(
+                f"Unsupported BB_EXIT_MODE={config.bb_exit_mode}. "
+                f"Choose from {', '.join(BOLLINGER_EXIT_CHOICES)}."
+            )
         if offline_to_ml_signal is None and any(
             mode in {STRATEGY_MODE_ML, STRATEGY_MODE_HYBRID}
             for mode in {config.strategy_mode, *self._symbol_strategy_modes.values()}
@@ -642,7 +1247,305 @@ class TradeOSBot:
             api_secret=api_secret,
             paper=self.config.paper,
             symbols=self.config.symbols,
+            price_stream_feed=self.config.live_feed,
+            latest_data_feed=self.config.latest_bar_feed,
         )
+
+    def data_parity_summary(self) -> dict[str, Any]:
+        return {
+            "historical_feed": self.config.historical_feed,
+            "live_feed": self.config.live_feed,
+            "latest_bar_feed": self.config.latest_bar_feed,
+            "bar_build_mode": self.config.bar_build_mode,
+            "apply_updated_bars": self.config.apply_updated_bars,
+            "post_bar_reconcile_poll": self.config.post_bar_reconcile_poll,
+            "block_trading_until_resync": self.config.block_trading_until_resync,
+            "assert_feed_on_startup": self.config.assert_feed_on_startup,
+            "log_bar_components": self.config.log_bar_components,
+        }
+
+    def get_startup_resync_result(self) -> ResyncResult:
+        return self._startup_resync_result
+
+    def _set_startup_resync_result(self, result: ResyncResult) -> ResyncResult:
+        self._startup_resync_result = result
+        self._update_startup_artifact_with_resync(result)
+        return result
+
+    def _update_startup_artifact_with_resync(self, result: ResyncResult) -> None:
+        artifact_path_raw = os.getenv(STARTUP_ARTIFACT_PATH_ENV, "").strip()
+        if not artifact_path_raw:
+            return
+        artifact_path = Path(artifact_path_raw)
+        if not artifact_path.exists():
+            return
+        try:
+            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        payload["resync_status"] = result.status.value
+        payload["resync_started_at_utc"] = result.started_at_utc
+        payload["resync_completed_at_utc"] = result.completed_at_utc
+        payload["resync_reason_codes"] = list(result.reason_codes)
+        payload["resync_positions_recovered"] = list(result.positions_recovered)
+        payload["resync_open_orders_recovered"] = list(result.open_orders_recovered)
+        payload["resync_recent_fills_recovered"] = list(result.recent_fills_recovered)
+        payload["resync_discrepancies"] = [
+            {
+                "symbol": item.symbol,
+                "kind": item.kind,
+                "detail": item.detail,
+            }
+            for item in result.discrepancies
+        ]
+        payload["gate_allows_entries"] = result.gate_allows_entries
+        payload["gate_allows_exits"] = result.gate_allows_exits
+        artifact_text = json.dumps(payload, indent=2)
+        artifact_path.write_text(artifact_text, encoding="utf-8")
+        latest_path = artifact_path.parent / "startup_config.json"
+        latest_path.write_text(artifact_text, encoding="utf-8")
+
+    def _local_resync_context(self) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        latest_run = self.storage.get_latest_run()
+        latest_symbols = {
+            str(row.get("symbol", "")).strip().upper(): row
+            for row in self.storage.get_latest_symbol_snapshot()
+            if str(row.get("symbol", "")).strip()
+        }
+        order_history = {
+            str(row.get("order_id", "")).strip(): row
+            for row in self.storage.get_order_history(limit=200)
+            if str(row.get("order_id", "")).strip()
+        }
+        return latest_run, latest_symbols, order_history
+
+    def _resync_gate_for_action(
+        self,
+        *,
+        action: str,
+        symbol: str,
+        positions: dict[str, Position],
+    ) -> tuple[bool, str | None]:
+        result = self._startup_resync_result
+        if action == "BUY":
+            if result.gate_allows_entries:
+                return True, None
+            if result.status == ResyncStatus.LOCKED:
+                return False, "resync_locked"
+            if result.status == ResyncStatus.FAILED:
+                return False, "resync_failed"
+            return False, "resync_entries_disabled"
+        if action == "SELL":
+            if not result.gate_allows_exits:
+                return False, "resync_exits_disabled"
+            if result.status == ResyncStatus.DEGRADED and symbol not in positions:
+                return False, "resync_exit_requires_broker_position"
+        return True, None
+
+    def perform_startup_resync(
+        self,
+        *,
+        recent_orders_limit: int = 50,
+        lookback_minutes: int = 240,
+        current_time_utc: datetime | None = None,
+    ) -> ResyncResult:
+        current = self._startup_resync_result
+        if current.status != ResyncStatus.LOCKED and current.completed_at_utc is not None:
+            return current
+
+        now_utc = current_time_utc or datetime.now(timezone.utc)
+        started_at = now_utc.isoformat()
+        lookback_cutoff = now_utc - timedelta(minutes=lookback_minutes)
+        self.blog.lifecycle(
+            "resync.started",
+            lookback_minutes=lookback_minutes,
+            recent_orders_limit=recent_orders_limit,
+            data_parity=self.data_parity_summary(),
+        )
+
+        positions_recovered: list[dict[str, Any]] = []
+        open_orders_recovered: list[dict[str, Any]] = []
+        recent_fills_recovered: list[dict[str, Any]] = []
+        discrepancies: list[ResyncDiscrepancy] = []
+        reason_codes: list[str] = []
+
+        try:
+            broker_positions = self.get_positions_by_symbol()
+            broker_open_orders = self.get_open_orders()
+            recent_orders = self.get_recent_orders(limit=recent_orders_limit)
+        except Exception as exc:
+            result = ResyncResult(
+                status=ResyncStatus.FAILED,
+                started_at_utc=started_at,
+                completed_at_utc=datetime.now(timezone.utc).isoformat(),
+                discrepancies=(ResyncDiscrepancy(symbol=None, kind="broker_query_failed", detail=str(exc)),),
+                reason_codes=("RESYNC_UNRESOLVED_ORDER_STATE", "RESYNC_UNRESOLVED_POSITION_STATE"),
+                gate_allows_entries=False,
+                gate_allows_exits=False,
+            )
+            self.blog.lifecycle("resync.failed", status=result.status.value, reason_codes=list(result.reason_codes))
+            return self._set_startup_resync_result(result)
+
+        latest_run, local_symbols, local_orders = self._local_resync_context()
+        latest_run_ts = _parse_iso_timestamp(str(latest_run.get("timestamp_utc", "") or "")) if latest_run else None
+        overnight_carry_restart = (
+            latest_run_ts is not None
+            and latest_run_ts.astimezone(_ET).date() < now_utc.astimezone(_ET).date()
+        )
+        if (broker_positions or broker_open_orders) and latest_run_ts is not None and latest_run_ts < lookback_cutoff:
+            # Overnight restarts with carried positions are expected; keep the
+            # stricter degraded gate for stale intraday restarts or any case
+            # where open orders still need reconciliation.
+            if broker_open_orders or not overnight_carry_restart:
+                reason_codes.append("RESYNC_LOOKBACK_INSUFFICIENT")
+                discrepancies.append(
+                    ResyncDiscrepancy(
+                        symbol=None,
+                        kind="lookback_insufficient",
+                        detail="local persisted state predates the recovery lookback window",
+                    )
+                )
+
+        for symbol, position in broker_positions.items():
+            local_row = local_symbols.get(symbol)
+            local_holding = bool(local_row.get("holding")) if local_row is not None else False
+            local_qty = _optional_float(local_row.get("quantity")) if local_row is not None else None
+            if not local_holding or (local_qty or 0.0) <= 0:
+                reason_codes.append("RESYNC_BROKER_POSITION_LOCAL_MISSING")
+                recovered = {
+                    "symbol": symbol,
+                    "qty": _position_qty_value(position),
+                    "avg_entry_price": _optional_float(getattr(position, "avg_entry_price", None)),
+                    "current_price": _optional_float(getattr(position, "current_price", None)),
+                }
+                positions_recovered.append(recovered)
+                entry_price = recovered["avg_entry_price"] or (
+                    _optional_float(local_row.get("avg_entry_price")) if local_row is not None else None
+                )
+                if entry_price is not None:
+                    self._position_entry_price[symbol] = entry_price
+                self._position_qty[symbol] = recovered["qty"]
+                if latest_run is not None and latest_run.get("timestamp_utc"):
+                    self._position_entry_ts.setdefault(symbol, str(latest_run["timestamp_utc"]))
+
+        if not broker_positions and not any(bool(row.get("holding")) for row in local_symbols.values()):
+            reason_codes.append("RESYNC_NO_BROKER_POSITION_LOCAL_FLAT")
+
+        for symbol, row in local_symbols.items():
+            local_holding = bool(row.get("holding"))
+            local_qty = _optional_float(row.get("quantity")) or 0.0
+            if local_holding and local_qty > 0 and symbol not in broker_positions:
+                reason_codes.append("RESYNC_SYMBOL_STATE_RESET")
+                discrepancies.append(
+                    ResyncDiscrepancy(
+                        symbol=symbol,
+                        kind="local_position_reset",
+                        detail="local position state was cleared because the broker reported no open position",
+                    )
+                )
+                self._position_entry_price.pop(symbol, None)
+                self._position_entry_ts.pop(symbol, None)
+                self._position_qty.pop(symbol, None)
+                self._position_entry_branch.pop(symbol, None)
+                self._position_first_seen_utc.pop(symbol, None)
+
+        for order in broker_open_orders:
+            if not order.order_id or not order.symbol:
+                reason_codes.append("RESYNC_UNRESOLVED_ORDER_STATE")
+                discrepancies.append(
+                    ResyncDiscrepancy(
+                        symbol=order.symbol or None,
+                        kind="open_order_missing_identity",
+                        detail="broker open order missing order_id or symbol",
+                    )
+                )
+                continue
+            local_order = local_orders.get(order.order_id)
+            if local_order is None or str(local_order.get("status", "")).lower() != str(order.status).lower():
+                reason_codes.append("RESYNC_OPEN_ORDER_RECOVERED")
+                open_orders_recovered.append(
+                    {
+                        "order_id": order.order_id,
+                        "symbol": order.symbol,
+                        "side": order.side,
+                        "status": order.status,
+                        "qty": order.qty,
+                        "filled_qty": order.filled_qty,
+                    }
+                )
+            if order.submitted_at:
+                self._order_submission_ts.setdefault(order.order_id, order.submitted_at)
+            if order.side:
+                self._order_submission_side.setdefault(order.order_id, order.side.lower())
+                if order.side.lower() == "sell":
+                    self._order_exit_reason.setdefault(order.order_id, "recovered_open_order")
+
+        for order in recent_orders:
+            order_id = str(order.order_id or "").strip()
+            filled_qty = _optional_float(order.filled_qty) or 0.0
+            if not order_id or filled_qty <= 0:
+                continue
+            filled_at = _parse_iso_timestamp(order.filled_at) or _parse_iso_timestamp(order.submitted_at)
+            if filled_at is None or filled_at < lookback_cutoff:
+                if order_id not in local_orders:
+                    reason_codes.append("RESYNC_LOOKBACK_INSUFFICIENT")
+                continue
+            local_order = local_orders.get(order_id)
+            local_filled_qty = _optional_float(local_order.get("filled_qty")) if local_order is not None else None
+            if local_order is None or (local_filled_qty or 0.0) < filled_qty:
+                reason_codes.append("RESYNC_RECENT_FILL_RECOVERED")
+                recent_fills_recovered.append(
+                    {
+                        "order_id": order_id,
+                        "symbol": order.symbol,
+                        "side": order.side,
+                        "filled_qty": filled_qty,
+                        "filled_at": order.filled_at,
+                    }
+                )
+                self._logged_fills.add((order_id, round(filled_qty, 6)))
+
+        unresolved_position = any(item.kind == "lookback_insufficient" for item in discrepancies)
+        unresolved_order = any(item.kind == "open_order_missing_identity" for item in discrepancies)
+        if unresolved_order:
+            reason_codes.append("RESYNC_UNRESOLVED_ORDER_STATE")
+        if unresolved_position:
+            reason_codes.append("RESYNC_UNRESOLVED_POSITION_STATE")
+
+        status = ResyncStatus.OK
+        gate_allows_entries = True
+        gate_allows_exits = True
+        if unresolved_order:
+            status = ResyncStatus.FAILED
+            gate_allows_entries = False
+            gate_allows_exits = False
+        elif unresolved_position or "RESYNC_LOOKBACK_INSUFFICIENT" in reason_codes:
+            status = ResyncStatus.DEGRADED
+            gate_allows_entries = False
+            gate_allows_exits = True
+
+        result = ResyncResult(
+            status=status,
+            started_at_utc=started_at,
+            completed_at_utc=(current_time_utc or datetime.now(timezone.utc)).isoformat(),
+            positions_recovered=tuple(positions_recovered),
+            open_orders_recovered=tuple(open_orders_recovered),
+            recent_fills_recovered=tuple(recent_fills_recovered),
+            discrepancies=tuple(discrepancies),
+            reason_codes=tuple(sorted(set(reason_codes))),
+            gate_allows_entries=gate_allows_entries,
+            gate_allows_exits=gate_allows_exits,
+        )
+        self.blog.lifecycle(
+            "resync.completed" if status != ResyncStatus.FAILED else "resync.failed",
+            status=result.status.value,
+            reason_codes=list(result.reason_codes),
+            gate_allows_entries=result.gate_allows_entries,
+            gate_allows_exits=result.gate_allows_exits,
+        )
+        return self._set_startup_resync_result(result)
 
     def _validate_persisted_symbol_state(self) -> None:
         latest_run = self.storage.get_latest_run()
@@ -702,6 +1605,51 @@ class TradeOSBot:
                 mean_reversion_exit_style=self.config.mean_reversion_exit_style,
                 mean_reversion_max_atr_percentile=self.config.mean_reversion_max_atr_percentile,
                 mean_reversion_trend_filter=self.config.mean_reversion_trend_filter,
+                mean_reversion_trend_slope_filter=self.config.mean_reversion_trend_slope_filter,
+                mean_reversion_stop_pct=self.config.mean_reversion_stop_pct,
+                vwap_z_entry_threshold=self.config.vwap_z_entry_threshold,
+                vwap_z_stop_atr_multiple=self.config.vwap_z_stop_atr_multiple,
+                min_atr_percentile=self.config.min_atr_percentile,
+                max_adx_threshold=self.config.max_adx_threshold,
+                trend_pullback_min_adx=self.config.trend_pullback_min_adx,
+                trend_pullback_min_slope=self.config.trend_pullback_min_slope,
+                trend_pullback_entry_threshold=self.config.trend_pullback_entry_threshold,
+                trend_pullback_min_atr_percentile=self.config.trend_pullback_min_atr_percentile,
+                trend_pullback_max_atr_percentile=self.config.trend_pullback_max_atr_percentile,
+                trend_pullback_exit_style=self.config.trend_pullback_exit_style,
+                trend_pullback_hold_bars=self.config.trend_pullback_hold_bars,
+                trend_pullback_take_profit_pct=self.config.trend_pullback_take_profit_pct,
+                trend_pullback_stop_pct=self.config.trend_pullback_stop_pct,
+                momentum_breakout_lookback_bars=self.config.momentum_breakout_lookback_bars,
+                momentum_breakout_entry_buffer_pct=self.config.momentum_breakout_entry_buffer_pct,
+                momentum_breakout_min_adx=self.config.momentum_breakout_min_adx,
+                momentum_breakout_min_slope=self.config.momentum_breakout_min_slope,
+                momentum_breakout_min_atr_percentile=self.config.momentum_breakout_min_atr_percentile,
+                momentum_breakout_exit_style=self.config.momentum_breakout_exit_style,
+                momentum_breakout_hold_bars=self.config.momentum_breakout_hold_bars,
+                momentum_breakout_stop_pct=self.config.momentum_breakout_stop_pct,
+                momentum_breakout_take_profit_pct=self.config.momentum_breakout_take_profit_pct,
+                volatility_expansion_lookback_bars=self.config.volatility_expansion_lookback_bars,
+                volatility_expansion_entry_buffer_pct=self.config.volatility_expansion_entry_buffer_pct,
+                volatility_expansion_max_atr_percentile=self.config.volatility_expansion_max_atr_percentile,
+                volatility_expansion_trend_filter=self.config.volatility_expansion_trend_filter,
+                volatility_expansion_min_slope=self.config.volatility_expansion_min_slope,
+                volatility_expansion_use_volume_confirm=self.config.volatility_expansion_use_volume_confirm,
+                volatility_expansion_exit_style=self.config.volatility_expansion_exit_style,
+                volatility_expansion_hold_bars=self.config.volatility_expansion_hold_bars,
+                volatility_expansion_stop_pct=self.config.volatility_expansion_stop_pct,
+                volatility_expansion_take_profit_pct=self.config.volatility_expansion_take_profit_pct,
+                bb_period=self.config.bb_period,
+                bb_stddev_mult=self.config.bb_stddev_mult,
+                bb_width_lookback=self.config.bb_width_lookback,
+                bb_squeeze_quantile=self.config.bb_squeeze_quantile,
+                bb_slope_lookback=self.config.bb_slope_lookback,
+                bb_use_volume_confirm=self.config.bb_use_volume_confirm,
+                bb_volume_mult=self.config.bb_volume_mult,
+                bb_breakout_buffer_pct=self.config.bb_breakout_buffer_pct,
+                bb_min_mid_slope=self.config.bb_min_mid_slope,
+                bb_trend_filter=self.config.bb_trend_filter,
+                bb_exit_mode=self.config.bb_exit_mode,
             )
         )
         self._strategy_cache[symbol] = strategy
@@ -709,6 +1657,24 @@ class TradeOSBot:
 
     def get_account(self) -> Any:
         return self.broker.get_account()
+
+    def perform_startup_preflight(self, *, execute_orders: bool) -> dict[str, object]:
+        account = self.get_account()
+        positions = self.get_positions_by_symbol()
+        market_open: bool | None = None
+        if execute_orders:
+            market_open = self._is_market_open()
+        summary = {
+            "execute_orders": execute_orders,
+            "cash": float(account.cash),
+            "buying_power": float(account.buying_power),
+            "equity": float(account.equity),
+            "position_count": len(positions),
+            "market_open": market_open,
+            "feed_status": self.get_price_feed_status(),
+        }
+        self.blog.lifecycle("startup.ready", **summary)
+        return summary
 
     def _log_skip(self, reason: str, detail: str) -> None:
         logger.info("%s %s", reason, detail)
@@ -720,13 +1686,46 @@ class TradeOSBot:
             return None
         return max(0.0, (now_utc - first_seen).total_seconds() / 60.0)
 
+    def _hydrate_open_position_state(self, positions: dict[str, Position]) -> None:
+        persisted_positions = _load_open_position_state_from_logs(getattr(self.blog, "log_root", "logs"))
+        for symbol, position in positions.items():
+            if not _has_open_position(position):
+                continue
+            persisted = persisted_positions.get(symbol)
+            if symbol not in self._position_entry_price:
+                persisted_entry_price = _optional_float(
+                    persisted.get("entry_price") if persisted is not None else None
+                )
+                broker_entry_price = _optional_float(getattr(position, "avg_entry_price", None))
+                entry_price = persisted_entry_price if persisted_entry_price is not None else broker_entry_price
+                if entry_price is not None:
+                    self._position_entry_price[symbol] = entry_price
+            if symbol not in self._position_qty:
+                persisted_qty = _optional_float(persisted.get("qty") if persisted is not None else None)
+                quantity = persisted_qty if persisted_qty is not None else _position_qty_value(position)
+                if quantity != 0:
+                    self._position_qty[symbol] = quantity
+            if symbol not in self._position_entry_ts:
+                persisted_decision_ts = persisted.get("decision_ts") if persisted is not None else None
+                if isinstance(persisted_decision_ts, str) and persisted_decision_ts:
+                    self._position_entry_ts[symbol] = persisted_decision_ts
+            if symbol not in self._position_entry_branch:
+                persisted_entry_branch = persisted.get("entry_branch") if persisted is not None else None
+                if isinstance(persisted_entry_branch, str) and persisted_entry_branch:
+                    self._position_entry_branch[symbol] = persisted_entry_branch
+
     def _update_position_holding_state(
         self,
         positions: dict[str, Position],
         observed_at_utc: datetime,
     ) -> None:
+        self._hydrate_open_position_state(positions)
         for symbol in positions:
-            self._position_first_seen_utc.setdefault(symbol, observed_at_utc)
+            entry_timestamp = _parse_iso_timestamp(self._position_entry_ts.get(symbol))
+            if entry_timestamp is not None:
+                self._position_first_seen_utc.setdefault(symbol, entry_timestamp)
+            else:
+                self._position_first_seen_utc.setdefault(symbol, observed_at_utc)
         for symbol in list(self._position_first_seen_utc):
             if symbol not in positions:
                 del self._position_first_seen_utc[symbol]
@@ -1039,13 +2038,22 @@ class TradeOSBot:
     ) -> SymbolEvaluation:
         aligned_decision_timestamp = decision_timestamp or self.get_decision_timestamp()
         holding = _has_long_position(position)
+        short_position = _has_short_position(position)
         strategy = self._strategy_for_symbol(symbol)
         effective_strategy_mode = strategy.config.strategy_mode
         bars_needed = max(
             self.config.sma_bars,
             25,
             50,  # minimum for trend_sma (50-bar SMA used by mean_reversion_trend_filter)
+            55,  # minimum to compute the 50-bar slope used by trend-aware strategies
+            strategy.config.momentum_breakout_lookback_bars + 1,
+            strategy.config.volatility_expansion_lookback_bars + 1,
             estimate_atr_percentile_lookback_bars(self.config.bar_timeframe_minutes),
+            estimate_bollinger_lookback_bars(
+                strategy.config.bb_period,
+                strategy.config.bb_width_lookback,
+                strategy.config.bb_slope_lookback,
+            ),
             estimate_regime_lookback_bars(self.config.bar_timeframe_minutes),
         )
         intraday_bars = self._get_intraday_bars(
@@ -1057,7 +2065,33 @@ class TradeOSBot:
         highs = [float(bar.high) for bar in intraday_bars]
         lows = [float(bar.low) for bar in intraday_bars]
         timestamps = [pd.Timestamp(getattr(bar, "timestamp")) for bar in intraday_bars]
-        min_history_bars = 2 if effective_strategy_mode in (STRATEGY_MODE_BREAKOUT, STRATEGY_MODE_ORB) else max(20, self.config.sma_bars)
+        if effective_strategy_mode in (STRATEGY_MODE_BREAKOUT, STRATEGY_MODE_ORB):
+            min_history_bars = 2
+        elif effective_strategy_mode == STRATEGY_MODE_MOMENTUM_BREAKOUT:
+            min_history_bars = max(
+                55,
+                self.config.sma_bars,
+                strategy.config.momentum_breakout_lookback_bars + 1,
+            )
+        elif effective_strategy_mode == STRATEGY_MODE_VOLATILITY_EXPANSION:
+            min_history_bars = max(
+                55,
+                self.config.sma_bars,
+                strategy.config.volatility_expansion_lookback_bars + 1,
+                estimate_bollinger_lookback_bars(
+                    strategy.config.bb_period,
+                    strategy.config.bb_width_lookback,
+                    strategy.config.bb_slope_lookback,
+                ),
+            )
+        elif effective_strategy_mode in (STRATEGY_MODE_BOLLINGER_SQUEEZE, STRATEGY_MODE_HYBRID_BB_MR):
+            min_history_bars = estimate_bollinger_lookback_bars(
+                strategy.config.bb_period,
+                strategy.config.bb_width_lookback,
+                strategy.config.bb_slope_lookback,
+            )
+        else:
+            min_history_bars = max(20, self.config.sma_bars)
         if len(closes) < min_history_bars:
             raise RuntimeError(
                 f"Not enough completed bars for {symbol} at {aligned_decision_timestamp.isoformat()}: got {len(closes)}"
@@ -1105,6 +2139,17 @@ class TradeOSBot:
         volumes = [float(getattr(bar, "volume", 0.0) or 0.0) for bar in intraday_bars]
         vwap_values = calculate_vwap_series(timestamps, highs, lows, closes, volumes)
         adx_values = calculate_adx_series(highs, lows, closes)
+        bb_features = calculate_bollinger_squeeze_features(
+            closes,
+            volumes,
+            period=strategy.config.bb_period,
+            stddev_mult=strategy.config.bb_stddev_mult,
+            width_lookback=strategy.config.bb_width_lookback,
+            squeeze_quantile=strategy.config.bb_squeeze_quantile,
+            slope_lookback=strategy.config.bb_slope_lookback,
+            use_volume_confirm=strategy.config.bb_use_volume_confirm,
+            volume_mult=strategy.config.bb_volume_mult,
+        )
         recent_volumes = volumes[-20:]
         avg_volume = (sum(recent_volumes) / len(recent_volumes)) if recent_volumes else None
         current_volume = float(getattr(intraday_bars[-1], "volume", 0.0) or 0.0)
@@ -1146,7 +2191,74 @@ class TradeOSBot:
         _window_open = self._is_in_entry_window(aligned_decision_timestamp.astimezone(_ET))
         _atr_pct_now = atr_pct_values[-1] if atr_pct_values else None
         _atr_pct_now_val = atr_percentiles[-1]
-        action = strategy.decide_action(
+        current_vwap = vwap_values[-1] if vwap_values else None
+        current_adx = adx_values[-1] if adx_values else None
+        trend_pullback_bars_held = 0
+        momentum_breakout_bars_held = 0
+        volatility_expansion_bars_held = 0
+        holding_minutes = self._position_holding_minutes(symbol, aligned_decision_timestamp)
+        if holding and holding_minutes is not None and self.config.bar_timeframe_minutes > 0:
+            trend_pullback_bars_held = max(
+                1,
+                math.ceil(holding_minutes / self.config.bar_timeframe_minutes),
+            )
+            momentum_breakout_bars_held = trend_pullback_bars_held
+            volatility_expansion_bars_held = trend_pullback_bars_held
+        current_trend_slope = (
+            trend_sma - (sum(closes[-51:-1]) / 50)
+            if trend_sma is not None and len(closes) >= 51
+            else None
+        )
+        recent_breakout_high = (
+            max(highs[-(max(strategy.config.momentum_breakout_lookback_bars, strategy.config.volatility_expansion_lookback_bars) + 1):-1])
+            if len(highs) >= max(strategy.config.momentum_breakout_lookback_bars, strategy.config.volatility_expansion_lookback_bars) + 1
+            else None
+        )
+        if short_position:
+            explanation_summary = (
+                "HOLD because the broker reports a short position. "
+                "Long-only strategy evaluation is suppressed until the short is flattened."
+            )
+            self.blog.signal(
+                symbol=symbol,
+                decision_ts=aligned_decision_timestamp.isoformat(),
+                bar_close=price,
+                sma=sma,
+                trend_sma=trend_sma,
+                atr_pct=_atr_pct_now,
+                atr_percentile=_atr_pct_now_val,
+                volume_ratio=volume_ratio,
+                action="HOLD",
+                holding=True,
+                trend_filter_pass=None,
+                atr_filter_pass=None,
+                window_open=_window_open,
+                rejection="short_position",
+                ml_prob=ml_signal.probability_up if ml_signal.probability_up != 0.5 else None,
+                extra_fields={
+                    "strategy_mode": effective_strategy_mode,
+                    "final_signal_reason": "short_position_unsupported",
+                    "decision_summary": explanation_summary,
+                    "entry_reference_price": None,
+                    "exit_reference_price": None,
+                    "stop_reference_price": None,
+                    "vwap": round(current_vwap, 4) if current_vwap is not None else None,
+                    "adx": round(current_adx, 4) if current_adx is not None else None,
+                    "regime_state": (
+                        "bullish" if bullish_regime is True else ("bearish" if bullish_regime is False else "unknown")
+                    ),
+                },
+            )
+            return SymbolEvaluation(
+                price=price,
+                sma=sma,
+                ml_signal=ml_signal,
+                action="HOLD",
+                latest_bar_close_utc=latest_bar_close.isoformat(),
+                hold_reason="short_position",
+                final_signal_reason="short_position_unsupported",
+            )
+        decision_details = strategy.decide_action_details(
             price,
             sma,
             ml_signal,
@@ -1162,9 +2274,25 @@ class TradeOSBot:
             volatility_ratio=volatility_ratio,
             effective_stop_price=effective_stop_price,
             trend_sma=trend_sma,
-            vwap=vwap_values[-1] if vwap_values else None,
-            adx=adx_values[-1] if adx_values else None,
+            trend_sma_slope=current_trend_slope,
+            vwap=current_vwap,
+            adx=current_adx,
+            bb_middle=bb_features["middle"][-1] if bb_features["middle"] else None,
+            bb_upper=bb_features["upper"][-1] if bb_features["upper"] else None,
+            bb_lower=bb_features["lower"][-1] if bb_features["lower"] else None,
+            bb_prev_squeeze=bb_features["squeeze"][-2] if len(bb_features["squeeze"]) >= 2 else None,
+            bb_mid_slope=bb_features["mid_slope"][-1] if bb_features["mid_slope"] else None,
+            bb_bias=bb_features["bias"][-1] if bb_features["bias"] else None,
+            bb_breakout_up=bb_features["breakout_up"][-1] if bb_features["breakout_up"] else None,
+            bb_breakout_down=bb_features["breakout_down"][-1] if bb_features["breakout_down"] else None,
+            bb_volume_confirm=bb_features["volume_confirm"][-1] if bb_features["volume_confirm"] else None,
+            hybrid_entry_branch=self._position_entry_branch.get(symbol) if holding else None,
+            trend_pullback_bars_held=trend_pullback_bars_held,
+            recent_breakout_high=recent_breakout_high,
+            momentum_breakout_bars_held=momentum_breakout_bars_held,
+            volatility_expansion_bars_held=volatility_expansion_bars_held,
         )
+        action = decision_details.action
         # --- structured signal log ---
         _trend_pass = (price >= trend_sma) if trend_sma is not None else None
         _atr_pass = (
@@ -1183,6 +2311,64 @@ class TradeOSBot:
             trend_pass=_trend_pass,
             atr_pass=_atr_pass if not holding else None,
         )
+        entry_reference_price: float | None = None
+        exit_reference_price: float | None = None
+        stop_reference_price: float | None = None
+        if effective_strategy_mode == STRATEGY_MODE_SMA:
+            entry_reference_price = strategy._entry_threshold_price(sma, _atr_pct_now)
+            exit_reference_price = sma if holding else None
+            if holding and self.config.sma_stop_pct > 0 and position is not None:
+                stop_reference_price = _optional_float(getattr(position, "avg_entry_price", None))
+                if stop_reference_price is not None:
+                    stop_reference_price *= (1.0 - self.config.sma_stop_pct)
+        elif effective_strategy_mode == STRATEGY_MODE_MEAN_REVERSION:
+            entry_reference_price = (
+                current_vwap - (strategy.config.vwap_z_entry_threshold * (_atr_pct_now * price))
+                if current_vwap is not None and _atr_pct_now is not None
+                else strategy._reversion_threshold_price(sma, _atr_pct_now)
+            )
+            exit_reference_price = current_vwap if current_vwap is not None else sma
+            if holding and self.config.mean_reversion_stop_pct > 0 and position is not None:
+                stop_reference_price = _optional_float(getattr(position, "avg_entry_price", None))
+                if stop_reference_price is not None:
+                    stop_reference_price *= (1.0 - self.config.mean_reversion_stop_pct)
+        elif effective_strategy_mode == STRATEGY_MODE_TREND_PULLBACK:
+            entry_reference_price = strategy._trend_pullback_entry_price(sma)
+            if holding and self.config.trend_pullback_stop_pct > 0 and position is not None:
+                stop_reference_price = _optional_float(getattr(position, "avg_entry_price", None))
+                if stop_reference_price is not None:
+                    stop_reference_price *= (1.0 - self.config.trend_pullback_stop_pct)
+        elif effective_strategy_mode in (STRATEGY_MODE_BREAKOUT, STRATEGY_MODE_ORB):
+            entry_reference_price = opening_range_highs[-1] if opening_range_highs else None
+            stop_reference_price = effective_stop_price
+        elif effective_strategy_mode == STRATEGY_MODE_BOLLINGER_SQUEEZE:
+            entry_reference_price = bb_features["upper"][-1] if bb_features["upper"] else None
+            exit_reference_price = bb_features["middle"][-1] if bb_features["middle"] else None
+        elif effective_strategy_mode == STRATEGY_MODE_HYBRID_BB_MR:
+            if decision_details.hybrid_branch_active == "bollinger_breakout":
+                entry_reference_price = bb_features["upper"][-1] if bb_features["upper"] else None
+                exit_reference_price = bb_features["middle"][-1] if bb_features["middle"] else None
+            else:
+                entry_reference_price = strategy._reversion_threshold_price(sma, _atr_pct_now)
+                exit_reference_price = current_vwap if current_vwap is not None else sma
+        explanation_summary = _build_signal_explanation(
+            strategy_mode=effective_strategy_mode,
+            action=action,
+            reason=decision_details.reason,
+            price=price,
+            sma=sma,
+            holding=holding,
+            time_window_open=_window_open,
+            atr_percentile=_atr_pct_now_val,
+            trend_sma=trend_sma,
+            bullish_regime=bullish_regime,
+            entry_reference_price=entry_reference_price,
+            exit_reference_price=exit_reference_price,
+            stop_reference_price=stop_reference_price,
+            vwap=current_vwap,
+            adx=current_adx,
+            hybrid_branch_active=decision_details.hybrid_branch_active,
+        )
         self.blog.signal(
             symbol=symbol,
             decision_ts=aligned_decision_timestamp.isoformat(),
@@ -1194,11 +2380,41 @@ class TradeOSBot:
             volume_ratio=volume_ratio,
             action=action,
             holding=holding,
-            trend_filter_pass=_trend_pass,
+            trend_filter_pass=_trend_pass if _trend_filter_active else None,
             atr_filter_pass=_atr_pass,
             window_open=_window_open,
             rejection=_rejection,
             ml_prob=ml_signal.probability_up if ml_signal.probability_up != 0.5 else None,
+            extra_fields={
+                "bb_mid": round(bb_features["middle"][-1], 4) if bb_features["middle"] and bb_features["middle"][-1] is not None else None,
+                "bb_upper": round(bb_features["upper"][-1], 4) if bb_features["upper"] and bb_features["upper"][-1] is not None else None,
+                "bb_lower": round(bb_features["lower"][-1], 4) if bb_features["lower"] and bb_features["lower"][-1] is not None else None,
+                "bb_width": round(bb_features["width"][-1], 6) if bb_features["width"] and bb_features["width"][-1] is not None else None,
+                "bb_squeeze": bb_features["squeeze"][-1] if bb_features["squeeze"] else None,
+                "bb_bias": bb_features["bias"][-1] if bb_features["bias"] else None,
+                "bb_mid_slope": round(bb_features["mid_slope"][-1], 6) if bb_features["mid_slope"] and bb_features["mid_slope"][-1] is not None else None,
+                "bb_breakout_up": bb_features["breakout_up"][-1] if bb_features["breakout_up"] else None,
+                "bb_breakout_down": bb_features["breakout_down"][-1] if bb_features["breakout_down"] else None,
+                "bb_volume_confirm": bb_features["volume_confirm"][-1] if bb_features["volume_confirm"] else None,
+                "hybrid_branch": decision_details.hybrid_branch,
+                "hybrid_branch_active": decision_details.hybrid_branch_active,
+                "hybrid_entry_branch": decision_details.hybrid_entry_branch,
+                "hybrid_regime_branch": decision_details.hybrid_regime_branch,
+                "mr_signal": decision_details.mr_signal,
+                "strategy_mode": effective_strategy_mode,
+                "final_signal_reason": decision_details.reason,
+                "decision_summary": explanation_summary,
+                "trend_filter_active": _trend_filter_active,
+                "trend_sma_slope": round(current_trend_slope, 6) if current_trend_slope is not None else None,
+                "entry_reference_price": round(entry_reference_price, 4) if entry_reference_price is not None else None,
+                "exit_reference_price": round(exit_reference_price, 4) if exit_reference_price is not None else None,
+                "stop_reference_price": round(stop_reference_price, 4) if stop_reference_price is not None else None,
+                "vwap": round(current_vwap, 4) if current_vwap is not None else None,
+                "adx": round(current_adx, 4) if current_adx is not None else None,
+                "regime_state": (
+                    "bullish" if bullish_regime is True else ("bearish" if bullish_regime is False else "unknown")
+                ),
+            },
         )
         return SymbolEvaluation(
             price=price,
@@ -1207,6 +2423,10 @@ class TradeOSBot:
             action=action,
             latest_bar_close_utc=latest_bar_close.isoformat(),
             hold_reason=_rejection,
+            hybrid_branch_active=decision_details.hybrid_branch_active,
+            hybrid_entry_branch=decision_details.hybrid_entry_branch,
+            hybrid_regime_branch=decision_details.hybrid_regime_branch,
+            final_signal_reason=decision_details.reason,
         )
 
     def decide(
@@ -1240,7 +2460,7 @@ class TradeOSBot:
         for symbol in self.config.symbols:
             position = positions.get(symbol)
             quantity = _position_qty_value(position)
-            holding = quantity > 0
+            holding = quantity != 0
             market_value = _float_or_default(getattr(position, "market_value", None)) if position is not None else 0.0
             holding_minutes = self._position_holding_minutes(symbol, aligned_decision_timestamp)
             try:
@@ -1260,7 +2480,7 @@ class TradeOSBot:
                     continue
                 evaluation = self.evaluate_symbol(
                     symbol,
-                    position if holding else None,
+                    position if quantity != 0 else None,
                     decision_timestamp=aligned_decision_timestamp,
                 )
 
@@ -1281,6 +2501,10 @@ class TradeOSBot:
                         ml_model_name=evaluation.ml_signal.model_name,
                         holding_minutes=holding_minutes,
                         hold_reason=evaluation.hold_reason,
+                        hybrid_branch_active=evaluation.hybrid_branch_active,
+                        hybrid_entry_branch=evaluation.hybrid_entry_branch,
+                        hybrid_regime_branch=evaluation.hybrid_regime_branch,
+                        final_signal_reason=evaluation.final_signal_reason,
                     )
                 )
             except StaleMarketDataError:
@@ -1387,6 +2611,16 @@ class TradeOSBot:
                 continue
             if action not in ("BUY", "SELL"):
                 previews.append(ExecutionPreview(symbol=symbol, action=action, status="NO_SIGNAL"))
+                continue
+            allowed_by_resync, resync_reason = self._resync_gate_for_action(
+                action=action,
+                symbol=symbol,
+                positions=snapshot.positions,
+            )
+            if not allowed_by_resync:
+                previews.append(
+                    ExecutionPreview(symbol=symbol, action=action, status="BLOCKED", reason=resync_reason)
+                )
                 continue
             if symbol in open_order_symbols:
                 previews.append(
@@ -1644,6 +2878,16 @@ class TradeOSBot:
             cache_key = (order.order_id, round(fill_qty, 6))
             if cache_key in self._logged_fills:
                 continue
+            storage = getattr(self, "storage", None)
+            if order.order_id and storage is not None:
+                claimed = storage.claim_order_fill(
+                    order.order_id,
+                    fill_qty,
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                if not claimed:
+                    self._logged_fills.add(cache_key)
+                    continue
             self._logged_fills.add(cache_key)
 
             # Use the decision_ts from submission time, not the current bar.
@@ -1680,6 +2924,22 @@ class TradeOSBot:
                 )
 
                 if side == "buy":
+                    existing_qty = _optional_float(self._position_qty.get(order.symbol)) or 0.0
+                    if existing_qty < 0:
+                        remaining_qty = existing_qty + fill_qty
+                        if remaining_qty < 0:
+                            self._position_qty[order.symbol] = remaining_qty
+                        else:
+                            self._position_entry_price.pop(order.symbol, None)
+                            self._position_entry_ts.pop(order.symbol, None)
+                            self._position_qty.pop(order.symbol, None)
+                            self._position_entry_branch.pop(order.symbol, None)
+                        self._order_submission_ts.pop(order.order_id, None)
+                        self._order_submission_side.pop(order.order_id, None)
+                        self._order_exit_reason.pop(order.order_id, None)
+                        self._order_signal_price.pop(order.order_id, None)
+                        self._order_entry_branch.pop(order.order_id, None)
+                        continue
                     # Record entry state so we can compute PnL when the position closes.
                     # Only log position.opened on the first fill — partial fills must not
                     # inflate the count.
@@ -1687,6 +2947,9 @@ class TradeOSBot:
                     self._position_entry_price[order.symbol] = fill_price
                     self._position_entry_ts[order.symbol] = dec_ts
                     self._position_qty[order.symbol] = fill_qty
+                    entry_branch = self._order_entry_branch.get(order.order_id)
+                    if entry_branch:
+                        self._position_entry_branch[order.symbol] = entry_branch
                     if _is_first_fill:
                         self.blog.position_opened(
                             symbol=order.symbol,
@@ -1694,12 +2957,14 @@ class TradeOSBot:
                             entry_price=fill_price,
                             qty=fill_qty,
                             strategy_mode=self.config.strategy_mode,
+                            entry_branch=entry_branch,
                         )
 
                 elif side == "sell":
                     entry_price = self._position_entry_price.pop(order.symbol, fill_price)
                     self._position_entry_ts.pop(order.symbol, None)
                     self._position_qty.pop(order.symbol, None)
+                    self._position_entry_branch.pop(order.symbol, None)
                     holding_minutes = (
                         self._position_holding_minutes(order.symbol, datetime.now(timezone.utc)) or 0.0
                     )
@@ -1719,6 +2984,7 @@ class TradeOSBot:
                 self._order_submission_side.pop(order.order_id, None)
                 self._order_exit_reason.pop(order.order_id, None)
                 self._order_signal_price.pop(order.order_id, None)
+                self._order_entry_branch.pop(order.order_id, None)
 
     def capture_state(
         self,
@@ -1736,6 +3002,7 @@ class TradeOSBot:
         price: float | None = None,
         decision_ts: str | None = None,
         signal_price: float | None = None,
+        entry_branch: str | None = None,
     ) -> OrderSnapshot | None:
         execution_price = price if price is not None else self.get_latest_price(symbol)
         available_buying_power = buying_power_available
@@ -1767,6 +3034,8 @@ class TradeOSBot:
             self._order_submission_side[order_id] = "buy"
             if signal_price is not None:
                 self._order_signal_price[order_id] = signal_price
+            if entry_branch:
+                self._order_entry_branch[order_id] = entry_branch
         self.blog.order_submitted(
             symbol=symbol,
             decision_ts=dec_ts,
@@ -1830,6 +3099,18 @@ class TradeOSBot:
         timestamp = now_et or self._et_now()
         return is_entry_window_open(pd.Timestamp(timestamp), self.config.time_window_mode)
 
+    def _active_symbol_event_blackout(self, symbol: str, timestamp_utc: datetime) -> SymbolEventBlackout | None:
+        for blackout in self.config.symbol_event_blackouts:
+            if blackout.symbol != symbol:
+                continue
+            start_ts = _parse_iso_timestamp(blackout.start_utc)
+            end_ts = _parse_iso_timestamp(blackout.end_utc)
+            if start_ts is None or end_ts is None:
+                continue
+            if start_ts <= timestamp_utc <= end_ts:
+                return blackout
+        return None
+
     def _is_past_flatten_deadline(self, now_et: datetime | None = None) -> bool:
         t = (now_et or self._et_now()).time()
         return t >= _SESSION_FLATTEN_AT
@@ -1846,6 +3127,7 @@ class TradeOSBot:
         hold_signals = 0
         error_signals = 0
         orders_submitted = 0
+        _hold_reasons: dict[str, int] = {}
 
         def _set_cycle_report(processed_bar: bool, skip_reason: str) -> None:
             self._last_run_cycle_report = RunCycleReport(
@@ -1914,7 +3196,6 @@ class TradeOSBot:
         sell_signals = sum(1 for item in snapshot.symbols if item.action == "SELL")
         hold_signals = sum(1 for item in snapshot.symbols if item.action == "HOLD")
         error_signals = sum(1 for item in snapshot.symbols if item.action == "ERROR")
-        _hold_reasons: dict[str, int] = {}
         for _item in snapshot.symbols:
             if _item.action == "HOLD" and _item.hold_reason:
                 _hold_reasons[_item.hold_reason] = _hold_reasons.get(_item.hold_reason, 0) + 1
@@ -1922,6 +3203,16 @@ class TradeOSBot:
         if not should_process:
             print("[CYCLE] Skipping duplicate bar before execution branch")
             _set_cycle_report(processed_bar=False, skip_reason="duplicate_bar")
+            self.record_state(snapshot)
+            return snapshot
+
+        resync_result = self.get_startup_resync_result()
+        if execute_orders and not resync_result.gate_allows_exits:
+            self._log_skip(
+                "SKIP_RESYNC_GATE",
+                f"status={resync_result.status.value} entries={resync_result.gate_allows_entries} exits={resync_result.gate_allows_exits}",
+            )
+            _set_cycle_report(processed_bar=True, skip_reason=resync_result.status.value.lower())
             self.record_state(snapshot)
             return snapshot
 
@@ -2020,7 +3311,7 @@ class TradeOSBot:
             print(f"Outside entry window ({now_et.strftime('%H:%M:%S')} ET): new entries suppressed, exits still active")
 
         positions = snapshot.positions.copy()
-        open_positions = sum(1 for position in positions.values() if _has_long_position(position))
+        open_positions = sum(1 for position in positions.values() if _has_open_position(position))
         remaining_buying_power = snapshot.buying_power
         open_orders = self.get_open_orders()
         open_order_symbols = {
@@ -2060,6 +3351,28 @@ class TradeOSBot:
                 )
                 print(f"{symbol} -> {action}{ml_text}{holding_text}")
 
+                allowed_by_resync, resync_reason = self._resync_gate_for_action(
+                    action=action,
+                    symbol=symbol,
+                    positions=positions,
+                )
+                if not allowed_by_resync:
+                    self._log_risk_check(
+                        symbol=symbol,
+                        decision_ts=decision_timestamp.isoformat(),
+                        action=action,
+                        allowed=False,
+                        block_reason=resync_reason,
+                        snapshot=snapshot,
+                        open_positions=open_positions,
+                        signal_price=item.price or None,
+                        detail=f"startup resync gate blocked action under status={resync_result.status.value}",
+                        in_entry_window=in_entry_window,
+                        remaining_buying_power=remaining_buying_power,
+                        recent_order_count=recent_order_count,
+                    )
+                    continue
+
                 if symbol in open_order_symbols:
                     print(f"Skip {symbol}: existing open order in flight")
                     self._log_risk_check(
@@ -2098,6 +3411,27 @@ class TradeOSBot:
 
                 if action == "BUY":
                     _dec_ts = decision_timestamp.isoformat() if decision_timestamp else ""
+                    active_blackout = self._active_symbol_event_blackout(symbol, decision_timestamp)
+                    if active_blackout is not None:
+                        print(f"Skip {symbol} BUY: event blackout active ({active_blackout.reason})")
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="BUY",
+                            allowed=False,
+                            block_reason="event_blackout",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            signal_price=item.price or None,
+                            detail=(
+                                f"blackout active from {active_blackout.start_utc} to "
+                                f"{active_blackout.end_utc} ({active_blackout.reason})"
+                            ),
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            recent_order_count=recent_order_count,
+                        )
+                        continue
                     if not in_entry_window:
                         print(f"Skip {symbol} BUY: outside trading window ({now_et.strftime('%H:%M:%S')} ET)")
                         self._log_risk_check(
@@ -2273,6 +3607,7 @@ class TradeOSBot:
                         price=live_price,
                         decision_ts=_dec_ts,
                         signal_price=_signal_price,
+                        entry_branch=item.hybrid_entry_branch,
                     )
                     if order is not None:
                         orders_submitted += 1
@@ -2399,7 +3734,9 @@ class TradeOSBot:
                 print("[CYCLE] Execution branch completed with no actionable BUY/SELL signals")
                 final_reason = "no_actionable_signals"
         _set_cycle_report(processed_bar=True, skip_reason=final_reason)
-        snapshot = self.build_snapshot(decision_timestamp=decision_timestamp)
+        # Persist a post-execution snapshot without re-evaluating signals.
+        # Re-running signal evaluation here duplicates signal logs for the same bar.
+        snapshot = self.build_snapshot(decision_timestamp=decision_timestamp, evaluate_signals=False)
         self.record_state(snapshot)
         return snapshot
 
@@ -2412,9 +3749,29 @@ def main(config: BotConfig | None = None, session_id: str | None = None) -> None
     if config is None:
         config = load_config()
     bot = TradeOSBot(config, session_id=session_id)
+    bot.perform_startup_resync()
     execute_orders = os.getenv("EXECUTE_ORDERS", "true").lower() != "false"
+    try:
+        bot.perform_startup_preflight(execute_orders=execute_orders)
+    except Exception as exc:
+        bot.blog.lifecycle(
+            "startup.failed",
+            reason="startup_preflight_error",
+            execute_orders=execute_orders,
+            error=str(exc),
+        )
+        raise
     bar_interval_seconds = config.bar_timeframe_minutes * 60
     shutdown_event = threading.Event()
+    exit_reason = "unknown"
+    bot.blog.lifecycle(
+        "started",
+        execute_orders=execute_orders,
+        strategy_mode=config.strategy_mode,
+        timeframe_minutes=config.bar_timeframe_minutes,
+        symbol_count=len(config.symbols),
+        data_parity=bot.data_parity_summary(),
+    )
 
     def _eod_flatten_worker() -> None:
         now_et = bot._et_now()
@@ -2453,40 +3810,59 @@ def main(config: BotConfig | None = None, session_id: str | None = None) -> None
     flatten_thread = threading.Thread(target=_eod_flatten_worker, name="eod-flatten", daemon=True)
     flatten_thread.start()
 
-    wait_seconds = bot._seconds_until_next_bar()
-    if wait_seconds > 1:
-        next_bar_utc = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
-        print(f"Aligning to next bar boundary: waiting {wait_seconds:.0f}s until {next_bar_utc.strftime('%H:%M:%S')} UTC")
-        shutdown_event.wait(timeout=wait_seconds)
-        if shutdown_event.is_set():
-            print("Bot loop exited.")
-            return
+    try:
+        wait_seconds = bot._seconds_until_next_bar()
+        if wait_seconds > 1:
+            next_bar_utc = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+            print(f"Aligning to next bar boundary: waiting {wait_seconds:.0f}s until {next_bar_utc.strftime('%H:%M:%S')} UTC")
+            shutdown_event.wait(timeout=wait_seconds)
+            if shutdown_event.is_set():
+                exit_reason = "startup_wait_interrupted"
+                print("Bot loop exited.")
+                return
 
-    while not shutdown_event.is_set():
-        if bot._is_past_flatten_deadline():
-            print("Main loop: past 15:55 ET, exiting without new tick")
-            break
-
-        tick_start = time.time()
-        try:
-            snapshot = bot.run_once(execute_orders=execute_orders)
-            if snapshot.kill_switch_triggered:
-                print("Main loop: kill switch triggered, exiting")
-                shutdown_event.set()
+        while not shutdown_event.is_set():
+            if bot._is_past_flatten_deadline():
+                exit_reason = "past_flatten_deadline"
+                print("Main loop: past 15:55 ET, exiting without new tick")
                 break
+
+            tick_start = time.time()
+            try:
+                snapshot = bot.run_once(execute_orders=execute_orders)
+                if snapshot.kill_switch_triggered:
+                    exit_reason = "kill_switch_triggered"
+                    print("Main loop: kill switch triggered, exiting")
+                    shutdown_event.set()
+                    break
+            except Exception as exc:
+                print(f"run_once ERROR: {exc}")
+
+            if shutdown_event.is_set():
+                if exit_reason == "unknown":
+                    exit_reason = "shutdown_event_set"
+                break
+
+            elapsed = time.time() - tick_start
+            sleep_seconds = max(0.0, bar_interval_seconds - elapsed)
+            print(f"Next tick in {sleep_seconds:.0f}s")
+            # Wait for the next bar, but wake immediately if flatten thread fires
+            shutdown_event.wait(timeout=sleep_seconds)
+
+        if exit_reason == "unknown":
+            exit_reason = "loop_completed"
+        print("Bot loop exited.")
+    finally:
+        try:
+            final_snapshot = bot.build_snapshot(evaluate_signals=False)
+            bot.record_state(final_snapshot)
         except Exception as exc:
-            print(f"run_once ERROR: {exc}")
-
-        if shutdown_event.is_set():
-            break
-
-        elapsed = time.time() - tick_start
-        sleep_seconds = max(0.0, bar_interval_seconds - elapsed)
-        print(f"Next tick in {sleep_seconds:.0f}s")
-        # Wait for the next bar, but wake immediately if flatten thread fires
-        shutdown_event.wait(timeout=sleep_seconds)
-
-    print("Bot loop exited.")
+            print(f"Final state capture ERROR: {exc}")
+        bot.blog.lifecycle(
+            "exiting",
+            reason=exit_reason,
+            execute_orders=execute_orders,
+        )
 
 
 if __name__ == "__main__":

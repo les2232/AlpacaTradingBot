@@ -1,0 +1,22 @@
+{
+  "fragility_label": "not ready",
+  "fragility_reason": "Baseline realized performance is non-positive and nearby checks do not rescue it.",
+  "baseline_summary": {
+    "section": "baseline",
+    "scenario": "baseline",
+    "symbols": "AMD,HON,C,JPM",
+    "start_date": null,
+    "end_date": null,
+    "signal_count": 200,
+    "filled_trades": 75,
+    "total_pnl": -63.92889597370788,
+    "expectancy": -0.8523852796494384,
+    "win_rate": 49.333333333333336,
+    "profit_factor": 0.7656863923376124,
+    "max_drawdown_pct": 1.4723240212056614,
+    "raw_fixed_sample_count": 200,
+    "raw_fixed_horizon_bars": 4,
+    "raw_fixed_net_expectancy_pct": 0.075406482085967,
+    "raw_fixed_win_rate_pct": 57.99999999999999
+  }
+}

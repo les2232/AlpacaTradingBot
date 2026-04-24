@@ -4,15 +4,23 @@ import pytest
 
 from strategy import (
     ADX_PERIOD,
+    BOLLINGER_EXIT_MIDDLE_BAND,
     MlSignal,
+    STRATEGY_MODE_BOLLINGER_SQUEEZE,
+    STRATEGY_MODE_HYBRID_BB_MR,
     STRATEGY_MODE_MEAN_REVERSION,
+    STRATEGY_MODE_MOMENTUM_BREAKOUT,
     STRATEGY_MODE_SMA,
+    STRATEGY_MODE_TREND_PULLBACK,
+    STRATEGY_MODE_VOLATILITY_EXPANSION,
     STRATEGY_MODE_WICK_FADE,
     Strategy,
     StrategyConfig,
     calculate_adx_series,
+    calculate_bollinger_squeeze_features,
     calculate_opening_range_series,
     calculate_vwap_series,
+    strategy_requires_adx,
 )
 
 
@@ -237,6 +245,26 @@ class TestSmaStopPct:
         )
 
         assert action == "HOLD"
+
+
+class TestMeanReversionRiskControls:
+    def test_mean_reversion_sells_on_stop_even_before_reversion_completes(self):
+        strategy = Strategy(
+            StrategyConfig(
+                strategy_mode=STRATEGY_MODE_MEAN_REVERSION,
+                mean_reversion_stop_pct=0.01,
+            )
+        )
+
+        action = strategy.decide_action(
+            price=98.9,
+            sma=101.0,
+            ml_signal=_ml_signal(),
+            holding=True,
+            position_entry_price=100.0,
+        )
+
+        assert action == "SELL"
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +894,184 @@ def _wf_decide(
     )
 
 
+def _tp_strategy(**kwargs) -> Strategy:
+    defaults = dict(
+        strategy_mode=STRATEGY_MODE_TREND_PULLBACK,
+        trend_pullback_min_adx=20.0,
+        trend_pullback_min_slope=0.0,
+        trend_pullback_entry_threshold=0.01,
+        trend_pullback_min_atr_percentile=20.0,
+        trend_pullback_max_atr_percentile=0.0,
+        trend_pullback_exit_style="fixed_bars",
+        trend_pullback_hold_bars=4,
+        trend_pullback_stop_pct=0.0,
+    )
+    defaults.update(kwargs)
+    return Strategy(StrategyConfig(**defaults))
+
+
+def _tp_decide(
+    strategy: Strategy,
+    *,
+    price: float,
+    sma: float = 100.0,
+    holding: bool = False,
+    atr_percentile: float | None = 40.0,
+    time_window_open: bool = True,
+    bullish_regime: bool | None = None,
+    position_entry_price: float | None = None,
+    trend_sma: float | None = 95.0,
+    trend_sma_slope: float | None = 0.2,
+    adx: float | None = 25.0,
+    bar_high: float | None = None,
+    trend_pullback_bars_held: int = 0,
+) -> str:
+    return strategy.decide_action(
+        price=price,
+        sma=sma,
+        ml_signal=_ml_signal(),
+        holding=holding,
+        atr_percentile=atr_percentile,
+        time_window_open=time_window_open,
+        bullish_regime=bullish_regime,
+        position_entry_price=position_entry_price,
+        trend_sma=trend_sma,
+        trend_sma_slope=trend_sma_slope,
+        adx=adx,
+        bar_high=bar_high,
+        trend_pullback_bars_held=trend_pullback_bars_held,
+    )
+
+
+def _mb_strategy(**kwargs) -> Strategy:
+    defaults = dict(
+        strategy_mode=STRATEGY_MODE_MOMENTUM_BREAKOUT,
+        momentum_breakout_lookback_bars=20,
+        momentum_breakout_entry_buffer_pct=0.001,
+        momentum_breakout_min_adx=20.0,
+        momentum_breakout_min_slope=0.0,
+        momentum_breakout_min_atr_percentile=20.0,
+        momentum_breakout_exit_style="fixed_bars",
+        momentum_breakout_hold_bars=3,
+        momentum_breakout_stop_pct=0.0,
+        momentum_breakout_take_profit_pct=0.0,
+    )
+    defaults.update(kwargs)
+    return Strategy(StrategyConfig(**defaults))
+
+
+def _mb_decide(
+    strategy: Strategy,
+    *,
+    price: float,
+    holding: bool = False,
+    atr_percentile: float | None = 40.0,
+    time_window_open: bool = True,
+    bullish_regime: bool | None = None,
+    position_entry_price: float | None = None,
+    trend_sma: float | None = 100.0,
+    trend_sma_slope: float | None = 0.2,
+    adx: float | None = 25.0,
+    bar_high: float | None = None,
+    bar_low: float | None = None,
+    recent_breakout_high: float | None = 99.0,
+    momentum_breakout_bars_held: int = 0,
+) -> str:
+    return strategy.decide_action(
+        price=price,
+        sma=100.0,
+        ml_signal=_ml_signal(),
+        holding=holding,
+        atr_percentile=atr_percentile,
+        time_window_open=time_window_open,
+        bullish_regime=bullish_regime,
+        position_entry_price=position_entry_price,
+        trend_sma=trend_sma,
+        trend_sma_slope=trend_sma_slope,
+        adx=adx,
+        bar_high=bar_high,
+        bar_low=bar_low,
+        recent_breakout_high=recent_breakout_high,
+        momentum_breakout_bars_held=momentum_breakout_bars_held,
+    )
+
+
+def _ve_strategy(**kwargs) -> Strategy:
+    defaults = dict(
+        strategy_mode=STRATEGY_MODE_VOLATILITY_EXPANSION,
+        volatility_expansion_lookback_bars=20,
+        volatility_expansion_entry_buffer_pct=0.001,
+        volatility_expansion_max_atr_percentile=35.0,
+        volatility_expansion_trend_filter=False,
+        volatility_expansion_min_slope=0.0,
+        volatility_expansion_use_volume_confirm=True,
+        volatility_expansion_exit_style="fixed_bars",
+        volatility_expansion_hold_bars=4,
+        volatility_expansion_stop_pct=0.0,
+        volatility_expansion_take_profit_pct=0.0,
+    )
+    defaults.update(kwargs)
+    return Strategy(StrategyConfig(**defaults))
+
+
+def _ve_decide(
+    strategy: Strategy,
+    *,
+    price: float,
+    holding: bool = False,
+    atr_percentile: float | None = 20.0,
+    time_window_open: bool = True,
+    bullish_regime: bool | None = None,
+    position_entry_price: float | None = None,
+    trend_sma: float | None = 100.0,
+    trend_sma_slope: float | None = 0.2,
+    bar_high: float | None = None,
+    bar_low: float | None = None,
+    recent_breakout_high: float | None = 99.0,
+    bb_prev_squeeze: bool | None = True,
+    bb_breakout_up: bool | None = True,
+    bb_volume_confirm: bool | None = True,
+    volatility_expansion_bars_held: int = 0,
+) -> str:
+    return strategy.decide_action(
+        price=price,
+        sma=100.0,
+        ml_signal=_ml_signal(),
+        holding=holding,
+        atr_percentile=atr_percentile,
+        time_window_open=time_window_open,
+        bullish_regime=bullish_regime,
+        position_entry_price=position_entry_price,
+        trend_sma=trend_sma,
+        trend_sma_slope=trend_sma_slope,
+        bar_high=bar_high,
+        bar_low=bar_low,
+        recent_breakout_high=recent_breakout_high,
+        bb_prev_squeeze=bb_prev_squeeze,
+        bb_breakout_up=bb_breakout_up,
+        bb_volume_confirm=bb_volume_confirm,
+        volatility_expansion_bars_held=volatility_expansion_bars_held,
+    )
+
+
+def test_strategy_requires_adx_for_trend_pullback_min_adx() -> None:
+    assert strategy_requires_adx(
+        StrategyConfig(strategy_mode=STRATEGY_MODE_TREND_PULLBACK, trend_pullback_min_adx=20.0, max_adx_threshold=0.0)
+    )
+    assert not strategy_requires_adx(
+        StrategyConfig(strategy_mode=STRATEGY_MODE_TREND_PULLBACK, trend_pullback_min_adx=0.0, max_adx_threshold=0.0)
+    )
+
+
+def test_strategy_requires_adx_for_momentum_breakout_min_adx() -> None:
+    assert strategy_requires_adx(
+        StrategyConfig(strategy_mode=STRATEGY_MODE_MOMENTUM_BREAKOUT, momentum_breakout_min_adx=20.0, max_adx_threshold=0.0)
+    )
+    assert not strategy_requires_adx(
+        StrategyConfig(strategy_mode=STRATEGY_MODE_MOMENTUM_BREAKOUT, momentum_breakout_min_adx=0.0, max_adx_threshold=0.0)
+    )
+
+
 class TestWickFadeEntry:
     def test_strong_lower_wick_triggers_buy(self):
         """Classic rejection candle: large lower wick, close near high."""
@@ -1007,3 +1213,618 @@ class TestWickFadeExit:
             s, close=100.0, high=100.0, low=100.0, open_=100.0,
             holding=True, wick_fade_stop=100.0, wick_fade_target=99.0,
         ) == "SELL"
+
+
+class TestTrendPullbackStrategy:
+    def test_buys_during_pullback_in_confirmed_trend(self):
+        strategy = _tp_strategy(trend_pullback_entry_threshold=0.01)
+
+        action = _tp_decide(
+            strategy,
+            price=98.9,
+            sma=100.0,
+            trend_sma=96.0,
+            trend_sma_slope=0.3,
+            adx=28.0,
+        )
+
+        assert action == "BUY"
+
+    def test_rejects_when_trend_reference_missing(self):
+        strategy = _tp_strategy()
+        assert _tp_decide(strategy, price=98.9, trend_sma=None) == "HOLD"
+
+    def test_rejects_when_slope_is_negative(self):
+        strategy = _tp_strategy(trend_pullback_min_slope=0.0)
+        assert _tp_decide(strategy, price=98.9, trend_sma_slope=-0.01) == "HOLD"
+
+    def test_rejects_when_price_loses_trend_reference(self):
+        strategy = _tp_strategy()
+        assert _tp_decide(strategy, price=94.0, trend_sma=95.0, sma=100.0) == "HOLD"
+
+    def test_rejects_when_adx_below_threshold(self):
+        strategy = _tp_strategy(trend_pullback_min_adx=25.0)
+        assert _tp_decide(strategy, price=98.9, adx=20.0) == "HOLD"
+
+    def test_rejects_when_atr_percentile_outside_bounds(self):
+        strategy = _tp_strategy(trend_pullback_min_atr_percentile=30.0, trend_pullback_max_atr_percentile=60.0)
+        assert _tp_decide(strategy, price=98.9, atr_percentile=10.0) == "HOLD"
+        assert _tp_decide(strategy, price=98.9, atr_percentile=75.0) == "HOLD"
+
+    def test_fixed_bar_exit_fires_at_limit(self):
+        strategy = _tp_strategy(trend_pullback_hold_bars=4)
+        assert _tp_decide(
+            strategy,
+            price=101.0,
+            holding=True,
+            position_entry_price=99.0,
+            trend_pullback_bars_held=4,
+        ) == "SELL"
+
+    def test_holds_before_fixed_bar_exit_limit(self):
+        strategy = _tp_strategy(trend_pullback_hold_bars=4)
+        assert _tp_decide(
+            strategy,
+            price=101.0,
+            holding=True,
+            position_entry_price=99.0,
+            trend_pullback_bars_held=3,
+        ) == "HOLD"
+
+    def test_take_profit_exit_fires_when_bar_high_hits_target(self):
+        strategy = _tp_strategy(
+            trend_pullback_exit_style="take_profit",
+            trend_pullback_take_profit_pct=0.0025,
+        )
+        assert _tp_decide(
+            strategy,
+            price=100.1,
+            holding=True,
+            position_entry_price=100.0,
+            bar_high=100.3,
+            trend_pullback_bars_held=1,
+        ) == "SELL"
+
+    def test_take_profit_holds_when_target_not_hit(self):
+        strategy = _tp_strategy(
+            trend_pullback_exit_style="take_profit",
+            trend_pullback_take_profit_pct=0.0025,
+        )
+        assert _tp_decide(
+            strategy,
+            price=100.1,
+            holding=True,
+            position_entry_price=100.0,
+            bar_high=100.2,
+            trend_pullback_bars_held=2,
+        ) == "HOLD"
+
+    def test_hybrid_take_profit_beats_time_exit(self):
+        strategy = _tp_strategy(
+            trend_pullback_exit_style="hybrid_tp_or_time",
+            trend_pullback_hold_bars=3,
+            trend_pullback_take_profit_pct=0.0025,
+        )
+        assert _tp_decide(
+            strategy,
+            price=100.05,
+            holding=True,
+            position_entry_price=100.0,
+            bar_high=100.4,
+            trend_pullback_bars_held=3,
+        ) == "SELL"
+
+    def test_hybrid_time_exit_fires_when_target_missed(self):
+        strategy = _tp_strategy(
+            trend_pullback_exit_style="hybrid_tp_or_time",
+            trend_pullback_hold_bars=3,
+            trend_pullback_take_profit_pct=0.0025,
+        )
+        assert _tp_decide(
+            strategy,
+            price=100.0,
+            holding=True,
+            position_entry_price=100.0,
+            bar_high=100.2,
+            trend_pullback_bars_held=3,
+        ) == "SELL"
+
+    def test_optional_stop_pct_exits_early(self):
+        strategy = _tp_strategy(trend_pullback_stop_pct=0.02)
+        assert _tp_decide(
+            strategy,
+            price=97.5,
+            holding=True,
+            position_entry_price=100.0,
+            trend_pullback_bars_held=1,
+        ) == "SELL"
+
+
+class TestMomentumBreakoutStrategy:
+    def test_buys_on_breakout_in_confirmed_trend(self):
+        strategy = _mb_strategy(
+            momentum_breakout_lookback_bars=20,
+            momentum_breakout_entry_buffer_pct=0.001,
+        )
+
+        action = _mb_decide(
+            strategy,
+            price=100.2,
+            trend_sma=98.0,
+            trend_sma_slope=0.25,
+            adx=28.0,
+            recent_breakout_high=100.0,
+        )
+
+        assert action == "BUY"
+
+    def test_rejects_without_trend_confirmation(self):
+        strategy = _mb_strategy()
+        assert _mb_decide(strategy, price=100.2, trend_sma=101.0) == "HOLD"
+        assert _mb_decide(strategy, price=100.2, trend_sma_slope=-0.01) == "HOLD"
+
+    def test_rejects_without_breakout_trigger(self):
+        strategy = _mb_strategy(momentum_breakout_entry_buffer_pct=0.001)
+        assert _mb_decide(strategy, price=100.05, recent_breakout_high=100.0) == "HOLD"
+
+    def test_rejects_when_filters_fail(self):
+        strategy = _mb_strategy(momentum_breakout_min_adx=25.0, momentum_breakout_min_atr_percentile=30.0)
+        assert _mb_decide(strategy, price=100.2, adx=20.0, recent_breakout_high=100.0) == "HOLD"
+        assert _mb_decide(strategy, price=100.2, atr_percentile=10.0, recent_breakout_high=100.0) == "HOLD"
+
+    def test_fixed_bar_exit_fires_at_limit(self):
+        strategy = _mb_strategy(momentum_breakout_hold_bars=3)
+        assert _mb_decide(
+            strategy,
+            price=101.0,
+            holding=True,
+            position_entry_price=100.0,
+            momentum_breakout_bars_held=3,
+        ) == "SELL"
+
+    def test_stop_and_take_profit_are_optional_overlays(self):
+        stop_strategy = _mb_strategy(momentum_breakout_stop_pct=0.01)
+        assert _mb_decide(
+            stop_strategy,
+            price=100.0,
+            holding=True,
+            position_entry_price=100.0,
+            bar_low=98.9,
+            momentum_breakout_bars_held=1,
+        ) == "SELL"
+
+        tp_strategy = _mb_strategy(momentum_breakout_take_profit_pct=0.01)
+        assert _mb_decide(
+            tp_strategy,
+            price=100.4,
+            holding=True,
+            position_entry_price=100.0,
+            bar_high=101.1,
+            momentum_breakout_bars_held=1,
+        ) == "SELL"
+
+
+class TestVolatilityExpansionStrategy:
+    def test_buys_after_squeeze_breakout(self):
+        strategy = _ve_strategy()
+        assert _ve_decide(strategy, price=99.2, recent_breakout_high=99.0, atr_percentile=20.0) == "BUY"
+
+    def test_rejects_without_compression_setup(self):
+        strategy = _ve_strategy()
+        assert _ve_decide(strategy, price=99.2, bb_prev_squeeze=False) == "HOLD"
+
+    def test_rejects_without_breakout_confirmation(self):
+        strategy = _ve_strategy()
+        assert _ve_decide(strategy, price=99.2, bb_breakout_up=False) == "HOLD"
+
+    def test_trend_filter_blocks_weak_context(self):
+        strategy = _ve_strategy(volatility_expansion_trend_filter=True, volatility_expansion_min_slope=0.05)
+        assert _ve_decide(strategy, price=99.2, trend_sma=100.0, trend_sma_slope=0.0) == "HOLD"
+
+    def test_volume_confirm_can_be_disabled(self):
+        strategy = _ve_strategy(volatility_expansion_use_volume_confirm=False)
+        assert _ve_decide(strategy, price=99.2, bb_volume_confirm=False) == "BUY"
+
+    def test_max_atr_percentile_blocks_non_compression_regime(self):
+        strategy = _ve_strategy(volatility_expansion_max_atr_percentile=25.0)
+        assert _ve_decide(strategy, price=99.2, atr_percentile=40.0) == "HOLD"
+
+    def test_fixed_bar_exit_fires_at_limit(self):
+        strategy = _ve_strategy(volatility_expansion_hold_bars=4)
+        assert _ve_decide(
+            strategy,
+            price=101.0,
+            holding=True,
+            position_entry_price=100.0,
+            volatility_expansion_bars_held=4,
+        ) == "SELL"
+
+    def test_stop_and_take_profit_are_optional_overlays(self):
+        stop_strategy = _ve_strategy(volatility_expansion_stop_pct=0.02)
+        assert _ve_decide(
+            stop_strategy,
+            price=100.0,
+            holding=True,
+            position_entry_price=100.0,
+            bar_low=97.5,
+            volatility_expansion_bars_held=1,
+        ) == "SELL"
+
+        tp_strategy = _ve_strategy(volatility_expansion_take_profit_pct=0.01)
+        assert _ve_decide(
+            tp_strategy,
+            price=100.4,
+            holding=True,
+            position_entry_price=100.0,
+            bar_high=101.1,
+            volatility_expansion_bars_held=1,
+        ) == "SELL"
+
+
+class TestBollingerSqueezeFeatures:
+    def test_returns_parallel_series(self):
+        closes = [100.0 + (i * 0.1) for i in range(160)]
+        volumes = [1000.0] * 160
+
+        features = calculate_bollinger_squeeze_features(
+            closes,
+            volumes,
+            period=20,
+            width_lookback=100,
+            slope_lookback=3,
+        )
+
+        assert len(features["middle"]) == len(closes)
+        assert len(features["squeeze"]) == len(closes)
+        assert len(features["bias"]) == len(closes)
+
+    def test_marks_bullish_breakout_after_squeeze(self):
+        closes = [100.0] * 123 + [104.0]
+        volumes = [1000.0] * 123 + [2500.0]
+
+        features = calculate_bollinger_squeeze_features(
+            closes,
+            volumes,
+            period=20,
+            width_lookback=100,
+            squeeze_quantile=0.2,
+            slope_lookback=3,
+            use_volume_confirm=True,
+            volume_mult=1.2,
+        )
+
+        assert features["squeeze"][-2] is True
+        assert features["bias"][-1] == "bullish"
+        assert features["breakout_up"][-1] is True
+        assert features["volume_confirm"][-1] is True
+
+
+def _bb_strategy(**kwargs) -> Strategy:
+    defaults = dict(
+        strategy_mode=STRATEGY_MODE_BOLLINGER_SQUEEZE,
+        bb_exit_mode=BOLLINGER_EXIT_MIDDLE_BAND,
+    )
+    defaults.update(kwargs)
+    return Strategy(StrategyConfig(**defaults))
+
+
+class TestBollingerSqueezeStrategy:
+    def test_buys_on_confirmed_bullish_breakout(self):
+        strategy = _bb_strategy(bb_use_volume_confirm=True, bb_volume_mult=1.2)
+
+        action = strategy.decide_action(
+            price=104.0,
+            sma=101.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            time_window_open=True,
+            bb_middle=101.0,
+            bb_upper=103.0,
+            bb_lower=99.0,
+            bb_prev_squeeze=True,
+            bb_mid_slope=0.8,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+        )
+
+        assert action == "BUY"
+
+    def test_rejects_breakout_without_prior_squeeze(self):
+        strategy = _bb_strategy()
+
+        action = strategy.decide_action(
+            price=104.0,
+            sma=101.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            bb_middle=101.0,
+            bb_upper=103.0,
+            bb_lower=99.0,
+            bb_prev_squeeze=False,
+            bb_mid_slope=0.8,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+        )
+
+        assert action == "HOLD"
+
+    def test_rejects_when_volume_confirm_enabled_and_missing(self):
+        strategy = _bb_strategy(bb_use_volume_confirm=True)
+
+        action = strategy.decide_action(
+            price=104.0,
+            sma=101.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            bb_middle=101.0,
+            bb_upper=103.0,
+            bb_lower=99.0,
+            bb_prev_squeeze=True,
+            bb_mid_slope=0.8,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=False,
+        )
+
+        assert action == "HOLD"
+
+    def test_sells_on_middle_band_exit(self):
+        strategy = _bb_strategy()
+
+        action = strategy.decide_action(
+            price=99.0,
+            sma=100.0,
+            ml_signal=_ml_signal(),
+            holding=True,
+            bb_middle=100.0,
+        )
+
+        assert action == "SELL"
+
+    def test_requires_breakout_buffer_when_configured(self):
+        strategy = _bb_strategy(bb_breakout_buffer_pct=0.01)
+
+        action = strategy.decide_action(
+            price=103.5,
+            sma=101.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            bb_middle=101.0,
+            bb_upper=103.0,
+            bb_lower=99.0,
+            bb_prev_squeeze=True,
+            bb_mid_slope=0.8,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+            trend_sma=100.0,
+        )
+
+        assert action == "HOLD"
+
+    def test_requires_trend_filter_when_enabled(self):
+        strategy = _bb_strategy(bb_trend_filter=True)
+
+        action = strategy.decide_action(
+            price=104.0,
+            sma=101.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            bb_middle=101.0,
+            bb_upper=103.0,
+            bb_lower=99.0,
+            bb_prev_squeeze=True,
+            bb_mid_slope=0.8,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+            trend_sma=105.0,
+        )
+
+        assert action == "HOLD"
+
+
+def _hybrid_bb_mr_strategy(**kwargs) -> Strategy:
+    defaults = dict(
+        strategy_mode=STRATEGY_MODE_HYBRID_BB_MR,
+        bb_exit_mode=BOLLINGER_EXIT_MIDDLE_BAND,
+        entry_threshold_pct=0.02,
+    )
+    defaults.update(kwargs)
+    return Strategy(StrategyConfig(**defaults))
+
+
+class TestHybridBbMrStrategy:
+    def test_selects_bollinger_branch_when_previous_bar_was_squeeze(self):
+        strategy = _hybrid_bb_mr_strategy()
+
+        details = strategy.decide_action_details(
+            price=104.0,
+            sma=101.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            bb_middle=101.0,
+            bb_upper=103.0,
+            bb_lower=99.0,
+            bb_prev_squeeze=True,
+            bb_mid_slope=0.5,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+        )
+
+        assert details.hybrid_branch == "bollinger_breakout"
+        assert details.action == "BUY"
+        assert details.reason == "bollinger_breakout_long"
+
+    def test_falls_back_to_mean_reversion_when_no_squeeze(self):
+        strategy = _hybrid_bb_mr_strategy(entry_threshold_pct=0.02)
+
+        details = strategy.decide_action_details(
+            price=97.0,
+            sma=100.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            atr_pct=None,
+            bb_middle=99.0,
+            bb_upper=101.0,
+            bb_lower=97.0,
+            bb_prev_squeeze=False,
+            bb_mid_slope=0.2,
+            bb_bias="bullish",
+            bb_breakout_up=False,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+        )
+
+        assert details.hybrid_branch == "mean_reversion"
+        assert details.mr_signal == "BUY"
+        assert details.action == "BUY"
+        assert details.reason == "mean_reversion_sma_entry"
+
+    def test_uses_previous_squeeze_only_without_lookahead(self):
+        strategy = _hybrid_bb_mr_strategy(entry_threshold_pct=0.02)
+
+        details = strategy.decide_action_details(
+            price=97.0,
+            sma=100.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            bb_middle=99.0,
+            bb_upper=101.0,
+            bb_lower=97.0,
+            bb_prev_squeeze=False,
+            bb_mid_slope=0.5,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+        )
+
+        assert details.hybrid_branch == "mean_reversion"
+        assert details.action == "BUY"
+        assert details.reason == "mean_reversion_sma_entry"
+
+    def test_bollinger_branch_blocks_entry_without_breakout(self):
+        strategy = _hybrid_bb_mr_strategy()
+
+        details = strategy.decide_action_details(
+            price=102.0,
+            sma=100.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            bb_middle=100.0,
+            bb_upper=103.0,
+            bb_lower=97.0,
+            bb_prev_squeeze=True,
+            bb_mid_slope=0.5,
+            bb_bias="bullish",
+            bb_breakout_up=False,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+        )
+
+        assert details.hybrid_branch == "bollinger_breakout"
+        assert details.action == "HOLD"
+        assert details.reason == "bollinger_no_signal"
+
+    def test_persists_bollinger_branch_while_position_is_open(self):
+        strategy = _hybrid_bb_mr_strategy()
+
+        details = strategy.decide_action_details(
+            price=99.0,
+            sma=101.0,
+            ml_signal=_ml_signal(),
+            holding=True,
+            bb_middle=100.0,
+            bb_upper=104.0,
+            bb_lower=96.0,
+            bb_prev_squeeze=False,
+            bb_mid_slope=-0.5,
+            bb_bias="bearish",
+            bb_breakout_up=False,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+            hybrid_entry_branch="bollinger_breakout",
+        )
+
+        assert details.hybrid_branch_active == "bollinger_breakout"
+        assert details.hybrid_regime_branch == "mean_reversion"
+        assert details.hybrid_entry_branch == "bollinger_breakout"
+        assert details.action == "SELL"
+        assert details.reason == "bollinger_middle_band_exit"
+
+    def test_persists_mean_reversion_branch_while_position_is_open(self):
+        strategy = _hybrid_bb_mr_strategy(entry_threshold_pct=0.02)
+
+        details = strategy.decide_action_details(
+            price=100.0,
+            sma=99.0,
+            ml_signal=_ml_signal(),
+            holding=True,
+            bb_middle=98.0,
+            bb_upper=99.0,
+            bb_lower=95.0,
+            bb_prev_squeeze=True,
+            bb_mid_slope=0.4,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+            hybrid_entry_branch="mean_reversion",
+        )
+
+        assert details.hybrid_branch_active == "mean_reversion"
+        assert details.hybrid_regime_branch == "bollinger_breakout"
+        assert details.hybrid_entry_branch == "mean_reversion"
+        assert details.action == "SELL"
+        assert details.reason == "mean_reversion_sma_exit"
+
+    def test_clears_entry_branch_after_exit_and_reselects_from_regime(self):
+        strategy = _hybrid_bb_mr_strategy(entry_threshold_pct=0.02)
+
+        exit_details = strategy.decide_action_details(
+            price=100.0,
+            sma=99.0,
+            ml_signal=_ml_signal(),
+            holding=True,
+            bb_middle=98.0,
+            bb_upper=99.0,
+            bb_lower=95.0,
+            bb_prev_squeeze=True,
+            bb_mid_slope=0.4,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+            hybrid_entry_branch="mean_reversion",
+        )
+        next_entry_details = strategy.decide_action_details(
+            price=104.0,
+            sma=101.0,
+            ml_signal=_ml_signal(),
+            holding=False,
+            bb_middle=101.0,
+            bb_upper=103.0,
+            bb_lower=99.0,
+            bb_prev_squeeze=True,
+            bb_mid_slope=0.5,
+            bb_bias="bullish",
+            bb_breakout_up=True,
+            bb_breakout_down=False,
+            bb_volume_confirm=True,
+            hybrid_entry_branch=None,
+        )
+
+        assert exit_details.action == "SELL"
+        assert next_entry_details.hybrid_branch_active == "bollinger_breakout"
+        assert next_entry_details.hybrid_entry_branch == "bollinger_breakout"
+        assert next_entry_details.action == "BUY"

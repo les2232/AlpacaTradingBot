@@ -1,0 +1,2 @@
+compare_hold_bars,baseline_hold_bars,trade_count,avg_realized_return_pct,avg_best_net_exit_pct,avg_missed_opportunity_pct,materially_worse_than_best_frac,avg_delta_baseline_minus_compare_pct,giveback_frac_pct,peak_before_baseline_exit_frac
+15,20,50,0.12184010238515589,1.4331379576472008,1.3112978552620456,96.0,0.09404996504580583,43.28358208955223,100.0

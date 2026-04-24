@@ -1,0 +1,22 @@
+{
+  "strategy_mode": "volatility_expansion",
+  "classification": "reject",
+  "reason": "Raw forward returns stay negative through the longer horizon ladder and realized expectancy remains non-positive; best raw horizon was 20 bars at -0.486%.",
+  "forward_horizons": [
+    4,
+    6,
+    8,
+    10,
+    15,
+    20,
+    30
+  ],
+  "hold_horizons": [
+    4,
+    8,
+    10,
+    15,
+    20,
+    30
+  ]
+}

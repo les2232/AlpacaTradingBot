@@ -1,12 +1,10 @@
 {
-  "timestamp": "2026-04-14T11:48:22Z",
-  "should_trade": false,
-  "approved": false,
+  "timestamp": "2026-04-17T00:00:00Z",
+  "should_trade": true,
+  "approved": true,
   "stable": true,
   "disabled_by_regime": false,
-  "rejection_reasons": [
-    "profit_factor 1.1890 >= 1.2"
-  ],
+  "rejection_reasons": [],
   "stability_reasons": [],
   "market_regime": "sideways",
   "regime_avg_vol": 0.001742,

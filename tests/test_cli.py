@@ -7,6 +7,7 @@ import pytest
 from dotenv import load_dotenv
 
 from alpaca_trading_bot import cli
+from trading_bot import BotConfig, RuntimeConfigDetails
 
 
 def _cleanup_tree(path: Path) -> None:
@@ -126,10 +127,17 @@ def test_run_live_refuses_non_paper_execution(monkeypatch: pytest.MonkeyPatch) -
         symbols=["AMD", "MSFT"],
     )
     fake_module = SimpleNamespace(
-        load_config_details=lambda: SimpleNamespace(config=config, runtime_config_path=None, overridden_fields=()),
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path=None,
+            overridden_fields=(),
+            runtime_config_approved=None,
+            runtime_config_rejection_reasons=(),
+        ),
         main=lambda **kwargs: None,
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.setattr(cli, "_live_instance_lock", cli.contextlib.nullcontext)
 
     with pytest.raises(RuntimeError, match="ALPACA_PAPER=false"):
         cli._run_live(preview=False)
@@ -151,7 +159,13 @@ def test_run_preview_allows_non_paper_but_disables_execution(monkeypatch: pytest
         assert session_id is not None
 
     fake_module = SimpleNamespace(
-        load_config_details=lambda: SimpleNamespace(config=config, runtime_config_path=None, overridden_fields=()),
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path=None,
+            overridden_fields=(),
+            runtime_config_approved=None,
+            runtime_config_rejection_reasons=(),
+        ),
         main=fake_main,
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
@@ -165,7 +179,10 @@ def test_run_preview_allows_non_paper_but_disables_execution(monkeypatch: pytest
 def test_run_live_refuses_second_live_instance(monkeypatch: pytest.MonkeyPatch) -> None:
     lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
     log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
-    lock_path.write_text('{"pid": 4242, "command": "tradeos live"}', encoding="utf-8")
+    lock_path.write_text(
+        '{"pid": 4242, "command": "tradeos live", "process_started_at_utc": "2026-04-16T14:00:00+00:00"}',
+        encoding="utf-8",
+    )
     config = SimpleNamespace(
         paper=True,
         strategy_mode="mean_reversion",
@@ -183,13 +200,28 @@ def test_run_live_refuses_second_live_instance(monkeypatch: pytest.MonkeyPatch) 
     )
 
     fake_module = SimpleNamespace(
-        load_config_details=lambda: SimpleNamespace(config=config, runtime_config_path="config/live_config.json", overridden_fields=("symbols",)),
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+        ),
         main=lambda **kwargs: None,
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.setattr(cli, "LIVE_BOT_LOCK_PATH", lock_path)
     monkeypatch.setattr(cli, "LOG_ROOT", log_root)
     monkeypatch.setattr(cli, "_pid_is_running", lambda pid: pid == 4242)
+    monkeypatch.setattr(
+        cli,
+        "_read_process_identity",
+        lambda pid: {
+            "pid": pid,
+            "started_at_utc": "2026-04-16T14:00:00+00:00",
+            "command_line": "python -m tradeos live",
+        },
+    )
 
     try:
         with pytest.raises(RuntimeError, match="second live bot instance"):
@@ -229,13 +261,30 @@ def test_run_live_replaces_stale_lock_and_cleans_up(
         assert session_id is not None
 
     fake_module = SimpleNamespace(
-        load_config_details=lambda: SimpleNamespace(config=config, runtime_config_path="config/live_config.json", overridden_fields=("symbols",)),
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+        ),
         main=fake_main,
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.setattr(cli, "LIVE_BOT_LOCK_PATH", lock_path)
     monkeypatch.setattr(cli, "LOG_ROOT", log_root)
     monkeypatch.setattr(cli, "_pid_is_running", lambda pid: False)
+    monkeypatch.setattr(
+        cli,
+        "_read_process_identity",
+        lambda pid: {
+            "pid": pid,
+            "started_at_utc": "2026-04-16T14:00:00+00:00",
+            "command_line": "python -m tradeos live",
+        }
+        if pid == cli.os.getpid()
+        else {},
+    )
 
     try:
         exit_code = cli._run_live(preview=False)
@@ -268,12 +317,27 @@ def test_run_live_reports_lock_acquired(monkeypatch: pytest.MonkeyPatch, capsys:
     )
 
     fake_module = SimpleNamespace(
-        load_config_details=lambda: SimpleNamespace(config=config, runtime_config_path="config/live_config.json", overridden_fields=("symbols", "strategy_mode")),
-            main=lambda **kwargs: None,
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols", "strategy_mode"),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+        ),
+        main=lambda **kwargs: None,
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.setattr(cli, "LIVE_BOT_LOCK_PATH", lock_path)
     monkeypatch.setattr(cli, "LOG_ROOT", log_root)
+    monkeypatch.setattr(
+        cli,
+        "_read_process_identity",
+        lambda pid: {
+            "pid": pid,
+            "started_at_utc": "2026-04-16T14:00:00+00:00",
+            "command_line": "python -m tradeos live",
+        },
+    )
 
     try:
         exit_code = cli._run_live(preview=False)
@@ -308,7 +372,13 @@ def test_run_live_loads_dotenv_before_resolving_config(monkeypatch: pytest.Monke
 
     def fake_load_config_details():
         called.append("load_config_details")
-        return SimpleNamespace(config=config, runtime_config_path="config/live_config.json", overridden_fields=("symbols",))
+        return SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+        )
 
     fake_module = SimpleNamespace(
         load_config_details=fake_load_config_details,
@@ -321,11 +391,84 @@ def test_run_live_loads_dotenv_before_resolving_config(monkeypatch: pytest.Monke
 
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.setattr(cli, "load_dotenv", fake_load_dotenv)
+    monkeypatch.setattr(
+        cli,
+        "_read_process_identity",
+        lambda pid: {
+            "pid": pid,
+            "started_at_utc": "2026-04-16T14:00:00+00:00",
+            "command_line": "python -m tradeos live",
+        },
+    )
 
     exit_code = cli._run_live(preview=True)
 
     assert exit_code == 0
     assert called[:2] == ["load_dotenv", "load_config_details"]
+
+
+def test_run_live_acquires_lock_before_loading_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
+    log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
+    observed: dict[str, bool] = {"lock_seen_during_load": False, "lock_seen_during_main": False}
+    config = SimpleNamespace(
+        paper=True,
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        symbols=["AMD"],
+        sma_bars=20,
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+    )
+
+    def fake_load_config_details():
+        observed["lock_seen_during_load"] = lock_path.exists()
+        return SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+        )
+
+    def fake_main(*, config=None, session_id=None) -> None:
+        observed["lock_seen_during_main"] = lock_path.exists()
+        assert config is not None
+        assert session_id is not None
+
+    fake_module = SimpleNamespace(
+        load_config_details=fake_load_config_details,
+        main=fake_main,
+    )
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.setattr(cli, "LIVE_BOT_LOCK_PATH", lock_path)
+    monkeypatch.setattr(cli, "LOG_ROOT", log_root)
+    monkeypatch.setattr(
+        cli,
+        "_read_process_identity",
+        lambda pid: {
+            "pid": pid,
+            "started_at_utc": "2026-04-16T14:00:00+00:00",
+            "command_line": "python -m tradeos live",
+        },
+    )
+
+    try:
+        exit_code = cli._run_live(preview=False)
+
+        assert exit_code == 0
+        assert observed["lock_seen_during_load"] is True
+        assert observed["lock_seen_during_main"] is True
+        assert not lock_path.exists()
+    finally:
+        lock_path.unlink(missing_ok=True)
+        _cleanup_tree(log_root)
 
 
 def test_run_live_recovers_malformed_lock(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -349,12 +492,27 @@ def test_run_live_recovers_malformed_lock(monkeypatch: pytest.MonkeyPatch, capsy
     )
 
     fake_module = SimpleNamespace(
-        load_config_details=lambda: SimpleNamespace(config=config, runtime_config_path="config/live_config.json", overridden_fields=("symbols",)),
-            main=lambda **kwargs: None,
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+        ),
+        main=lambda **kwargs: None,
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.setattr(cli, "LIVE_BOT_LOCK_PATH", lock_path)
     monkeypatch.setattr(cli, "LOG_ROOT", log_root)
+    monkeypatch.setattr(
+        cli,
+        "_read_process_identity",
+        lambda pid: {
+            "pid": pid,
+            "started_at_utc": "2026-04-16T14:00:00+00:00",
+            "command_line": "python -m tradeos live",
+        },
+    )
 
     try:
         exit_code = cli._run_live(preview=False)
@@ -362,6 +520,269 @@ def test_run_live_recovers_malformed_lock(monkeypatch: pytest.MonkeyPatch, capsy
 
         assert exit_code == 0
         assert "Recovered malformed live bot lock" in output
+        assert not lock_path.exists()
+    finally:
+        lock_path.unlink(missing_ok=True)
+        _cleanup_tree(log_root)
+
+
+def test_run_live_refuses_unapproved_runtime_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = SimpleNamespace(
+        paper=True,
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        symbols=["AMD"],
+    )
+    fake_module = SimpleNamespace(
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=False,
+            runtime_config_rejection_reasons=("profit_factor 1.0169 >= 1.2",),
+            baseline_valid_for_comparison=True,
+            baseline_validation_errors=(),
+        ),
+        main=lambda **kwargs: None,
+    )
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.delenv(cli.ALLOW_UNAPPROVED_RUNTIME_ENV, raising=False)
+    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
+    monkeypatch.setattr(cli, "_live_instance_lock", cli.contextlib.nullcontext)
+
+    with pytest.raises(RuntimeError, match="unapproved runtime config"):
+        cli._run_live(preview=False)
+
+
+def test_run_live_allows_unapproved_runtime_with_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
+    log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
+    called: dict[str, bool] = {"main": False}
+    config = SimpleNamespace(
+        paper=True,
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        symbols=["AMD"],
+        sma_bars=20,
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+    )
+
+    def fake_main(*, config=None, session_id=None) -> None:
+        called["main"] = True
+        assert config is not None
+        assert session_id is not None
+
+    fake_module = SimpleNamespace(
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=False,
+            runtime_config_rejection_reasons=("profit_factor 1.0169 >= 1.2",),
+            baseline_valid_for_comparison=True,
+            baseline_validation_errors=(),
+        ),
+        main=fake_main,
+    )
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.setattr(cli, "LIVE_BOT_LOCK_PATH", lock_path)
+    monkeypatch.setattr(cli, "LOG_ROOT", log_root)
+    monkeypatch.setenv(cli.ALLOW_UNAPPROVED_RUNTIME_ENV, "true")
+    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
+    monkeypatch.setattr(
+        cli,
+        "_read_process_identity",
+        lambda pid: {
+            "pid": pid,
+            "started_at_utc": "2026-04-16T14:00:00+00:00",
+            "command_line": "python -m tradeos live",
+        },
+    )
+
+    try:
+        exit_code = cli._run_live(preview=False)
+
+        assert exit_code == 0
+        assert called["main"] is True
+        assert not lock_path.exists()
+    finally:
+        lock_path.unlink(missing_ok=True)
+        _cleanup_tree(log_root)
+
+
+def test_run_live_refuses_baseline_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = SimpleNamespace(
+        paper=True,
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        symbols=["AMD"],
+    )
+    fake_module = SimpleNamespace(
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+            baseline_valid_for_comparison=False,
+            baseline_validation_errors=("research config does not match live runtime",),
+        ),
+        main=lambda **kwargs: None,
+    )
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.delenv(cli.ALLOW_BASELINE_MISMATCH_ENV, raising=False)
+    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
+    monkeypatch.setattr(cli, "_live_instance_lock", cli.contextlib.nullcontext)
+
+    with pytest.raises(RuntimeError, match="does not match the promoted baseline"):
+        cli._run_live(preview=False)
+
+
+def test_run_live_allows_baseline_mismatch_with_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called: dict[str, bool] = {"main": False}
+    config = SimpleNamespace(
+        paper=True,
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        symbols=["AMD"],
+        sma_bars=20,
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+    )
+
+    def fake_main(*, config=None, session_id=None) -> None:
+        called["main"] = True
+        assert config is not None
+        assert session_id is not None
+
+    fake_module = SimpleNamespace(
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+            baseline_valid_for_comparison=False,
+            baseline_validation_errors=("research config does not match live runtime",),
+        ),
+        main=fake_main,
+    )
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.setenv(cli.ALLOW_BASELINE_MISMATCH_ENV, "true")
+    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
+    monkeypatch.setattr(cli, "_live_instance_lock", cli.contextlib.nullcontext)
+
+    exit_code = cli._run_live(preview=False)
+
+    assert exit_code == 0
+    assert called["main"] is True
+
+
+def test_attach_baseline_validation_supports_frozen_runtime_details(monkeypatch: pytest.MonkeyPatch) -> None:
+    details = RuntimeConfigDetails(
+        config=BotConfig(
+            symbols=["AMD"],
+            max_usd_per_trade=200.0,
+            max_symbol_exposure_usd=200.0,
+            max_open_positions=3,
+            max_daily_loss_usd=300.0,
+            sma_bars=20,
+            bar_timeframe_minutes=15,
+        ),
+        runtime_config_path="config/live_config.json",
+        overridden_fields=("symbols",),
+        runtime_config_approved=True,
+        runtime_config_rejection_reasons=(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_backtest_baseline",
+        lambda project_root: (
+            None,
+            {
+                "valid_for_comparison": False,
+                "validation_errors": ["research config does not match live runtime"],
+            },
+        ),
+    )
+
+    updated = cli._attach_baseline_validation(details)
+
+    assert updated is not details
+    assert updated.baseline_valid_for_comparison is False
+    assert updated.baseline_validation_errors == ("research config does not match live runtime",)
+
+
+def test_run_live_recovers_reused_pid_lock(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
+    log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
+    lock_path.write_text(
+        '{"pid": 4242, "command": "tradeos live", "process_started_at_utc": "2026-04-16T09:30:00+00:00"}',
+        encoding="utf-8",
+    )
+    config = SimpleNamespace(
+        paper=True,
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        symbols=["AMD"],
+        sma_bars=20,
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        max_orders_per_minute=6,
+        max_price_deviation_bps=75.0,
+        max_live_price_age_seconds=60,
+        max_data_delay_seconds=300,
+    )
+
+    fake_module = SimpleNamespace(
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=("symbols",),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+        ),
+        main=lambda **kwargs: None,
+    )
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.setattr(cli, "LIVE_BOT_LOCK_PATH", lock_path)
+    monkeypatch.setattr(cli, "LOG_ROOT", log_root)
+    monkeypatch.setattr(cli, "_pid_is_running", lambda pid: True)
+    monkeypatch.setattr(
+        cli,
+        "_read_process_identity",
+        lambda pid: {
+            "pid": pid,
+            "started_at_utc": "2026-04-16T10:45:00+00:00" if pid == 4242 else "2026-04-16T14:00:00+00:00",
+            "command_line": "python -m tradeos live" if pid == cli.os.getpid() else "python unrelated.py",
+        },
+    )
+
+    try:
+        exit_code = cli._run_live(preview=False)
+        output = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "Recovered stale live bot lock" in output
         assert not lock_path.exists()
     finally:
         lock_path.unlink(missing_ok=True)
@@ -377,17 +798,36 @@ def test_persist_startup_config_writes_live_artifact(monkeypatch: pytest.MonkeyP
             bar_timeframe_minutes=15,
             sma_bars=20,
             symbols=["AMD", "MSFT"],
+            historical_feed="iex",
+            live_feed="iex",
+            latest_bar_feed="iex",
+            bar_build_mode="stream_minute_aggregate",
+            apply_updated_bars=True,
+            post_bar_reconcile_poll=True,
+            block_trading_until_resync=True,
+            assert_feed_on_startup=True,
+            log_bar_components=True,
             max_usd_per_trade=200.0,
             max_symbol_exposure_usd=200.0,
             max_open_positions=3,
             max_daily_loss_usd=300.0,
-            max_orders_per_minute=6,
-            max_price_deviation_bps=75.0,
-            max_live_price_age_seconds=60,
-            max_data_delay_seconds=300,
-        ),
+                max_orders_per_minute=6,
+                max_price_deviation_bps=75.0,
+                max_live_price_age_seconds=60,
+                max_data_delay_seconds=300,
+                ml_lookback_bars=320,
+                breakout_max_stop_pct=0.03,
+                sma_stop_pct=0.0,
+                mean_reversion_exit_style="sma",
+                mean_reversion_max_atr_percentile=0.0,
+                mean_reversion_trend_filter=False,
+                mean_reversion_trend_slope_filter=False,
+                mean_reversion_stop_pct=0.0,
+            ),
         runtime_config_path="config/live_config.json",
         overridden_fields=("symbols", "strategy_mode"),
+        runtime_config_approved=True,
+        runtime_config_rejection_reasons=(),
     )
     monkeypatch.setattr(cli, "LOG_ROOT", log_root)
     monkeypatch.setenv("BOT_DB_PATH", "bot_history.db")
@@ -404,7 +844,23 @@ def test_persist_startup_config_writes_live_artifact(monkeypatch: pytest.MonkeyP
         assert payload["execution_enabled"] is True
         assert payload["paper"] is True
         assert payload["symbols"] == ["AMD", "MSFT"]
+        assert payload["historical_feed"] == "iex"
+        assert payload["live_feed"] == "iex"
+        assert payload["latest_bar_feed"] == "iex"
+        assert payload["bar_build_mode"] == "stream_minute_aggregate"
+        assert payload["apply_updated_bars"] is True
+        assert payload["post_bar_reconcile_poll"] is True
+        assert payload["block_trading_until_resync"] is True
         assert payload["runtime_overrides"] == ["symbols", "strategy_mode"]
+        assert payload["runtime_config_approved"] is True
+        assert payload["runtime_config_rejection_reasons"] == []
+        assert payload["ml_lookback_bars"] == 320
+        assert payload["breakout_max_stop_pct"] == 0.03
+        assert payload["sma_stop_pct"] == 0.0
+        assert payload["mean_reversion_exit_style"] == "sma"
+        assert payload["mean_reversion_trend_filter"] is False
+        assert payload["mean_reversion_trend_slope_filter"] is False
+        assert payload["mean_reversion_stop_pct"] == 0.0
         assert latest_payload == payload
     finally:
         if log_root.exists():
@@ -413,3 +869,11 @@ def test_persist_startup_config_writes_live_artifact(monkeypatch: pytest.MonkeyP
                     child.unlink()
                 else:
                     child.rmdir()
+
+
+def test_pid_is_running_uses_process_identity_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.os, "name", "nt")
+    monkeypatch.setattr(cli, "_read_process_identity", lambda pid: {"pid": pid, "command_line": "python -m tradeos live"})
+
+    assert cli._pid_is_running(15592) is True
+    assert cli._pid_is_running(0) is False

@@ -1,0 +1,3 @@
+window_idx,family,selected_variant_id,selection_expectancy,selection_trade_count,train_start,train_end,test_start,test_end
+1,baseline,baseline_lb20_top20_hold5,-1.218265408638873,179,2026-01-14,2026-03-12,2026-03-13,2026-04-10
+1,pullback,pullback_lb20_top20_hold5_pb0.5,-1.366048209682193,156,2026-01-14,2026-03-12,2026-03-13,2026-04-10

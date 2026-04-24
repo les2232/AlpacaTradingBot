@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
+from research.experiment_log import log_experiment_run
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -301,6 +302,44 @@ def main() -> None:
     if not summary_df.empty:
         print("\nTop runs:")
         print(summary_df.to_string(index=False))
+        best_row = summary_df.iloc[0].to_dict()
+        log_experiment_run(
+            run_type="backtest_experiment_batch",
+            script_path=__file__,
+            entrypoint=sys.argv[0],
+            strategy_name=str(best_row.get("run") or args.preset),
+            dataset_path=args.dataset,
+            params={
+                "preset": args.preset,
+                "run_name": args.run_name,
+                "skip_existing": args.skip_existing,
+                "jobs": [
+                    {
+                        "name": job.name,
+                        "output_stem": job.output_stem,
+                        "extra_args": list(job.extra_args),
+                    }
+                    for job in jobs
+                ],
+            },
+            metrics={
+                "total_return_pct": best_row.get("total_return_pct"),
+                "profit_factor": best_row.get("profit_factor"),
+                "sharpe": best_row.get("sharpe_ratio"),
+                "win_rate": best_row.get("win_rate"),
+                "max_drawdown_pct": best_row.get("max_drawdown_pct"),
+                "trade_count": best_row.get("total_trades"),
+                "expectancy": best_row.get("expectancy"),
+                "realized_pnl": best_row.get("realized_pnl"),
+            },
+            output_path=output_dir,
+            summary_path=summary_csv,
+            extra_fields={
+                "best_run_name": best_row.get("run"),
+                "report_path": str(report_md),
+                "comparison_per_symbol_path": str(per_symbol_csv) if per_symbol_df.empty is False else None,
+            },
+        )
 
 
 if __name__ == "__main__":

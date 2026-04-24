@@ -1,0 +1,19 @@
+{
+  "classification": {
+    "label": "reject",
+    "reason": "The strategy shows no positive raw continuation horizon and no realized edge on this sample."
+  },
+  "baseline": {
+    "strategy_mode": "volatility_expansion",
+    "signal_count": 4,
+    "closed_trade_count": 4,
+    "backtest_result": {
+      "realized_pnl": -24.597254028803604,
+      "expectancy": -6.149313507200901,
+      "win_rate": 0.0,
+      "profit_factor": 0.0,
+      "max_drawdown_pct": 0.32754867498459134,
+      "avg_holding_bars": 5.0
+    }
+  }
+}

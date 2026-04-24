@@ -18,6 +18,12 @@ Active live mode: **`mean_reversion`** (set in `config/live_config.json`, valida
   - indicator/filter settings
 - If `config/live_config.json` differs from `.env`, the bot will override `.env` for supported runtime fields and print which fields were overridden at startup.
 
+## Supported Interfaces
+
+- The supported operational interface is the `tradeos` CLI.
+- The supported monitoring UI is the Streamlit dashboard.
+- The older desktop UI layer has been intentionally removed and should not be recreated as part of routine operational work.
+
 ## One Operator Workflow
 
 Use exactly one execution process and one monitoring process.
@@ -28,7 +34,15 @@ Use exactly one execution process and one monitoring process.
 .\start_dashboard.ps1
 ```
 
-This is the preferred launcher. By default it starts `tradeos live`, then starts or reuses the dashboard, and opens the browser when the dashboard is ready.
+This is the preferred launcher. By default it starts `tradeos live`, then starts or reuses the dashboard, and opens the browser when the dashboard is ready. It also keeps the live approval gate on by default.
+
+If you are deliberately testing an unapproved research config, use the explicit override:
+
+```powershell
+.\start_dashboard.ps1 -AllowUnapprovedRuntime
+```
+
+Treat that as a temporary research-mode launch, not the normal production path.
 
 2. Confirm the startup summary matches expectations:
    - `account=paper`

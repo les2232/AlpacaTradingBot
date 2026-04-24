@@ -8,6 +8,7 @@ This document freezes the default trading behavior for the bot. The symbol unive
 - Asset class: US listed equities only.
 - Strategy style: intraday long-only signal trading.
 - Execution style: market orders only.
+- Supported operator surfaces: `tradeos` CLI plus the Streamlit dashboard. The legacy desktop UI has been intentionally removed.
 
 ## Configurable Inputs
 
@@ -163,6 +164,7 @@ See `config/live_config.json` for the runtime source of truth.
   - runs sweeps
   - ranks results
   - writes decision artifacts such as `best_config_latest.json`, `stability_report.json`, and `trade_decision.json`
+- Additional validation and experiment scripts now live under `research/`, with root-level wrappers preserved where compatibility still matters.
 - [run_compare_suite.ps1](run_compare_suite.ps1) is a fixed benchmarking wrapper:
   - it uses predefined datasets
   - compares `sma`, `ml`, and `hybrid`

@@ -107,5 +107,110 @@ def test_load_backtest_baseline_uses_live_config_and_research_artifact() -> None
         assert baseline["win_rate"] == 0.75
         assert source["mode"] == "live_config+research"
         assert source["research_metrics_used"] is True
+        assert source["valid_for_comparison"] is True
+    finally:
+        shutil.rmtree(base_dir, ignore_errors=True)
+
+
+def test_load_backtest_baseline_rejects_unapproved_or_mismatched_research() -> None:
+    base_dir = Path.cwd() / f"test_daily_report_baseline_invalid_{uuid.uuid4().hex}"
+    try:
+        (base_dir / "config").mkdir(parents=True)
+        (base_dir / "results").mkdir(parents=True)
+        (base_dir / "config" / "live_config.json").write_text(
+            json.dumps(
+                {
+                    "source": {
+                        "approved": False,
+                        "rejection_reasons": ["profit_factor 1.01 >= 1.2"],
+                    },
+                    "runtime": {
+                        "symbols": ["AMD", "MSFT", "TSLA"],
+                        "bar_timeframe_minutes": 15,
+                        "strategy_mode": "mean_reversion",
+                        "sma_bars": 15,
+                        "entry_threshold_pct": 0.0015,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (base_dir / "results" / "best_config_latest.json").write_text(
+            json.dumps(
+                {
+                    "approved": False,
+                    "rejection_reasons": ["profit_factor 1.18 >= 1.2"],
+                    "config": {
+                        "strategy_mode": "mean_reversion",
+                        "sma_bars": 20,
+                        "entry_threshold_pct": 0.002,
+                    },
+                    "performance": {
+                        "trades_per_day": 6.0,
+                        "win_rate": 75.0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        baseline, source = daily_report.load_backtest_baseline(base_dir)
+
+        assert baseline["symbols"] == 3
+        assert baseline["bars_per_day"] == 26
+        assert baseline["signal_rate_per_symbol_per_day"] == daily_report.DEFAULT_BACKTEST["signal_rate_per_symbol_per_day"]
+        assert baseline["win_rate"] == daily_report.DEFAULT_BACKTEST["win_rate"]
+        assert source["research_metrics_used"] is False
+        assert source["valid_for_comparison"] is False
+        assert source["live_config_approved"] is False
+        assert source["research_approved"] is False
+        assert source["research_matches_live_runtime"] is False
+        assert any("live config is approved=false" in item for item in source["validation_errors"])
+        assert any("research artifact is approved=false" in item for item in source["validation_errors"])
+        assert any("research config does not match live runtime" in item for item in source["validation_errors"])
+    finally:
+        shutil.rmtree(base_dir, ignore_errors=True)
+
+
+def test_load_backtest_baseline_parses_string_approval_flags() -> None:
+    base_dir = Path.cwd() / f"test_daily_report_baseline_string_bool_{uuid.uuid4().hex}"
+    try:
+        (base_dir / "config").mkdir(parents=True)
+        (base_dir / "results").mkdir(parents=True)
+        (base_dir / "config" / "live_config.json").write_text(
+            json.dumps(
+                {
+                    "source": {
+                        "approved": "false",
+                        "rejection_reasons": ["not approved yet"],
+                    },
+                    "runtime": {
+                        "symbols": ["AMD"],
+                        "bar_timeframe_minutes": 15,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (base_dir / "results" / "best_config_latest.json").write_text(
+            json.dumps(
+                {
+                    "approved": "false",
+                    "rejection_reasons": ["not approved yet"],
+                    "config": {},
+                    "performance": {
+                        "trades_per_day": 2.0,
+                        "win_rate": 80.0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        _, source = daily_report.load_backtest_baseline(base_dir)
+
+        assert source["live_config_approved"] is False
+        assert source["research_approved"] is False
+        assert source["valid_for_comparison"] is False
     finally:
         shutil.rmtree(base_dir, ignore_errors=True)

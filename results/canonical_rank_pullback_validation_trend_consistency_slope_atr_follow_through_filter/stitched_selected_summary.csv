@@ -1,0 +1,3 @@
+variant_id,family,score_mode,rank_lookback_bars,eligible_percent,pullback_depth_atr,hold_bars,use_early_no_follow_through_exit,use_recent_follow_through_filter,trade_count,expectancy,win_rate,profit_factor,avg_hold_bars,total_pnl,total_return_pct,max_drawdown_pct,top_positive_symbol_share
+selected_baseline_stitched_oos,baseline,trend_consistency_20_x_slope_20_over_atr_20,,,,6,False,False,57,-0.11376739258032022,63.1578947368421,0.9896681083525739,6.666666666666667,-6.484741377078253,-0.6484741377078214,6.683771688160106,0.4358799438863734
+selected_pullback_stitched_oos,pullback,trend_consistency_20_x_slope_20_over_atr_20,,,,6,False,False,40,-2.341419096857365,50.0,0.7397236717929423,6.375,-93.6567638742946,-9.36567638742946,3.525440155332366,0.5164883308849884

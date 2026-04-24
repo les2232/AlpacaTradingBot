@@ -1,0 +1,9 @@
+symbol,side,price,shares,timestamp,entry_branch,pnl,holding_bars,exit_reason,research_exit_fill
+AMD,BUY,256.815,3.893853552167903,2026-01-28 14:45:00+00:00,,,,,
+AMD,SELL,252.81,3.893853552167903,2026-01-28 15:45:00+00:00,,-15.614883476432396,5.0,volatility_expansion_fixed_bars_exit,next_open
+C,BUY,116.11,8.612522607871846,2026-02-26 14:45:00+00:00,,,,,
+C,SELL,115.415,8.612522607871846,2026-02-26 15:45:00+00:00,,-6.0057032124708485,5.0,volatility_expansion_fixed_bars_exit,next_open
+AMD,BUY,199.56,5.0110242533573865,2026-03-18 14:00:00+00:00,,,,,
+JPM,BUY,288.38,3.4676468548443027,2026-03-18 14:00:00+00:00,,,,,
+AMD,SELL,199.23,5.0110242533573865,2026-03-18 15:00:00+00:00,,-1.6736380036079481,5.0,volatility_expansion_fixed_bars_exit,next_open
+JPM,SELL,288.01,3.4676468548443027,2026-03-18 15:00:00+00:00,,-1.3030293362924112,5.0,volatility_expansion_fixed_bars_exit,next_open

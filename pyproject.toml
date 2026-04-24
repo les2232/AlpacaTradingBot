@@ -40,6 +40,7 @@ py-modules = [
     "storage",
     "strategy",
     "symbol_state",
+    "strategy_report",
     "trading_bot",
     "universe",
     "vwap_atr_sweep",
@@ -47,7 +48,7 @@ py-modules = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["alpaca_trading_bot", "tradeos", "tradeos.*", "ml"]
+include = ["alpaca_trading_bot", "tradeos", "tradeos.*", "ml", "research", "research.*"]
 
 [tool.setuptools.package-data]
 ml = ["models/*.pkl"]

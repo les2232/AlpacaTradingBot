@@ -1,0 +1,4 @@
+{
+  "classification": "feed_quality_issue",
+  "reason": "The comparison dataset retains bars at these timestamps while the aligned target dataset does not, which points to feed-specific availability problems that alignment then propagates."
+}

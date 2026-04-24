@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from avatar import generate_near_miss_narration, generate_trade_narration
+from drift_monitor import BaselineProfile, DriftAlert, DriftReport, LiveMetrics, build_drift_report
 from storage import BotStorage
 from symbol_state import format_symbol_list, normalize_symbols, symbols_match
 
@@ -98,6 +99,20 @@ class PersistedSignalDecision:
     atr_pct: float | None
     atr_percentile: float | None
     volume_ratio: float | None
+    strategy_mode: str | None = None
+    final_signal_reason: str | None = None
+    decision_summary: str | None = None
+    hybrid_branch_active: str | None = None
+    hybrid_entry_branch: str | None = None
+    hybrid_regime_branch: str | None = None
+    mr_signal: str | None = None
+    trend_sma_slope: float | None = None
+    entry_reference_price: float | None = None
+    exit_reference_price: float | None = None
+    stop_reference_price: float | None = None
+    vwap: float | None = None
+    adx: float | None = None
+    regime_state: str | None = None
     rejection: str | None = None
     trend_filter: str | None = None
     atr_filter: str | None = None
@@ -142,6 +157,33 @@ class PersistedStartupConfig:
     max_live_price_age_seconds: int
     max_data_delay_seconds: int
     db_path: str
+    ml_lookback_bars: int = 0
+    breakout_max_stop_pct: float = 0.0
+    sma_stop_pct: float = 0.0
+    mean_reversion_exit_style: str = ""
+    mean_reversion_max_atr_percentile: float = 0.0
+    mean_reversion_trend_filter: bool = False
+    mean_reversion_trend_slope_filter: bool = False
+    mean_reversion_stop_pct: float = 0.0
+    historical_feed: str = ""
+    live_feed: str = ""
+    latest_bar_feed: str = ""
+    bar_build_mode: str = ""
+    apply_updated_bars: bool = False
+    post_bar_reconcile_poll: bool = False
+    block_trading_until_resync: bool = False
+    assert_feed_on_startup: bool = False
+    log_bar_components: bool = False
+    resync_status: str | None = None
+    resync_started_at_utc: str | None = None
+    resync_completed_at_utc: str | None = None
+    resync_reason_codes: tuple[str, ...] = ()
+    gate_allows_entries: bool | None = None
+    gate_allows_exits: bool | None = None
+    runtime_config_approved: bool | None = None
+    runtime_config_rejection_reasons: tuple[str, ...] = ()
+    baseline_valid_for_comparison: bool | None = None
+    baseline_validation_errors: tuple[str, ...] = ()
     artifact_path: str | None = None
 
 
@@ -189,6 +231,17 @@ class DrilldownEvent:
 
 
 @dataclass(frozen=True)
+class PersistedActivityItem:
+    observed_at_utc: str | None
+    event_type: str
+    title: str
+    body: str
+    level: str = "info"
+    symbol: str | None = None
+    decision_timestamp: str | None = None
+
+
+@dataclass(frozen=True)
 class DashboardState:
     startup_config: PersistedStartupConfig | None
     storage: BotStorage
@@ -210,6 +263,8 @@ class DashboardState:
     recent_narrations: tuple[PersistedNarration, ...] = ()
     recent_near_misses: tuple[PersistedNearMiss, ...] = ()
     drilldown_candidates: tuple[DrilldownEvent, ...] = ()
+    recent_activity: tuple[PersistedActivityItem, ...] = ()
+    drift_report: DriftReport | None = None
 
 
 def _log_root() -> Path:
@@ -260,7 +315,48 @@ def _startup_config_from_payload(payload: dict[str, object], artifact_path: Path
         max_price_deviation_bps=float(payload.get("max_price_deviation_bps", 0.0) or 0.0),
         max_live_price_age_seconds=int(payload.get("max_live_price_age_seconds", 0) or 0),
         max_data_delay_seconds=int(payload.get("max_data_delay_seconds", 0) or 0),
+        ml_lookback_bars=int(payload.get("ml_lookback_bars", 0) or 0),
+        breakout_max_stop_pct=float(payload.get("breakout_max_stop_pct", 0.0) or 0.0),
+        sma_stop_pct=float(payload.get("sma_stop_pct", 0.0) or 0.0),
+        mean_reversion_exit_style=str(payload.get("mean_reversion_exit_style", "") or ""),
+        mean_reversion_max_atr_percentile=float(payload.get("mean_reversion_max_atr_percentile", 0.0) or 0.0),
+        mean_reversion_trend_filter=bool(payload.get("mean_reversion_trend_filter", False)),
+        mean_reversion_trend_slope_filter=bool(payload.get("mean_reversion_trend_slope_filter", False)),
+        mean_reversion_stop_pct=float(payload.get("mean_reversion_stop_pct", 0.0) or 0.0),
         db_path=str(payload.get("db_path", "bot_history.db") or "bot_history.db"),
+        historical_feed=str(payload.get("historical_feed", "") or ""),
+        live_feed=str(payload.get("live_feed", "") or ""),
+        latest_bar_feed=str(payload.get("latest_bar_feed", "") or ""),
+        bar_build_mode=str(payload.get("bar_build_mode", "") or ""),
+        apply_updated_bars=bool(payload.get("apply_updated_bars", False)),
+        post_bar_reconcile_poll=bool(payload.get("post_bar_reconcile_poll", False)),
+        block_trading_until_resync=bool(payload.get("block_trading_until_resync", False)),
+        assert_feed_on_startup=bool(payload.get("assert_feed_on_startup", False)),
+        log_bar_components=bool(payload.get("log_bar_components", False)),
+        resync_status=str(payload.get("resync_status", "")) or None,
+        resync_started_at_utc=str(payload.get("resync_started_at_utc", "")) or None,
+        resync_completed_at_utc=str(payload.get("resync_completed_at_utc", "")) or None,
+        resync_reason_codes=tuple(
+            str(item) for item in payload.get("resync_reason_codes", []) if str(item)
+        ),
+        gate_allows_entries=payload.get("gate_allows_entries")
+        if isinstance(payload.get("gate_allows_entries"), bool)
+        else None,
+        gate_allows_exits=payload.get("gate_allows_exits")
+        if isinstance(payload.get("gate_allows_exits"), bool)
+        else None,
+        runtime_config_approved=payload.get("runtime_config_approved")
+        if isinstance(payload.get("runtime_config_approved"), bool)
+        else None,
+        runtime_config_rejection_reasons=tuple(
+            str(item) for item in payload.get("runtime_config_rejection_reasons", []) if str(item)
+        ),
+        baseline_valid_for_comparison=payload.get("baseline_valid_for_comparison")
+        if isinstance(payload.get("baseline_valid_for_comparison"), bool)
+        else None,
+        baseline_validation_errors=tuple(
+            str(item) for item in payload.get("baseline_validation_errors", []) if str(item)
+        ),
         artifact_path=str(artifact_path) if artifact_path is not None else None,
     )
 
@@ -286,7 +382,55 @@ def _load_latest_jsonl_event(path: Path, event_name: str | None = None) -> dict[
     return None
 
 
-def _load_jsonl_events(path: Path, event_names: set[str] | None = None, limit: int | None = None) -> list[dict[str, object]]:
+def _next_startup_started_at(
+    startup_configs: list[PersistedStartupConfig],
+    startup_config: PersistedStartupConfig | None,
+) -> str | None:
+    if startup_config is None:
+        return None
+    for index, candidate in enumerate(startup_configs):
+        if candidate == startup_config and index + 1 < len(startup_configs):
+            return startup_configs[index + 1].started_at_utc
+    return None
+
+
+def _payload_matches_session(
+    payload: dict[str, object],
+    *,
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
+) -> bool:
+    if session_id:
+        payload_session_id = str(payload.get("session_id", "")) or None
+        if payload_session_id:
+            return payload_session_id == session_id
+
+    payload_ts = (
+        str(payload.get("ts", "")) or None
+        or str(payload.get("decision_ts", "")) or None
+    )
+    payload_dt = _parse_iso_utc(payload_ts)
+    start_dt = _parse_iso_utc(started_at_utc)
+    end_dt = _parse_iso_utc(ended_before_utc)
+    if payload_dt is None:
+        return session_id is None and started_at_utc is None and ended_before_utc is None
+    if start_dt is not None and payload_dt < start_dt:
+        return False
+    if end_dt is not None and payload_dt >= end_dt:
+        return False
+    return True
+
+
+def _load_jsonl_events(
+    path: Path,
+    event_names: set[str] | None = None,
+    limit: int | None = None,
+    *,
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
+) -> list[dict[str, object]]:
     if not path.exists():
         return []
     try:
@@ -307,6 +451,13 @@ def _load_jsonl_events(path: Path, event_names: set[str] | None = None, limit: i
             continue
         if event_names is not None and str(payload.get("event", "")) not in event_names:
             continue
+        if not _payload_matches_session(
+            payload,
+            session_id=session_id,
+            started_at_utc=started_at_utc,
+            ended_before_utc=ended_before_utc,
+        ):
+            continue
         results.append(payload)
         if limit is not None and len(results) >= limit:
             break
@@ -315,11 +466,24 @@ def _load_jsonl_events(path: Path, event_names: set[str] | None = None, limit: i
     return results
 
 
-def _load_latest_cycle_report() -> PersistedCycleReport | None:
+def _load_latest_cycle_report(
+    *,
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
+) -> PersistedCycleReport | None:
     log_dir = _latest_log_dir()
     if log_dir is None:
         return None
-    payload = _load_latest_jsonl_event(log_dir / "risk.jsonl", "cycle.summary")
+    rows = _load_jsonl_events(
+        log_dir / "risk.jsonl",
+        {"cycle.summary"},
+        limit=1,
+        session_id=session_id,
+        started_at_utc=started_at_utc,
+        ended_before_utc=ended_before_utc,
+    )
+    payload = rows[-1] if rows else None
     if payload is None:
         return None
     return PersistedCycleReport(
@@ -336,12 +500,33 @@ def _load_latest_cycle_report() -> PersistedCycleReport | None:
     )
 
 
-def _load_feed_status() -> str:
+def _load_feed_status(
+    *,
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
+) -> str:
     log_dir = _latest_log_dir()
     if log_dir is None:
         return "no persisted logs yet"
-    stale_warning = _load_latest_jsonl_event(log_dir / "bars.jsonl", "bar.stale_warning")
-    bar_received = _load_latest_jsonl_event(log_dir / "bars.jsonl", "bar.received")
+    stale_rows = _load_jsonl_events(
+        log_dir / "bars.jsonl",
+        {"bar.stale_warning"},
+        limit=1,
+        session_id=session_id,
+        started_at_utc=started_at_utc,
+        ended_before_utc=ended_before_utc,
+    )
+    received_rows = _load_jsonl_events(
+        log_dir / "bars.jsonl",
+        {"bar.received"},
+        limit=1,
+        session_id=session_id,
+        started_at_utc=started_at_utc,
+        ended_before_utc=ended_before_utc,
+    )
+    stale_warning = stale_rows[-1] if stale_rows else None
+    bar_received = received_rows[-1] if received_rows else None
     # Use whichever event is more recent so a pre-market stale_warning doesn't
     # persist as the status after fresh bars arrive during the session.
     stale_ts = str(stale_warning.get("ts", "")) if stale_warning else ""
@@ -426,6 +611,7 @@ def _decision_timestamp_from_trace(trace: object) -> str | None:
 
 def _build_session_warnings(
     startup_config: PersistedStartupConfig | None,
+    latest_startup_config: PersistedStartupConfig | None,
     snapshot: PersistedBotSnapshot,
     has_persisted_snapshot: bool,
     last_cycle_report: PersistedCycleReport | None,
@@ -435,6 +621,21 @@ def _build_session_warnings(
 
     if startup_config is None:
         return ()
+    latest_started_at = _parse_iso_utc(latest_startup_config.started_at_utc) if latest_startup_config is not None else None
+    selected_started_at = _parse_iso_utc(startup_config.started_at_utc)
+    if (
+        latest_startup_config is not None
+        and latest_startup_config != startup_config
+        and latest_started_at is not None
+        and selected_started_at is not None
+        and latest_started_at > selected_started_at
+    ):
+        launch_time = latest_started_at.astimezone().strftime("%b %d, %Y %I:%M %p %Z")
+        warnings.append(
+            "A newer TradeOS launch started at "
+            f"{launch_time}, but it has not saved session data yet. "
+            "The dashboard is showing the most recent persisted session instead."
+        )
     if ignored_snapshot_symbols:
         warnings.append(
             "Current config symbols: "
@@ -442,6 +643,17 @@ def _build_session_warnings(
             "Latest persisted snapshot symbols: "
             f"[{format_symbol_list(ignored_snapshot_symbols)}]. "
             "Persisted symbol state is from a different run and is being ignored."
+        )
+    if startup_config.runtime_config_approved is False:
+        reasons = "; ".join(startup_config.runtime_config_rejection_reasons)
+        detail = (
+            f" Current runtime approval notes: {reasons}."
+            if reasons else
+            " Current runtime approval notes are unavailable."
+        )
+        warnings.append(
+            "This session is using a runtime config that is marked unapproved for live trading."
+            + detail
         )
 
     return tuple(warnings)
@@ -452,9 +664,60 @@ def _select_startup_config_for_session(
     snapshot: PersistedBotSnapshot,
     has_persisted_snapshot: bool,
     last_cycle_report: PersistedCycleReport | None,
+    latest_run_session_id: str | None = None,
 ) -> PersistedStartupConfig | None:
     if not startup_configs:
         return None
+    if latest_run_session_id:
+        matching = [
+            config
+            for config in startup_configs
+            if (config.session_id or "") == latest_run_session_id
+        ]
+        if matching:
+            return max(matching, key=lambda item: _parse_iso_utc(item.started_at_utc) or datetime.min)
+    target_timestamps: list[datetime] = []
+    if has_persisted_snapshot:
+        snapshot_dt = _parse_iso_utc(snapshot.timestamp_utc)
+        if snapshot_dt is not None:
+            target_timestamps.append(snapshot_dt)
+    if last_cycle_report is not None:
+        cycle_dt = _parse_iso_utc(last_cycle_report.decision_timestamp) or _parse_iso_utc(
+            last_cycle_report.observed_at_utc
+        )
+        if cycle_dt is not None:
+            target_timestamps.append(cycle_dt)
+
+    def _config_windows() -> list[tuple[PersistedStartupConfig, datetime | None, datetime | None]]:
+        windows: list[tuple[PersistedStartupConfig, datetime | None, datetime | None]] = []
+        for index, config in enumerate(startup_configs):
+            start_dt = _parse_iso_utc(config.started_at_utc)
+            next_dt = (
+                _parse_iso_utc(startup_configs[index + 1].started_at_utc)
+                if index + 1 < len(startup_configs)
+                else None
+            )
+            windows.append((config, start_dt, next_dt))
+        return windows
+
+    config_windows = _config_windows()
+    for target_dt in target_timestamps:
+        for config, start_dt, next_dt in config_windows:
+            if start_dt is not None and target_dt < start_dt:
+                continue
+            if next_dt is not None and target_dt >= next_dt:
+                continue
+            return config
+
+    if target_timestamps:
+        latest_target = max(target_timestamps)
+        eligible = [
+            config
+            for config, start_dt, _ in config_windows
+            if start_dt is not None and start_dt <= latest_target
+        ]
+        if eligible:
+            return max(eligible, key=lambda item: _parse_iso_utc(item.started_at_utc) or datetime.min)
     return max(startup_configs, key=lambda item: _parse_iso_utc(item.started_at_utc) or datetime.min)
 
 def _build_snapshot(storage: BotStorage, session_id: str | None = None) -> tuple[PersistedBotSnapshot, bool]:
@@ -560,6 +823,9 @@ def _execution_reason(payload: dict[str, object]) -> str | None:
 
 def _load_recent_execution_activity(
     last_cycle_report: PersistedCycleReport | None,
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
     limit: int = 5,
 ) -> tuple[PersistedExecutionActivity, ...]:
     log_dir = _latest_log_dir()
@@ -568,9 +834,9 @@ def _load_recent_execution_activity(
     latest_cycle_ts = last_cycle_report.decision_timestamp if last_cycle_report is not None else None
 
     events: list[dict[str, object]] = []
-    events.extend(_load_jsonl_events(log_dir / "execution.jsonl", {"order.submitted", "order.filled", "order.partial_fill", "order.rejected"}, limit=20))
-    events.extend(_load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}, limit=20))
-    events.extend(_load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=40))
+    events.extend(_load_jsonl_events(log_dir / "execution.jsonl", {"order.submitted", "order.filled", "order.partial_fill", "order.rejected"}, limit=20, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc))
+    events.extend(_load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}, limit=20, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc))
+    events.extend(_load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=40, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc))
 
     normalized: list[tuple[datetime, PersistedExecutionActivity]] = []
     for payload in events:
@@ -658,13 +924,22 @@ def _load_recent_execution_activity(
 
 def _load_latest_cycle_risk_checks(
     last_cycle_report: PersistedCycleReport | None,
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
 ) -> tuple[PersistedRiskCheck, ...]:
     if last_cycle_report is None:
         return ()
     log_dir = _latest_log_dir()
     if log_dir is None:
         return ()
-    rows = _load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"})
+    rows = _load_jsonl_events(
+        log_dir / "risk.jsonl",
+        {"risk.check"},
+        session_id=session_id,
+        started_at_utc=started_at_utc,
+        ended_before_utc=ended_before_utc,
+    )
     target = last_cycle_report.decision_timestamp
     checks: list[PersistedRiskCheck] = []
     for payload in rows:
@@ -688,12 +963,23 @@ def _load_latest_cycle_risk_checks(
     return tuple(checks)
 
 
-def _load_session_block_reason_counts() -> tuple[tuple[str, int], ...]:
+def _load_session_block_reason_counts(
+    *,
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
+) -> tuple[tuple[str, int], ...]:
     log_dir = _latest_log_dir()
     if log_dir is None:
         return ()
     counts: dict[str, int] = {}
-    for payload in _load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}):
+    for payload in _load_jsonl_events(
+        log_dir / "risk.jsonl",
+        {"risk.check"},
+        session_id=session_id,
+        started_at_utc=started_at_utc,
+        ended_before_utc=ended_before_utc,
+    ):
         action = str(payload.get("action", "")).upper()
         if action not in {"BUY", "SELL"}:
             continue
@@ -704,11 +990,22 @@ def _load_session_block_reason_counts() -> tuple[tuple[str, int], ...]:
     return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
-def _load_latest_signal_rows() -> tuple[PersistedSignalDecision, ...]:
+def _load_latest_signal_rows(
+    *,
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
+) -> tuple[PersistedSignalDecision, ...]:
     log_dir = _latest_log_dir()
     if log_dir is None:
         return ()
-    rows = _load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"})
+    rows = _load_jsonl_events(
+        log_dir / "signals.jsonl",
+        {"signal.evaluated"},
+        session_id=session_id,
+        started_at_utc=started_at_utc,
+        ended_before_utc=ended_before_utc,
+    )
     if not rows:
         return ()
 
@@ -736,6 +1033,20 @@ def _load_latest_signal_rows() -> tuple[PersistedSignalDecision, ...]:
             atr_pct=_to_float(payload.get("atr_pct")),
             atr_percentile=_to_float(payload.get("atr_percentile")),
             volume_ratio=_to_float(payload.get("volume_ratio")),
+            strategy_mode=str(payload.get("strategy_mode", "")) or None,
+            final_signal_reason=str(payload.get("final_signal_reason", "")) or None,
+            decision_summary=str(payload.get("decision_summary", "")) or None,
+            hybrid_branch_active=str(payload.get("hybrid_branch_active", "")) or None,
+            hybrid_entry_branch=str(payload.get("hybrid_entry_branch", "")) or None,
+            hybrid_regime_branch=str(payload.get("hybrid_regime_branch", "")) or None,
+            mr_signal=str(payload.get("mr_signal", "")) or None,
+            trend_sma_slope=_to_float(payload.get("trend_sma_slope")),
+            entry_reference_price=_to_float(payload.get("entry_reference_price")),
+            exit_reference_price=_to_float(payload.get("exit_reference_price")),
+            stop_reference_price=_to_float(payload.get("stop_reference_price")),
+            vwap=_to_float(payload.get("vwap")),
+            adx=_to_float(payload.get("adx")),
+            regime_state=str(payload.get("regime_state", "")) or None,
             rejection=str(payload.get("rejection", "")) or None,
             trend_filter=str(payload.get("trend_filter", "")) or None,
             atr_filter=str(payload.get("atr_filter", "")) or None,
@@ -745,7 +1056,12 @@ def _load_latest_signal_rows() -> tuple[PersistedSignalDecision, ...]:
     return tuple(sorted(latest_by_symbol.values(), key=lambda item: item.symbol))
 
 
-def _load_recent_narrations(limit: int = 10) -> tuple[PersistedNarration, ...]:
+def _load_recent_narrations(
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
+    limit: int = 10,
+) -> tuple[PersistedNarration, ...]:
     """
     Load and narrate the most recent actionable events from today's JSONL logs.
 
@@ -763,18 +1079,18 @@ def _load_recent_narrations(limit: int = 10) -> tuple[PersistedNarration, ...]:
     raw_events: list[dict] = []
 
     # Fetch recent signal events; filter to only actionable BUY/SELL decisions
-    for payload in _load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=60):
+    for payload in _load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=60, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc):
         if str(payload.get("action", "")).upper() in {"BUY", "SELL"}:
             raw_events.append(payload)
 
     # Fetch risk blocks only
-    for payload in _load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}, limit=40):
+    for payload in _load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}, limit=40, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc):
         if payload.get("allowed") is False:
             raw_events.append(payload)
 
     # Fetch position closes
     raw_events.extend(
-        _load_jsonl_events(log_dir / "positions.jsonl", {"position.closed"}, limit=20)
+        _load_jsonl_events(log_dir / "positions.jsonl", {"position.closed"}, limit=20, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc)
     )
 
     # Sort newest first
@@ -840,7 +1156,12 @@ def _qualifies_as_near_miss(event: dict) -> bool:
     )
 
 
-def _load_recent_near_misses(limit: int = 5) -> tuple[PersistedNearMiss, ...]:
+def _load_recent_near_misses(
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
+    limit: int = 5,
+) -> tuple[PersistedNearMiss, ...]:
     """
     Load the most recent near-miss signal events from today's signals.jsonl.
 
@@ -856,7 +1177,7 @@ def _load_recent_near_misses(limit: int = 5) -> tuple[PersistedNearMiss, ...]:
         return ()
 
     raw: list[dict] = []
-    for payload in _load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=120):
+    for payload in _load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=120, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc):
         if _qualifies_as_near_miss(payload):
             raw.append(payload)
 
@@ -898,6 +1219,9 @@ def _load_recent_near_misses(limit: int = 5) -> tuple[PersistedNearMiss, ...]:
 
 def _load_drilldown_candidates(
     strategy_mode: str | None,
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
     limit: int = 40,
 ) -> tuple[DrilldownEvent, ...]:
     """
@@ -912,9 +1236,9 @@ def _load_drilldown_candidates(
         return ()
 
     raw: list[dict] = []
-    raw.extend(_load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=60))
-    raw.extend(_load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}, limit=40))
-    raw.extend(_load_jsonl_events(log_dir / "positions.jsonl", {"position.closed"}, limit=20))
+    raw.extend(_load_jsonl_events(log_dir / "signals.jsonl", {"signal.evaluated"}, limit=60, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc))
+    raw.extend(_load_jsonl_events(log_dir / "risk.jsonl", {"risk.check"}, limit=40, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc))
+    raw.extend(_load_jsonl_events(log_dir / "positions.jsonl", {"position.closed"}, limit=20, session_id=session_id, started_at_utc=started_at_utc, ended_before_utc=ended_before_utc))
 
     def _ts_key(p: dict) -> datetime:
         return _parse_iso_utc(str(p.get("ts", ""))) or datetime.min.replace(tzinfo=timezone.utc)
@@ -972,19 +1296,216 @@ def _load_drilldown_candidates(
     return tuple(results)
 
 
+def _pretty_activity_text(value: object | None, fallback: str = "unknown") -> str:
+    text = str(value or "").strip().replace("_", " ")
+    return text if text else fallback
+
+
+def _load_recent_activity(
+    session_id: str | None = None,
+    started_at_utc: str | None = None,
+    ended_before_utc: str | None = None,
+    limit: int = 12,
+) -> tuple[PersistedActivityItem, ...]:
+    log_dir = _latest_log_dir()
+    if log_dir is None:
+        return ()
+
+    event_specs = {
+        log_dir / "execution.jsonl": {"order.submitted", "order.filled", "order.partial_fill", "order.rejected"},
+        log_dir / "risk.jsonl": {"risk.check", "cycle.summary", "execution.error", "kill_switch.warning", "kill_switch.triggered"},
+        log_dir / "signals.jsonl": {"signal.evaluated"},
+        log_dir / "bars.jsonl": {"bar.stale_warning"},
+        log_dir / "positions.jsonl": {"position.opened", "position.closed"},
+    }
+
+    raw_events: list[dict[str, object]] = []
+    for path, names in event_specs.items():
+        raw_events.extend(
+            _load_jsonl_events(
+                path,
+                names,
+                limit=40,
+                session_id=session_id,
+                started_at_utc=started_at_utc,
+                ended_before_utc=ended_before_utc,
+            )
+        )
+
+    def _ts_key(payload: dict[str, object]) -> datetime:
+        return _parse_iso_utc(str(payload.get("ts", ""))) or datetime.min.replace(tzinfo=timezone.utc)
+
+    raw_events.sort(key=_ts_key, reverse=True)
+
+    items: list[PersistedActivityItem] = []
+    seen: set[tuple[str | None, str, str | None, str | None]] = set()
+    for payload in raw_events:
+        event = str(payload.get("event", ""))
+        observed_at = str(payload.get("ts", "")) or None
+        symbol = str(payload.get("symbol", "")).upper() or None
+        decision_timestamp = (
+            str(payload.get("decision_ts", "")) or None
+            or _decision_timestamp_from_trace(payload.get("trace"))
+        )
+        dedupe_key = (observed_at, event, symbol, decision_timestamp)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        title = ""
+        body = ""
+        level = "info"
+
+        if event == "cycle.summary":
+            processed = bool(payload.get("processed_bar"))
+            skip_reason = _pretty_activity_text(payload.get("skip_reason"))
+            buy_count = int(payload.get("buy_signals", 0) or 0)
+            sell_count = int(payload.get("sell_signals", 0) or 0)
+            hold_count = int(payload.get("hold_signals", 0) or 0)
+            order_count = int(payload.get("orders_submitted", 0) or 0)
+            title = "Decision cycle recorded" if processed else "Cycle skipped"
+            body = (
+                f"{buy_count} buys, {sell_count} sells, {hold_count} holds, {order_count} orders. "
+                f"Outcome: {skip_reason}."
+            )
+            level = "warn" if not processed or order_count == 0 and (buy_count or sell_count) else "info"
+        elif event == "risk.check":
+            action = str(payload.get("action", "")).upper() or "CHECK"
+            allowed = bool(payload.get("allowed"))
+            if allowed:
+                title = f"{action} cleared risk checks"
+                body = f"{symbol or 'Signal'} passed the current live safety gates."
+                level = "info"
+            else:
+                block_reason = _pretty_activity_text(payload.get("block_reason"))
+                detail = str(payload.get("detail", "")).strip()
+                title = f"{action} blocked"
+                body = f"{symbol or 'Signal'} was blocked by {block_reason}."
+                if detail:
+                    body = f"{body} {detail}"
+                level = "warn"
+        elif event == "signal.evaluated":
+            action = str(payload.get("action", "")).upper() or "HOLD"
+            rejection = str(payload.get("rejection", "")).strip()
+            if action in {"BUY", "SELL"}:
+                title = f"{action} signal detected"
+                body = f"{symbol or 'Symbol'} produced an actionable {action.lower()} signal on the latest saved bar."
+                level = "info"
+            elif rejection:
+                title = "Setup rejected"
+                body = f"{symbol or 'Symbol'} was evaluated but held because {_pretty_activity_text(rejection)}."
+                level = "warn"
+            else:
+                title = "No actionable signal"
+                body = f"{symbol or 'Symbol'} was evaluated and no trade was taken."
+                level = "info"
+        elif event == "order.submitted":
+            side = str(payload.get("side", "")).upper() or "ORDER"
+            qty = payload.get("qty")
+            title = f"{side} order submitted"
+            body = f"{symbol or 'Order'} submitted"
+            if qty is not None:
+                body = f"{body} for {float(qty):.2f} shares."
+            else:
+                body = f"{body}."
+            level = "info"
+        elif event == "order.filled":
+            side = str(payload.get("side", "")).upper() or "ORDER"
+            fill_price = _to_float(payload.get("fill_price"))
+            title = f"{side} order filled"
+            body = f"{symbol or 'Order'} filled"
+            if fill_price is not None:
+                body = f"{body} at ${fill_price:,.2f}."
+            else:
+                body = f"{body}."
+            level = "info"
+        elif event == "order.partial_fill":
+            title = "Partial fill"
+            body = f"{symbol or 'Order'} filled partially and may still be working."
+            level = "warn"
+        elif event == "order.rejected":
+            reason = _pretty_activity_text(payload.get("reason"))
+            title = "Order rejected"
+            body = f"{symbol or 'Order'} was rejected: {reason}."
+            level = "err"
+        elif event == "position.opened":
+            title = "Position opened"
+            body = f"{symbol or 'Position'} is now open."
+            level = "info"
+        elif event == "position.closed":
+            exit_reason = _pretty_activity_text(payload.get("exit_reason"))
+            pnl = _to_float(payload.get("pnl_usd"))
+            body = f"{symbol or 'Position'} closed via {exit_reason}."
+            if pnl is not None:
+                body = f"{body} Realized PnL: ${pnl:,.2f}."
+            title = "Position closed"
+            level = "info"
+        elif event == "bar.stale_warning":
+            age_s = _to_float(payload.get("bar_age_s"))
+            title = "Bar data arrived late"
+            body = (
+                f"{symbol or 'A symbol'} latest completed bar was stale"
+                + (f" by {age_s:.0f}s." if age_s is not None else ".")
+            )
+            level = "warn"
+        elif event == "execution.error":
+            action = str(payload.get("action", "")).upper() or "EXECUTION"
+            error = str(payload.get("error", "")).strip() or "unknown error"
+            title = f"{action} execution error"
+            body = f"{symbol or 'Execution'} hit an error: {error}."
+            level = "err"
+        elif event in {"kill_switch.warning", "kill_switch.triggered"}:
+            reason = _pretty_activity_text(payload.get("reason"))
+            title = "Kill switch warning" if event == "kill_switch.warning" else "Kill switch triggered"
+            body = f"Risk control update: {reason}."
+            level = "warn" if event == "kill_switch.warning" else "err"
+
+        if not title or not body:
+            continue
+
+        items.append(
+            PersistedActivityItem(
+                observed_at_utc=observed_at,
+                event_type=event,
+                title=title,
+                body=body,
+                level=level,
+                symbol=symbol,
+                decision_timestamp=decision_timestamp,
+            )
+        )
+        if len(items) >= limit:
+            break
+
+    return tuple(items)
+
+
 def load_dashboard_state() -> DashboardState:
     startup_configs = _load_startup_configs()
     latest_startup_config = startup_configs[-1] if startup_configs else None
     db_path = Path(latest_startup_config.db_path if latest_startup_config is not None else os.getenv("BOT_DB_PATH", "bot_history.db"))
     storage = BotStorage(db_path)
-    last_cycle_report = _load_latest_cycle_report()
-    feed_status = _load_feed_status()
+    latest_run = storage.get_latest_run()
     latest_snapshot, has_latest_snapshot = _build_snapshot(storage)
     startup_config = _select_startup_config_for_session(
         startup_configs=startup_configs,
         snapshot=latest_snapshot,
         has_persisted_snapshot=has_latest_snapshot,
-        last_cycle_report=last_cycle_report,
+        last_cycle_report=None,
+        latest_run_session_id=str(latest_run.get("session_id", "")) or None if latest_run is not None else None,
+    )
+    session_id = startup_config.session_id if startup_config is not None else None
+    session_started_at = startup_config.started_at_utc if startup_config is not None else None
+    session_ended_before = _next_startup_started_at(startup_configs, startup_config)
+    last_cycle_report = _load_latest_cycle_report(
+        session_id=session_id,
+        started_at_utc=session_started_at,
+        ended_before_utc=session_ended_before,
+    )
+    feed_status = _load_feed_status(
+        session_id=session_id,
+        started_at_utc=session_started_at,
+        ended_before_utc=session_ended_before,
     )
     session_id = startup_config.session_id if startup_config is not None else None
     snapshot, has_persisted_snapshot = _build_snapshot(storage, session_id=session_id)
@@ -1002,19 +1523,91 @@ def load_dashboard_state() -> DashboardState:
             symbol_state_status = "current_runtime_symbols"
     session_warnings = _build_session_warnings(
         startup_config=startup_config,
+        latest_startup_config=latest_startup_config,
         snapshot=snapshot,
         has_persisted_snapshot=has_persisted_snapshot,
         last_cycle_report=last_cycle_report,
         ignored_snapshot_symbols=ignored_snapshot_symbols,
     )
-    latest_signal_rows = _load_latest_signal_rows()
-    latest_cycle_risk_checks = _load_latest_cycle_risk_checks(last_cycle_report)
-    session_block_reason_counts = _load_session_block_reason_counts()
+    latest_signal_rows = _load_latest_signal_rows(
+        session_id=session_id,
+        started_at_utc=session_started_at,
+        ended_before_utc=session_ended_before,
+    )
+    latest_cycle_risk_checks = _load_latest_cycle_risk_checks(
+        last_cycle_report,
+        session_id=session_id,
+        started_at_utc=session_started_at,
+        ended_before_utc=session_ended_before,
+    )
+    session_block_reason_counts = _load_session_block_reason_counts(
+        session_id=session_id,
+        started_at_utc=session_started_at,
+        ended_before_utc=session_ended_before,
+    )
     session_first_prices = storage.get_session_first_prices(session_id=session_id)
-    recent_narrations = _load_recent_narrations()
-    recent_near_misses = _load_recent_near_misses()
+    recent_narrations = _load_recent_narrations(
+        session_id=session_id,
+        started_at_utc=session_started_at,
+        ended_before_utc=session_ended_before,
+    )
+    recent_near_misses = _load_recent_near_misses(
+        session_id=session_id,
+        started_at_utc=session_started_at,
+        ended_before_utc=session_ended_before,
+    )
     _strategy_mode = startup_config.strategy_mode if startup_config is not None else None
-    drilldown_candidates = _load_drilldown_candidates(_strategy_mode)
+    drilldown_candidates = _load_drilldown_candidates(
+        _strategy_mode,
+        session_id=session_id,
+        started_at_utc=session_started_at,
+        ended_before_utc=session_ended_before,
+    )
+    log_dir = _latest_log_dir()
+    drift_report = None
+    if log_dir is not None:
+        signal_events = list(
+            _load_jsonl_events(
+                log_dir / "signals.jsonl",
+                {"signal.evaluated"},
+                session_id=session_id,
+                started_at_utc=session_started_at,
+                ended_before_utc=session_ended_before,
+            )
+        )
+        bar_events = list(
+            _load_jsonl_events(
+                log_dir / "bars.jsonl",
+                {"bar.received", "bar.stale_warning"},
+                session_id=session_id,
+                started_at_utc=session_started_at,
+                ended_before_utc=session_ended_before,
+            )
+        )
+        risk_events = list(
+            _load_jsonl_events(
+                log_dir / "risk.jsonl",
+                {"risk.check"},
+                session_id=session_id,
+                started_at_utc=session_started_at,
+                ended_before_utc=session_ended_before,
+            )
+        )
+        position_events = list(
+            _load_jsonl_events(
+                log_dir / "positions.jsonl",
+                {"position.closed"},
+                session_id=session_id,
+                started_at_utc=session_started_at,
+                ended_before_utc=session_ended_before,
+            )
+        )
+        drift_report = build_drift_report(
+            signal_events=signal_events,
+            bar_events=bar_events,
+            risk_events=risk_events,
+            position_events=position_events,
+        )
     return DashboardState(
         startup_config=startup_config,
         storage=storage,
@@ -1036,4 +1629,10 @@ def load_dashboard_state() -> DashboardState:
         recent_narrations=recent_narrations,
         recent_near_misses=recent_near_misses,
         drilldown_candidates=drilldown_candidates,
+        recent_activity=_load_recent_activity(
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        ),
+        drift_report=drift_report,
     )

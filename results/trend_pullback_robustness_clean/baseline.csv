@@ -1,0 +1,2 @@
+section,scenario,symbols,start_date,end_date,signal_count,trade_count,realized_pnl,expectancy,win_rate,profit_factor,max_drawdown_pct,avg_holding_period,best_raw_horizon_bars,best_raw_net_expectancy_pct
+baseline,baseline,"AMD,JPM,HON,C",,,201,50,60.920051192577944,1.2184010238515588,50.0,1.1778525601464405,2.2017641617286388,21.0,20,0.23024954006230092

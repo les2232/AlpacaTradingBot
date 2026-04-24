@@ -1,0 +1,6 @@
+{
+  "dataset": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__sip__97d4a1837aaa__regular",
+  "timeframe": "15Min",
+  "classification": "benign",
+  "reason": "The dataset uses a consistent intraday timestamp grid; no within-session spacing problems were detected."
+}

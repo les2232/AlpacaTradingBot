@@ -1,10 +1,8 @@
 {
-  "saved_at": "2026-04-14T11:48:22Z",
+  "saved_at": "2026-04-17T00:00:00Z",
   "dataset": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e",
-  "approved": false,
-  "rejection_reasons": [
-    "profit_factor 1.1890 >= 1.2"
-  ],
+  "approved": true,
+  "rejection_reasons": [],
   "config": {
     "strategy_mode": "mean_reversion",
     "sma_bars": 15,

@@ -26,6 +26,31 @@ def test_storage_claim_decision_timestamp_is_global_and_single_use() -> None:
     assert second_claim is False
 
 
+def test_storage_claim_order_fill_is_global_and_single_use() -> None:
+    db_path = Path.cwd() / f"test_order_fill_claim_{uuid4().hex}.db"
+    storage = BotStorage(db_path)
+
+    first_claim = storage.claim_order_fill(
+        "order-123",
+        5.0,
+        "2026-04-10T18:00:05+00:00",
+    )
+    second_claim = storage.claim_order_fill(
+        "order-123",
+        5.0,
+        "2026-04-10T18:00:06+00:00",
+    )
+    distinct_qty_claim = storage.claim_order_fill(
+        "order-123",
+        10.0,
+        "2026-04-10T18:00:07+00:00",
+    )
+
+    assert first_claim is True
+    assert second_claim is False
+    assert distinct_qty_claim is True
+
+
 @dataclass
 class _DummyAccount:
     cash: float = 1000.0

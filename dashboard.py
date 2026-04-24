@@ -1,15 +1,18 @@
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 import html
+from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 _ET = ZoneInfo("America/New_York")
+_SESSION_FLATTEN_AT = dt_time(15, 55)
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 from dashboard_state import DashboardState, DrilldownEvent, load_dashboard_state
+from research.experiment_log import DEFAULT_LOG_PATH, load_experiment_log_frame
 
 st.set_page_config(page_title="TradeOS", layout="wide")
 
@@ -18,7 +21,57 @@ def _strategy_mode_uses_ml(strategy_mode: str | None) -> bool:
     return str(strategy_mode or "").strip().lower() in {"ml", "hybrid"}
 
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
+def _live_bot_process_health() -> tuple[str, str]:
+    lock_path = Path.cwd() / ".live_bot.lock"
+    try:
+        from alpaca_trading_bot.cli import _live_lock_matches_running_process, _read_live_lock_metadata
+    except Exception:
+        return "unknown", "Live bot process health is unavailable in this dashboard context."
+
+    try:
+        metadata = _read_live_lock_metadata()
+    except Exception:
+        return "unknown", "Live bot process metadata could not be read safely."
+
+    if not metadata:
+        if lock_path.exists():
+            return "stale_lock", "A live bot lock file exists but could not be parsed."
+        return "missing", "No active TradeOS live process was detected."
+
+    pid = int(metadata.get("pid", 0) or 0)
+    if _live_lock_matches_running_process(metadata):
+        return "running", f"Live bot process detected (pid={pid})."
+    if pid > 0:
+        return "stale_lock", f"Live bot lock points to pid={pid}, but that process is no longer healthy."
+    return "stale_lock", "A stale live bot lock is present."
+
+
+def _process_health_summary() -> tuple[str, str, str]:
+    health, note = _live_bot_process_health()
+    if health == "running":
+        return "Process live", note, "good"
+    if health == "unknown":
+        return "Process unknown", note, "warn"
+    return "Process offline", note, "err"
+
+
+def _resync_status_summary(state: DashboardState) -> tuple[str, str, str]:
+    cfg = state.startup_config
+    status = str(getattr(cfg, "resync_status", "") or "").strip().upper()
+    if not status:
+        return "Resync unknown", "This session does not have persisted startup resync metadata yet.", "warn"
+    if status == "RESYNC_OK":
+        return "Resync OK", "Broker state was recovered and the bot is allowed to trade normally.", "good"
+    if status == "RESYNC_DEGRADED":
+        return "Resync degraded", "Broker exposure was recovered, but the bot should remain exits-only.", "warn"
+    if status == "RESYNC_FAILED":
+        return "Resync failed", "Startup reconciliation did not finish safely, so trading should remain blocked.", "err"
+    if status == "RESYNC_LOCKED":
+        return "Resync locked", "Startup reconciliation is still in progress, so new trading should remain blocked.", "warn"
+    return f"Resync {status.lower()}", f"Startup reconciliation reported {status}.", "warn"
+
+
+# â”€â”€ CSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _inject_css() -> None:
     st.markdown(
@@ -26,28 +79,65 @@ def _inject_css() -> None:
         <style>
         @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;700&display=swap');
         :root {
-            --bg: #0b111b;
-            --panel: rgba(14, 22, 35, 0.92);
-            --panel-strong: rgba(18, 28, 43, 0.98);
-            --panel-soft: rgba(255,255,255,0.035);
-            --line: rgba(148, 163, 184, 0.16);
-            --text: #edf4ff;
-            --text-soft: #adc1d9;
-            --text-dim: #71859c;
-            --accent: #67b8ff;
-            --accent-2: #4ce2c5;
-            --glow: 0 18px 50px rgba(5, 10, 20, 0.36);
+            --font-family-ui: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+
+            --font-size-xxs: 12px;
+            --font-size-xs: 13px;
+            --font-size-sm: 15px;
+            --font-size-md: 16px;
+            --font-size-lg: 18px;
+            --font-size-xl: 22px;
+            --font-size-2xl: 30px;
+
+            --font-weight-regular: 400;
+            --font-weight-medium: 500;
+            --font-weight-semibold: 600;
+            --font-weight-bold: 700;
+
+            --text-primary: #E6EDF3;
+            --text-secondary: #9DA7B3;
+            --text-muted: #6B7480;
+
+            --line-height-tight: 1.2;
+            --line-height-snug: 1.35;
+            --line-height-normal: 1.48;
+            --line-height-relaxed: 1.58;
+
+            --letter-spacing-tight: -0.02em;
+            --letter-spacing-normal: 0;
+            --letter-spacing-wide: 0.08em;
+
+            --bg: #0B0F14;
+            --panel: #151B23;
+            --panel-strong: #151B23;
+            --panel-soft: #151B23;
+            --line: #1F2733;
+            --text: var(--text-primary);
+            --text-soft: var(--text-secondary);
+            --text-dim: var(--text-muted);
+            --accent: #E6EDF3;
+            --accent-2: #E6EDF3;
+            --glow: none;
+            --success: #3FB950;
+            --warning: #D29922;
+            --error: #F85149;
+            --success-bg: rgba(63, 185, 80, 0.12);
+            --warning-bg: rgba(210, 153, 34, 0.12);
+            --error-bg: rgba(248, 81, 73, 0.12);
+            --muted-bg: rgba(157, 167, 179, 0.10);
         }
-        html, body, [class*="css"] { font-family: 'DM Sans', 'Segoe UI', sans-serif; font-size: 20px; }
+        html, body, [class*="css"] {
+            font-family: var(--font-family-ui);
+            font-size: var(--font-size-md);
+            font-weight: var(--font-weight-regular);
+            line-height: var(--line-height-normal);
+            letter-spacing: var(--letter-spacing-normal);
+        }
         code, pre, .mono { font-family: 'DM Mono', 'Consolas', monospace; }
 
         .stApp {
-            background:
-                radial-gradient(circle at top left, rgba(71, 132, 255, 0.14), transparent 28%),
-                radial-gradient(circle at 85% 0%, rgba(76, 226, 197, 0.10), transparent 20%),
-                radial-gradient(circle at 50% 20%, rgba(255,255,255,0.03), transparent 35%),
-                linear-gradient(180deg, #08101a 0%, #0b111b 35%, #0b111b 100%);
-            color: #d8e0ec;
+            background: var(--bg);
+            color: var(--text);
         }
         .block-container {
             padding-top: 1.2rem;
@@ -83,7 +173,7 @@ def _inject_css() -> None:
         .dot-rest  { background: #facc15; }
         .dot-error { background: #f87171; }
 
-        /* Badges — rectangular chip style, DM Mono, semi-transparent tints */
+        /* Badges â€” rectangular chip style, DM Mono, semi-transparent tints */
         .badge {
             display: inline-block;
             border-radius: 4px;
@@ -174,7 +264,7 @@ def _inject_css() -> None:
             font-weight: 600;
         }
 
-        /* ── v2 dashboard layout ─────────────────────────────────── */
+        /* â”€â”€ v2 dashboard layout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
         .config-stack {
             display: flex;
             flex-direction: column;
@@ -452,21 +542,50 @@ def _inject_css() -> None:
         }
 
         /* Detail history table */
-        .hist-wrap { max-height: 280px; overflow-y: auto; border: 0.5px solid rgba(255,255,255,0.07); background: rgba(255,255,255,0.015); border-radius: 10px; }
+        .hist-wrap {
+            max-height: 320px;
+            overflow-y: auto;
+            border: 1px solid rgba(255,255,255,0.07);
+            background: linear-gradient(180deg, rgba(255,255,255,0.022), rgba(255,255,255,0.012));
+            border-radius: 14px;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+        }
         .hist-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        .hist-table th { position: sticky; top: 0; background: rgba(15,17,23,0.96); padding: 9px 11px; text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .11em; color: #647b96; border-bottom: 0.5px solid rgba(255,255,255,0.07); font-weight: 500; font-family: 'DM Sans', sans-serif; }
-        .hist-table td { padding: 9px 11px; border-bottom: 0.5px solid rgba(255,255,255,0.04); color: #c7d3df; }
+        .hist-table th {
+            position: sticky;
+            top: 0;
+            background: rgba(12,16,23,0.97);
+            padding: 11px 13px;
+            text-align: left;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: .14em;
+            color: #7489a2;
+            border-bottom: 1px solid rgba(255,255,255,0.07);
+            font-weight: 700;
+            font-family: 'DM Sans', sans-serif;
+        }
+        .hist-table td {
+            padding: 12px 13px;
+            border-bottom: 1px solid rgba(255,255,255,0.045);
+            color: #d5dfeb;
+            vertical-align: top;
+        }
+        .hist-table tbody tr:nth-child(odd) td {
+            background: rgba(255,255,255,0.012);
+        }
         .hist-table tr:last-child td { border-bottom: none; }
-        .hist-table .mono { font-family: 'DM Mono', monospace; color: #8fa3ba; }
+        .hist-table .mono { font-family: 'DM Mono', monospace; color: #b5c4d5; }
         .hist-action-buy  { color: #4ade80; font-weight: 600; }
         .hist-action-sell { color: #f87171; font-weight: 600; }
-        .hist-action-hold { color: #4a5c6e; }
+        .hist-action-hold { color: #96a9be; font-weight: 600; }
         .hist-action-err  { color: #ef9f27; font-weight: 600; }
+        .hist-action-snapshot { color: #8fb8ff; font-weight: 700; }
 
         /* Tabs */
         [data-testid="stTabs"] { margin-top: 0.1rem; }
 
-        /* Watchlist card+button overlay — button is an invisible full-cover click target */
+        /* Watchlist card+button overlay â€” button is an invisible full-cover click target */
         [data-testid="column"]:first-child > [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {
             position: relative;
         }
@@ -491,6 +610,395 @@ def _inject_css() -> None:
             gap: 18px;
             align-items: flex-start;
             margin-bottom: 0.85rem;
+        }
+        .operator-header {
+            display: grid;
+            grid-template-columns: minmax(320px, 1.7fr) repeat(4, minmax(150px, 0.9fr));
+            gap: 10px;
+            margin: 0.35rem 0 0.9rem;
+            align-items: stretch;
+        }
+        .operator-header-main,
+        .operator-header-card {
+            background: linear-gradient(180deg, rgba(15, 22, 34, 0.98), rgba(10, 15, 24, 0.98));
+            border: 1px solid rgba(129, 151, 181, 0.14);
+            border-radius: 16px;
+            padding: 14px 16px;
+            min-width: 0;
+            box-shadow: 0 10px 24px rgba(5, 10, 20, 0.18);
+        }
+        .operator-header-card.warn,
+        .operator-header-main.warn {
+            border-color: rgba(250, 204, 21, 0.26);
+        }
+        .operator-header-card.err,
+        .operator-header-main.err {
+            border-color: rgba(248, 113, 113, 0.28);
+        }
+        .operator-header-main {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .operator-header-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 14px;
+        }
+        .operator-title-wrap { min-width: 0; }
+        .operator-kicker {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.16em;
+            color: #7f95ae;
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+        }
+        .operator-title {
+            font-size: 1.45rem;
+            line-height: 1.15;
+            font-weight: 700;
+            color: #f5f8fc;
+            letter-spacing: -0.02em;
+        }
+        .operator-subtitle {
+            margin-top: 0.35rem;
+            font-size: 0.88rem;
+            color: #92a6bc;
+            line-height: 1.4;
+        }
+        .operator-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+        }
+        .operator-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border-radius: 999px;
+            padding: 0.28rem 0.62rem;
+            font-size: 0.74rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-weight: 700;
+            font-family: 'DM Mono', monospace;
+            color: #dce6f1;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(129, 151, 181, 0.16);
+            white-space: nowrap;
+        }
+        .operator-chip.good {
+            color: #9bf0cf;
+            border-color: rgba(76, 226, 197, 0.28);
+            background: rgba(76, 226, 197, 0.07);
+        }
+        .operator-chip.warn {
+            color: #fbd46e;
+            border-color: rgba(250, 204, 21, 0.28);
+            background: rgba(250, 204, 21, 0.08);
+        }
+        .operator-chip.err {
+            color: #fca5a5;
+            border-color: rgba(248, 113, 113, 0.3);
+            background: rgba(248, 113, 113, 0.08);
+        }
+        .operator-main-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+        .operator-mini {
+            border: 1px solid rgba(129, 151, 181, 0.12);
+            border-radius: 12px;
+            background: rgba(255,255,255,0.025);
+            padding: 11px 12px;
+            min-width: 0;
+        }
+        .operator-mini-label,
+        .operator-card-label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.13em;
+            color: #71859c;
+            margin-bottom: 0.28rem;
+            font-weight: 700;
+        }
+        .operator-mini-value,
+        .operator-card-value {
+            font-size: 1rem;
+            line-height: 1.25;
+            color: #f3f7fc;
+            font-weight: 700;
+            font-family: 'DM Mono', monospace;
+            overflow-wrap: anywhere;
+        }
+        .operator-mini-note,
+        .operator-card-note {
+            margin-top: 0.32rem;
+            font-size: 0.8rem;
+            line-height: 1.35;
+            color: #8ea3b8;
+        }
+        .operator-card-value.good { color: #86efac; }
+        .operator-card-value.warn { color: #fcd34d; }
+        .operator-card-value.err { color: #fda4af; }
+        .operator-shell {
+            margin: 0.2rem 0 0.75rem;
+        }
+        .operator-control-shell {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 10px 0 8px;
+            border-bottom: 1px solid var(--line);
+            margin-bottom: 10px;
+        }
+        .operator-control-main {
+            min-width: 0;
+        }
+        .operator-control-title {
+            margin-bottom: 6px;
+        }
+        .operator-meta-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .operator-meta-item {
+            min-width: 0;
+        }
+        .operator-status-grid {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 8px;
+        }
+        .operator-status-card {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 12px;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .operator-status-card.warn {
+            border-color: rgba(210, 153, 34, 0.35);
+        }
+        .operator-status-card.err {
+            border-color: rgba(248, 81, 73, 0.35);
+        }
+        .decision-log-summary {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+            margin: 0.25rem 0 0.8rem;
+        }
+        .decision-log-summary-card {
+            background:
+                radial-gradient(circle at top right, rgba(103, 184, 255, 0.08), transparent 34%),
+                linear-gradient(180deg, rgba(21, 27, 35, 0.98), rgba(15, 21, 29, 0.98));
+            border: 1px solid rgba(129, 151, 181, 0.16);
+            border-radius: 16px;
+            padding: 16px 18px;
+            box-shadow: 0 10px 24px rgba(2, 8, 18, 0.2);
+        }
+        .decision-log-shell {
+            display: grid;
+            grid-template-columns: minmax(0, 1.25fr) minmax(360px, 0.95fr);
+            gap: 16px;
+            align-items: start;
+        }
+        .decision-log-pane {
+            background:
+                radial-gradient(circle at top right, rgba(103, 184, 255, 0.08), transparent 34%),
+                linear-gradient(180deg, rgba(21, 27, 35, 0.98), rgba(15, 21, 29, 0.98));
+            border: 1px solid rgba(129, 151, 181, 0.16);
+            border-radius: 18px;
+            padding: 16px 18px;
+            min-width: 0;
+            box-shadow: 0 12px 30px rgba(2, 8, 18, 0.2);
+        }
+        .decision-log-list-header,
+        .decision-log-list-row {
+            display: grid;
+            grid-template-columns: 1.15fr 0.7fr 0.95fr 0.85fr 1.6fr 72px;
+            gap: 12px;
+            align-items: stretch;
+        }
+        .decision-log-list-header {
+            padding: 0 4px 10px;
+            border-bottom: 1px solid rgba(129, 151, 181, 0.14);
+            margin-bottom: 8px;
+        }
+        .decision-log-list-row {
+            padding: 12px 14px;
+            border: 1px solid rgba(129, 151, 181, 0.14);
+            border-radius: 16px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015));
+            margin-bottom: 10px;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+        }
+        .decision-log-list-row:last-child {
+            margin-bottom: 0;
+        }
+        .decision-log-cell {
+            min-width: 0;
+        }
+        .decision-log-cell-block {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            justify-content: center;
+        }
+        .decision-log-col-label {
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: #7f95ae;
+            font-weight: 700;
+        }
+        .decision-log-row-value {
+            font-size: 0.95rem;
+            color: #e7eef8;
+            line-height: 1.35;
+            overflow-wrap: anywhere;
+        }
+        .decision-log-row-value.strong {
+            font-size: 1.02rem;
+            font-weight: 700;
+            color: #f5f8fd;
+        }
+        .decision-log-row-meta {
+            font-size: 0.8rem;
+            color: #94a8bf;
+            line-height: 1.35;
+        }
+        .decision-log-outcome {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: fit-content;
+            padding: 0.24rem 0.58rem;
+            border-radius: 999px;
+            font-size: 0.76rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-family: 'DM Mono', monospace;
+            border: 1px solid rgba(129, 151, 181, 0.16);
+            background: rgba(255,255,255,0.04);
+            color: #dce6f1;
+        }
+        .decision-log-outcome.good {
+            color: #9bf0cf;
+            background: rgba(76, 226, 197, 0.08);
+            border-color: rgba(76, 226, 197, 0.24);
+        }
+        .decision-log-outcome.warn {
+            color: #fbd46e;
+            background: rgba(250, 204, 21, 0.08);
+            border-color: rgba(250, 204, 21, 0.24);
+        }
+        .decision-log-outcome.neutral {
+            color: #d9e3ee;
+            background: rgba(148, 163, 184, 0.08);
+            border-color: rgba(129, 151, 181, 0.2);
+        }
+        .decision-log-button-cell {
+            display: flex;
+            align-items: center;
+            justify-content: stretch;
+            min-width: 0;
+        }
+        .decision-log-detail-hero {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding-bottom: 14px;
+            margin-bottom: 14px;
+            border-bottom: 1px solid rgba(129, 151, 181, 0.14);
+        }
+        .decision-log-detail-headline {
+            font-size: 1.18rem;
+            line-height: 1.3;
+            font-weight: 700;
+            color: #f5f8fd;
+        }
+        .decision-log-detail-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+        }
+        .decision-log-detail-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 0.24rem 0.62rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-family: 'DM Mono', monospace;
+            color: #dce6f1;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(129, 151, 181, 0.16);
+        }
+        .decision-log-detail-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+        }
+        .decision-log-detail-grid .kv {
+            display: flex;
+            flex-direction: column;
+            align-items: stretch;
+            gap: 6px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            border: 1px solid rgba(129, 151, 181, 0.14);
+            background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015));
+        }
+        .decision-log-detail-grid .kv-key {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: #7f95ae;
+            font-weight: 700;
+        }
+        .decision-log-detail-grid .kv-val {
+            font-size: 0.98rem;
+            line-height: 1.45;
+            color: #edf4ff;
+            font-family: var(--font-family-ui);
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+        .decision-log-empty {
+            padding: 18px 0 8px;
+        }
+        @media (max-width: 1200px) {
+            .operator-meta-grid { grid-template-columns: 1fr; }
+            .operator-status-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+            .decision-log-shell { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 900px) {
+            .operator-control-shell { flex-direction: column; }
+            .operator-status-grid,
+            .decision-log-summary { grid-template-columns: 1fr; }
+            .decision-log-list-header,
+            .decision-log-list-row {
+                grid-template-columns: 1fr;
+                gap: 6px;
+            }
         }
         .hero-card {
             background:
@@ -597,6 +1105,112 @@ def _inject_css() -> None:
             color: #eff5fb;
             font-weight: 600;
         }
+        .status-strip {
+            display: grid;
+            grid-template-columns: minmax(250px, 1.45fr) repeat(5, minmax(120px, 0.72fr));
+            gap: 10px;
+            margin: 0.8rem 0 0.95rem;
+        }
+        .status-panel {
+            background:
+                radial-gradient(circle at top right, rgba(103, 184, 255, 0.1), transparent 26%),
+                linear-gradient(180deg, rgba(18, 27, 41, 0.97), rgba(10, 16, 25, 0.97));
+            border: 1px solid rgba(129, 151, 181, 0.15);
+            border-radius: 18px;
+            padding: 16px 18px;
+            box-shadow: var(--glow);
+            min-width: 0;
+        }
+        .status-panel.primary {
+            border-color: rgba(103, 184, 255, 0.24);
+        }
+        .status-panel.warn {
+            border-color: rgba(250, 204, 21, 0.3);
+            background:
+                radial-gradient(circle at top right, rgba(250, 204, 21, 0.12), transparent 22%),
+                linear-gradient(180deg, rgba(31, 27, 16, 0.97), rgba(19, 17, 12, 0.97));
+        }
+        .status-panel.err {
+            border-color: rgba(248, 113, 113, 0.3);
+            background:
+                radial-gradient(circle at top right, rgba(248, 113, 113, 0.14), transparent 22%),
+                linear-gradient(180deg, rgba(34, 21, 24, 0.97), rgba(21, 12, 14, 0.97));
+        }
+        .status-panel-kicker {
+            font-size: 0.74rem;
+            text-transform: uppercase;
+            letter-spacing: 0.16em;
+            color: #7f95ae;
+            margin-bottom: 0.35rem;
+            font-weight: 700;
+        }
+        .status-panel-title {
+            font-size: 1.38rem;
+            color: #f4f8fd;
+            font-weight: 700;
+            margin-bottom: 0.28rem;
+        }
+        .status-panel-copy {
+            font-size: 0.92rem;
+            color: #a7bbd0;
+            line-height: 1.4;
+        }
+        .status-metric-label {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #71859c;
+            margin-bottom: 0.25rem;
+        }
+        .status-metric-value {
+            font-size: 1.24rem;
+            color: #f2f7fd;
+            font-weight: 700;
+            font-family: 'DM Mono', monospace;
+        }
+        .status-metric-note {
+            margin-top: 0.35rem;
+            font-size: 0.82rem;
+            color: #91a6bc;
+            line-height: 1.35;
+        }
+        .approval-chip-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-top: 0.55rem;
+        }
+        .approval-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border-radius: 999px;
+            padding: 0.26rem 0.66rem;
+            font-size: 0.76rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-weight: 700;
+            font-family: 'DM Mono', monospace;
+            border: 1px solid rgba(129, 151, 181, 0.16);
+            color: #dce6f1;
+            background: rgba(255,255,255,0.04);
+        }
+        .approval-chip.good {
+            color: #9bf0cf;
+            border-color: rgba(76, 226, 197, 0.28);
+            background: rgba(76, 226, 197, 0.08);
+        }
+        .approval-chip.warn {
+            color: #fbd46e;
+            border-color: rgba(250, 204, 21, 0.28);
+            background: rgba(250, 204, 21, 0.08);
+        }
+        .approval-chip.err {
+            color: #fca5a5;
+            border-color: rgba(248, 113, 113, 0.3);
+            background: rgba(248, 113, 113, 0.08);
+        }
         .compact-card {
             background: linear-gradient(180deg, rgba(23, 30, 42, 0.96), rgba(15, 18, 27, 0.96));
             border: 1px solid rgba(129, 151, 181, 0.14);
@@ -698,6 +1312,74 @@ def _inject_css() -> None:
             color: #a9bacd;
             line-height: 1.35;
         }
+        .section-intro {
+            margin: 0.4rem 0 1rem;
+            padding: 16px 18px;
+            border-radius: 20px;
+            background:
+                radial-gradient(circle at top right, rgba(103, 184, 255, 0.1), transparent 28%),
+                linear-gradient(180deg, rgba(17, 26, 40, 0.96), rgba(11, 17, 28, 0.96));
+            border: 1px solid rgba(129, 151, 181, 0.12);
+            box-shadow: var(--glow);
+        }
+        .section-intro-kicker {
+            font-size: 0.74rem;
+            text-transform: uppercase;
+            letter-spacing: 0.18em;
+            color: #7f95ae;
+            margin-bottom: 0.35rem;
+            font-weight: 700;
+        }
+        .section-intro-title {
+            font-size: 1.34rem;
+            color: #f4f8fd;
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+        }
+        .section-intro-body {
+            font-size: 0.95rem;
+            color: #9db0c8;
+            line-height: 1.5;
+            max-width: 50rem;
+        }
+        .workspace-map {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin: 0.55rem 0 1.1rem;
+        }
+        .workspace-map-card {
+            padding: 16px 16px 15px;
+            border-radius: 18px;
+            background: linear-gradient(180deg, rgba(18, 26, 39, 0.96), rgba(11, 17, 27, 0.96));
+            border: 1px solid rgba(129, 151, 181, 0.12);
+            box-shadow: 0 14px 30px rgba(2, 6, 14, 0.24);
+        }
+        .workspace-map-kicker {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: #7b91aa;
+            margin-bottom: 0.42rem;
+        }
+        .workspace-map-title {
+            font-size: 1rem;
+            color: #eff5fb;
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+        }
+        .workspace-map-copy {
+            font-size: 0.88rem;
+            color: #97abc1;
+            line-height: 1.45;
+        }
+        .workspace-map-meta {
+            margin-top: 0.75rem;
+            font-family: 'DM Mono', monospace;
+            font-size: 0.76rem;
+            color: #cde5ff;
+            letter-spacing: 0.05em;
+        }
         .workspace-label {
             font-size: 0.82rem;
             text-transform: uppercase;
@@ -733,24 +1415,84 @@ def _inject_css() -> None:
             color: #72849a;
             line-height: 1.35;
         }
-        .sym-card-v2 {
+        .live-zones {
+            display: grid;
+            grid-template-columns: 1.05fr 1.7fr 1.05fr;
+            gap: 12px;
+            margin-bottom: 0.85rem;
+        }
+        .live-zone {
+            padding: 12px 14px;
+            border-radius: 16px;
+            background: rgba(255,255,255,0.028);
+            border: 1px solid rgba(129, 151, 181, 0.1);
+        }
+        .live-zone-title {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: #7d92aa;
+            margin-bottom: 0.32rem;
+            font-weight: 700;
+        }
+        .live-zone-copy {
+            font-size: 0.87rem;
+            color: #9fb3c8;
+            line-height: 1.45;
+        }
+        .history-shell {
+            margin-top: 0.2rem;
+        }
+        .history-toolbar {
+            display: grid;
+            grid-template-columns: minmax(260px, 1.2fr) repeat(2, minmax(140px, 0.8fr));
+            gap: 12px;
+            margin-bottom: 1rem;
+        }
+        .history-stat {
             padding: 14px 16px;
+            border-radius: 16px;
+            background: rgba(255,255,255,0.028);
+            border: 1px solid rgba(129, 151, 181, 0.12);
+        }
+        .history-stat-label {
+            font-size: 0.74rem;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: #7d92aa;
+            margin-bottom: 0.36rem;
+        }
+        .history-stat-value {
+            font-size: 1.08rem;
+            font-family: 'DM Mono', monospace;
+            color: #eff5fb;
+            font-weight: 700;
+        }
+        .sym-card-v2 {
+            padding: 16px 17px 15px;
             border-bottom: 1px solid rgba(255,255,255,0.045);
             cursor: pointer;
             border-left: 3px solid transparent;
-            transition: background 0.14s ease, border-color 0.14s ease, transform 0.14s ease;
+            background: linear-gradient(180deg, rgba(255,255,255,0.018), rgba(255,255,255,0.01));
+            transition: background 0.14s ease, border-color 0.14s ease, transform 0.14s ease, box-shadow 0.14s ease;
         }
         .sym-card-v2:last-child { border-bottom: none; }
         .sym-card-v2:hover {
-            background: rgba(255,255,255,0.032);
+            background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.018));
             transform: translateX(3px);
+            box-shadow: inset 0 0 0 1px rgba(140, 167, 201, 0.08);
         }
         .sym-card-v2.sym-active {
-            background: linear-gradient(90deg, rgba(59,130,246,0.14), rgba(59,130,246,0.04));
+            background:
+                radial-gradient(circle at right center, rgba(96,165,250,0.12), transparent 38%),
+                linear-gradient(90deg, rgba(59,130,246,0.18), rgba(59,130,246,0.045));
             border-left-color: #60a5fa;
+            box-shadow: inset 0 0 0 1px rgba(96,165,250,0.12);
         }
         .sym-card-v2.sym-error {
-            background: linear-gradient(90deg, rgba(248,113,113,0.14), rgba(248,113,113,0.04));
+            background:
+                radial-gradient(circle at right center, rgba(248,113,113,0.1), transparent 40%),
+                linear-gradient(90deg, rgba(248,113,113,0.16), rgba(248,113,113,0.045));
             border-left-color: #f87171;
         }
         .sym-card-v2-top {
@@ -763,9 +1505,9 @@ def _inject_css() -> None:
             display: grid;
             grid-template-columns: 1fr auto;
             gap: 8px;
-            margin-top: 7px;
-            font-size: 0.9rem;
-            color: #cad5e4;
+            margin-top: 9px;
+            font-size: 0.88rem;
+            color: #c6d4e2;
         }
         .sym-price {
             font-family: 'DM Mono', monospace;
@@ -782,7 +1524,7 @@ def _inject_css() -> None:
             justify-content: space-between;
             align-items: center;
             gap: 8px;
-            margin-top: 6px;
+            margin-top: 10px;
         }
         .tiny-label {
             font-size: 0.84rem;
@@ -908,7 +1650,7 @@ def _inject_css() -> None:
             color: #7db6f7;
             letter-spacing: 0.04em;
         }
-        /* Near-miss symbol chip — amber tint to signal "almost" */
+        /* Near-miss symbol chip â€” amber tint to signal "almost" */
         .miss-sym {
             font-family: 'DM Mono', monospace;
             font-size: 0.78rem;
@@ -930,54 +1672,82 @@ def _inject_css() -> None:
         .ticker-strip {
             display: flex;
             flex-direction: column;
-            gap: 8px;
-            margin-bottom: 0.8rem;
+            gap: 12px;
+            margin-bottom: 1rem;
         }
         .ticker-strip-head {
             display: flex;
             justify-content: space-between;
-            align-items: center;
-            gap: 10px;
+            align-items: flex-end;
+            gap: 14px;
+            flex-wrap: wrap;
         }
         .ticker-strip-ribbon {
             display: flex;
-            gap: 10px;
+            gap: 12px;
             overflow-x: auto;
-            padding: 12px 14px;
-            border-radius: 16px;
-            background: linear-gradient(90deg, rgba(17, 25, 38, 0.98), rgba(10, 17, 27, 0.98));
+            padding: 14px 16px;
+            border-radius: 20px;
+            background:
+                radial-gradient(circle at left center, rgba(96,165,250,0.08), transparent 18%),
+                linear-gradient(90deg, rgba(16, 24, 36, 0.98), rgba(10, 17, 27, 0.98));
             border: 1px solid rgba(129, 151, 181, 0.14);
             box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+            scrollbar-width: thin;
         }
         .ticker-chip {
             flex: 0 0 auto;
-            display: flex;
+            min-width: 124px;
+            display: grid;
+            grid-template-columns: auto 1fr;
+            grid-template-areas:
+                "symbol price"
+                "change change";
             align-items: center;
-            gap: 9px;
-            padding: 7px 9px;
-            border-radius: 10px;
-            background: rgba(255,255,255,0.045);
-            border: 1px solid rgba(255,255,255,0.08);
+            column-gap: 10px;
+            row-gap: 6px;
+            padding: 10px 12px 11px;
+            border-radius: 14px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.055), rgba(255,255,255,0.025));
+            border: 1px solid rgba(255,255,255,0.075);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.025);
         }
         .ticker-chip.active {
-            background: rgba(96,165,250,0.11);
+            background:
+                radial-gradient(circle at top right, rgba(96,165,250,0.12), transparent 34%),
+                linear-gradient(180deg, rgba(96,165,250,0.14), rgba(96,165,250,0.06));
             border-color: rgba(96,165,250,0.28);
         }
         .ticker-chip-symbol {
+            grid-area: symbol;
             font-family: 'DM Mono', monospace;
-            font-size: 0.95rem;
+            font-size: 1.08rem;
             font-weight: 700;
             color: #f8fbff;
         }
         .ticker-chip-price {
+            grid-area: price;
             font-family: 'DM Mono', monospace;
-            font-size: 0.9rem;
-            color: #dfe7f2;
+            justify-self: end;
+            font-size: 0.98rem;
+            color: #c8d5e4;
         }
         .ticker-chip-change {
+            grid-area: change;
             font-family: 'DM Mono', monospace;
-            font-size: 0.86rem;
+            display: inline-flex;
+            align-items: baseline;
+            gap: 6px;
+            font-size: 1rem;
             font-weight: 700;
+            letter-spacing: -0.01em;
+        }
+        .ticker-chip-note {
+            font-size: 0.78rem;
+            color: #6f849d;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
         }
         .exec-panel {
             background:
@@ -992,6 +1762,70 @@ def _inject_css() -> None:
         .exec-list {
             display: grid;
             gap: 11px;
+        }
+        .activity-feed-list {
+            display: grid;
+            gap: 10px;
+        }
+        .activity-feed-row {
+            display: grid;
+            grid-template-columns: 76px minmax(0, 1fr);
+            gap: 12px;
+            align-items: start;
+            padding: 12px 0;
+            border-top: 1px solid rgba(255,255,255,0.06);
+        }
+        .activity-feed-row:first-child {
+            border-top: none;
+            padding-top: 4px;
+        }
+        .activity-time {
+            font-size: 0.74rem;
+            color: #7f95ae;
+            font-family: 'DM Mono', monospace;
+            letter-spacing: 0.06em;
+            padding-top: 2px;
+        }
+        .activity-title {
+            font-size: 0.97rem;
+            color: #eef4fb;
+            font-weight: 600;
+            margin-bottom: 0.2rem;
+        }
+        .activity-body {
+            font-size: 0.88rem;
+            color: #9fb2c7;
+            line-height: 1.4;
+        }
+        .activity-badges {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 0.35rem;
+        }
+        .activity-tag {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 0.18rem 0.5rem;
+            font-size: 0.7rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-weight: 700;
+            font-family: 'DM Mono', monospace;
+            background: rgba(255,255,255,0.05);
+            color: #dce6f1;
+        }
+        .activity-tag.warn {
+            background: rgba(250, 204, 21, 0.08);
+            color: #fbd46e;
+        }
+        .activity-tag.err {
+            background: rgba(248, 113, 113, 0.08);
+            color: #fca5a5;
+        }
+        .activity-tag.info {
+            background: rgba(103, 184, 255, 0.08);
+            color: #9fd4ff;
         }
         .exec-row {
             display: grid;
@@ -1088,30 +1922,48 @@ def _inject_css() -> None:
         .exec-type-badge.no-signal { background: rgba(100,116,139,0.16); color: #94a3b8; }
         .logic-list {
             display: grid;
-            gap: 8px;
-            margin-top: 0.9rem;
+            gap: 10px;
+            margin-top: 0.95rem;
         }
         .logic-item {
-            display: flex;
-            gap: 8px;
-            align-items: flex-start;
-            font-size: 1rem;
-            color: #c8d3e1;
-            line-height: 1.35;
-            padding: 9px 11px;
-            background: rgba(255,255,255,0.025);
-            border: 1px solid rgba(255,255,255,0.05);
-            border-radius: 10px;
+            display: grid;
+            grid-template-columns: minmax(118px, 0.72fr) minmax(0, 1.65fr);
+            gap: 12px 16px;
+            align-items: start;
+            font-size: 0.98rem;
+            color: #d8e3ee;
+            line-height: 1.42;
+            padding: 12px 14px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.018));
+            border: 1px solid rgba(255,255,255,0.055);
+            border-radius: 14px;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
         }
         .logic-bullet {
-            color: #60a5fa;
-            font-family: 'DM Mono', monospace;
-            margin-top: 1px;
+            display: none;
         }
         .logic-key {
-            color: #90a3ba;
-            min-width: 134px;
-            flex: 0 0 134px;
+            color: #8ea4bc;
+            font-size: 0.76rem;
+            line-height: 1.25;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            font-weight: 700;
+            padding-top: 0.15rem;
+        }
+        .logic-body {
+            min-width: 0;
+        }
+        .logic-main {
+            color: #eef5fb;
+            font-size: 0.98rem;
+            line-height: 1.35;
+        }
+        .logic-note {
+            margin-top: 0.32rem;
+            color: #8fa2b7;
+            font-size: 0.88rem;
+            line-height: 1.42;
         }
         .logic-val-yes { color: #4ade80; font-weight: 700; }
         .logic-val-no { color: #f87171; font-weight: 700; }
@@ -1216,20 +2068,35 @@ def _inject_css() -> None:
         .rail-row:last-child { border-bottom: none; }
 
         @media (max-width: 1200px) {
+            .operator-header { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+            .operator-header-main { grid-column: span 3; }
+            .operator-main-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .dash-metrics { grid-template-columns: repeat(2, 1fr); }
             .detail-info-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .status-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
             .hero-summary,
             .timing-grid,
+            .workspace-map,
+            .history-toolbar,
+            .live-zones,
             .feed-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         }
         @media (max-width: 900px) {
             .top-shell { flex-direction: column; }
             .status-inline { justify-content: flex-start; }
+            .operator-header { grid-template-columns: 1fr; }
+            .operator-header-main { grid-column: span 1; }
+            .operator-main-grid { grid-template-columns: 1fr; }
+            .operator-header-top { flex-direction: column; }
             .detail-hero-top { flex-direction: column; }
             .detail-price { text-align: left; }
             .dash-metrics { grid-template-columns: 1fr; }
             .detail-info-grid { grid-template-columns: 1fr; }
+            .status-strip,
             .hero-summary,
+            .workspace-map,
+            .history-toolbar,
+            .live-zones,
             .timing-grid,
             .feed-grid { grid-template-columns: 1fr; }
             .feed-stat {
@@ -1242,74 +2109,584 @@ def _inject_css() -> None:
             .action-card { min-width: 0; }
         }
 
-        /* ── Trade Decision Drilldown ────────────────────────────── */
+        /* â”€â”€ Trade Decision Drilldown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
         .dd-shell {
-            padding: 20px 22px 18px;
-            border-radius: 18px;
-            background: linear-gradient(180deg, rgba(16,24,38,0.98), rgba(10,15,24,0.98));
-            border: 1px solid rgba(103,184,255,0.14);
-            box-shadow: 0 12px 32px rgba(0,0,0,0.22);
+            padding: 22px 24px 20px;
+            border-radius: 22px;
+            background:
+                radial-gradient(circle at top right, rgba(103, 184, 255, 0.1), transparent 32%),
+                linear-gradient(180deg, rgba(17, 25, 38, 0.98), rgba(10, 15, 24, 0.98));
+            border: 1px solid rgba(129, 151, 181, 0.18);
+            box-shadow: 0 18px 40px rgba(0,0,0,0.24);
             margin-bottom: 1.2rem;
         }
         .dd-header {
             display: flex;
             align-items: center;
-            gap: 10px;
-            margin-bottom: 1.1rem;
+            gap: 12px;
+            margin-bottom: 1.25rem;
             flex-wrap: wrap;
         }
         .dd-symbol {
-            font-size: 1.35rem;
+            font-size: 1.45rem;
             font-weight: 800;
-            color: #edf4ff;
+            color: #f5f8fd;
             font-family: 'DM Mono', monospace;
             letter-spacing: 0.04em;
         }
         .dd-ts {
-            font-size: 0.86rem;
-            color: #4a6474;
+            font-size: 0.9rem;
+            color: #8ea4ba;
             margin-left: 4px;
         }
         .dd-section {
-            margin-top: 1.1rem;
-            padding-top: 0.9rem;
-            border-top: 1px solid rgba(255,255,255,0.06);
+            margin-top: 1.2rem;
+            padding-top: 1rem;
+            border-top: 1px solid rgba(129, 151, 181, 0.14);
         }
-        .dd-path { margin-top: 0.5rem; }
+        .dd-shell .kv {
+            display: grid;
+            grid-template-columns: minmax(120px, 0.7fr) minmax(0, 1fr);
+            gap: 10px 18px;
+            align-items: start;
+            padding: 0.72rem 0;
+            border-bottom: 1px solid rgba(129, 151, 181, 0.12);
+        }
+        .dd-shell .kv-key {
+            font-size: 0.74rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #7f95ae;
+            font-weight: 700;
+            padding-top: 0.15rem;
+        }
+        .dd-shell .kv-val {
+            font-size: 0.98rem;
+            line-height: 1.45;
+            color: #edf4ff;
+            font-family: var(--font-family-ui);
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+        .dd-path { margin-top: 0.7rem; display: grid; gap: 10px; }
         .dd-path-step {
-            display: flex;
-            align-items: flex-start;
+            display: grid;
+            grid-template-columns: 28px minmax(140px, 0.8fr) minmax(0, 1fr);
             gap: 10px;
-            padding: 7px 0;
-            border-bottom: 0.5px solid rgba(255,255,255,0.04);
+            align-items: start;
+            padding: 12px 14px;
+            border: 1px solid rgba(129, 151, 181, 0.12);
+            border-radius: 14px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.02));
         }
-        .dd-path-step:last-child { border-bottom: none; }
         .dd-step-idx {
             font-family: 'DM Mono', monospace;
-            font-size: 0.78rem;
-            color: #3d5a78;
-            min-width: 22px;
-            padding-top: 2px;
+            font-size: 0.76rem;
+            color: #99b2c9;
+            width: 28px;
+            height: 28px;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(103, 184, 255, 0.1);
+            border: 1px solid rgba(103, 184, 255, 0.16);
         }
         .dd-step-key {
-            font-size: 0.92rem;
-            color: #8fa3ba;
-            min-width: 150px;
-            flex: 0 0 150px;
+            font-size: 0.88rem;
+            color: #9eb3c8;
+            font-weight: 600;
+            line-height: 1.4;
+            padding-top: 0.3rem;
         }
-        .dd-step-val { font-size: 0.92rem; color: #d7e1ec; }
+        .dd-step-val { font-size: 0.96rem; color: #edf4ff; line-height: 1.45; }
         .dd-pass  { color: #4ade80; font-weight: 700; }
         .dd-reject { color: #f87171; font-weight: 700; }
-        .dd-note  { font-size: 0.8rem; color: #4a6070; margin-left: 6px; }
+        .dd-note  { display: inline-block; font-size: 0.82rem; color: #8ea4ba; margin-left: 8px; }
+
+        .tradeos-page-title {
+            font-family: var(--font-family-ui);
+            font-size: var(--font-size-2xl);
+            font-weight: var(--font-weight-bold);
+            line-height: var(--line-height-tight);
+            letter-spacing: var(--letter-spacing-tight);
+            color: var(--text-primary);
+        }
+        .tradeos-section-label {
+            font-family: var(--font-family-ui);
+            font-size: var(--font-size-xs);
+            font-weight: var(--font-weight-semibold);
+            line-height: 1.2;
+            letter-spacing: var(--letter-spacing-wide);
+            text-transform: uppercase;
+            color: var(--text-secondary);
+        }
+        .tradeos-primary-value {
+            font-family: var(--font-family-ui);
+            font-size: var(--font-size-lg);
+            font-weight: var(--font-weight-bold);
+            line-height: var(--line-height-snug);
+            letter-spacing: -0.01em;
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+        }
+        .tradeos-secondary-value {
+            font-family: var(--font-family-ui);
+            font-size: var(--font-size-md);
+            font-weight: var(--font-weight-medium);
+            line-height: var(--line-height-normal);
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+        }
+        .tradeos-body-text {
+            font-family: var(--font-family-ui);
+            font-size: var(--font-size-sm);
+            font-weight: var(--font-weight-regular);
+            line-height: var(--line-height-relaxed);
+            color: var(--text-secondary);
+        }
+        .tradeos-meta-text {
+            font-family: var(--font-family-ui);
+            font-size: var(--font-size-xs);
+            font-weight: var(--font-weight-medium);
+            line-height: var(--line-height-normal);
+            color: var(--text-secondary);
+            font-variant-numeric: tabular-nums;
+        }
+        .tradeos-muted-text {
+            font-family: var(--font-family-ui);
+            font-size: var(--font-size-xs);
+            font-weight: var(--font-weight-regular);
+            line-height: var(--line-height-normal);
+            color: var(--text-muted);
+        }
+
+        /* Theme normalization overrides */
+        .m-pos,
+        .order-action.buy,
+        .hist-action-buy,
+        .exec-action.buy,
+        .logic-val-yes,
+        .dd-pass,
+        .operator-card-value.good {
+            color: var(--success) !important;
+        }
+        .m-neg,
+        .order-action.sell,
+        .hist-action-sell,
+        .exec-action.sell,
+        .logic-val-no,
+        .dd-reject,
+        .operator-card-value.err {
+            color: var(--error) !important;
+        }
+        .operator-card-value.warn,
+        .status-card.warn .status-card-dot,
+        .activity-tag.warn {
+            color: var(--warning) !important;
+        }
+        .dot-live,
+        .exec-row.buy:before {
+            background: var(--success) !important;
+            box-shadow: none !important;
+        }
+        .dot-rest,
+        .rail-dot-warn,
+        .exec-row.hold-filtered:before {
+            background: var(--warning) !important;
+            box-shadow: none !important;
+        }
+        .dot-error,
+        .rail-dot-err,
+        .exec-row.sell:before,
+        .exec-row.blocked:before {
+            background: var(--error) !important;
+            box-shadow: none !important;
+        }
+        .exec-row.hold-no-signal:before,
+        .exec-row.hold-rejected:before,
+        .status-card.info .status-card-dot {
+            background: #6E7681 !important;
+        }
+        .badge,
+        .approval-chip,
+        .operator-chip,
+        .config-chip,
+        .activity-tag,
+        .exec-type-badge,
+        [data-testid="stTabs"] [role="tab"] {
+            border-radius: 8px !important;
+            box-shadow: none !important;
+        }
+        .b-buy,
+        .b-ready,
+        .approval-chip.good,
+        .operator-chip.good {
+            background: var(--success-bg) !important;
+            color: var(--success) !important;
+            border: 1px solid transparent !important;
+        }
+        .b-err,
+        .b-blocked,
+        .approval-chip.err,
+        .operator-chip.err {
+            background: var(--error-bg) !important;
+            color: var(--error) !important;
+            border: 1px solid transparent !important;
+        }
+        .b-sell,
+        .b-hold,
+        .b-nosignal,
+        .approval-chip.warn,
+        .operator-chip.warn,
+        .exec-type-badge.no-signal,
+        .activity-tag.info {
+            background: var(--muted-bg) !important;
+            color: var(--text-soft) !important;
+            border: 1px solid transparent !important;
+        }
+        .exec-type-badge.filtered {
+            background: var(--warning-bg) !important;
+            color: var(--warning) !important;
+        }
+        .exec-type-badge.rejected,
+        .exec-type-badge.blocked,
+        .activity-tag.err {
+            background: var(--error-bg) !important;
+            color: var(--error) !important;
+        }
+        .activity-tag.warn,
+        .status-card.warn {
+            background: var(--warning-bg) !important;
+        }
+        .status-card.err {
+            background: var(--error-bg) !important;
+        }
+        .status-card.info {
+            background: var(--muted-bg) !important;
+        }
+        .config-card,
+        .dash-metrics,
+        .detail-history-card,
+        .rail-card,
+        .detail-hero,
+        .watchlist-shell,
+        .exec-panel,
+        .dd-shell,
+        .timing-shell,
+        .section-intro,
+        .workspace-map-card,
+        .hero-card,
+        .action-card,
+        .status-panel,
+        .compact-card,
+        .compact-card.feed-card,
+        .operator-header-main,
+        .operator-header-card,
+        .operator-mini,
+        .config-stat,
+        .config-empty,
+        .history-stat,
+        .live-zone,
+        .detail-info-cell,
+        .hist-wrap,
+        .ticker-strip-ribbon,
+        .ticker-chip,
+        .exec-row,
+        .logic-item,
+        .cycle-summary,
+        .timing-item,
+        [data-testid="stButton"] > button[kind="secondary"],
+        [data-testid="stTabs"] [role="tab"],
+        [data-testid="stTabs"] [aria-selected="true"] {
+            background: var(--panel) !important;
+            border: 1px solid var(--line) !important;
+            border-radius: 8px !important;
+            box-shadow: none !important;
+        }
+        .config-card::after,
+        .hero-card:before {
+            content: none !important;
+            display: none !important;
+            background: none !important;
+        }
+        .stApp,
+        .config-card,
+        .dash-metrics,
+        .detail-history-card,
+        .rail-card,
+        .detail-hero,
+        .watchlist-shell,
+        .exec-panel,
+        .dd-shell,
+        .timing-shell,
+        .section-intro,
+        .workspace-map-card,
+        .hero-card,
+        .action-card,
+        .status-panel,
+        .compact-card,
+        .operator-header-main,
+        .operator-header-card,
+        .operator-mini,
+        .config-stat,
+        .config-empty,
+        .history-stat,
+        .live-zone,
+        .detail-info-cell,
+        .hist-wrap,
+        .ticker-strip-ribbon,
+        .ticker-chip,
+        .exec-row,
+        .logic-item,
+        .cycle-summary,
+        .timing-item {
+            filter: none !important;
+        }
+        .top-title,
+        .operator-title,
+        .status-panel-title,
+        .section-intro-title,
+        .workspace-map-title,
+        .detail-symbol,
+        .order-price,
+        .rail-row-val,
+        .rail-sym,
+        .sym-ticker,
+        .exec-symbol,
+        .timing-value,
+        .operator-mini-value,
+        .operator-card-value,
+        .config-stat-value,
+        .config-row-val,
+        .kv-val,
+        .dd-symbol,
+        .dd-step-val,
+        .hero-stat-value {
+            color: var(--text) !important;
+            font-family: var(--font-family-ui);
+        }
+        .subtle-copy,
+        .hero-note,
+        .status-panel-copy,
+        .status-metric-note,
+        .config-card-note,
+        .config-stat-sub,
+        .config-empty,
+        .workspace-map-copy,
+        .workspace-map-meta,
+        .watchlist-subtext,
+        .watchlist-tip,
+        .live-zone-copy,
+        .activity-body,
+        .exec-reason,
+        .thought-text,
+        .timing-help,
+        .operator-subtitle,
+        .operator-mini-note,
+        .operator-card-note,
+        .rail-empty,
+        .order-detail,
+        .order-time,
+        .history-stat-label,
+        .feed-subline,
+        .feed-stat-label,
+        .feed-stat-value,
+        .ticker-chip-price,
+        .thought-ts,
+        .dd-ts,
+        .dd-step-key,
+        .dd-note,
+        .kv-key,
+        .config-row-key,
+        .config-band-label,
+        .config-stat-label,
+        .detail-info-cell-label,
+        .dash-metric-label,
+        .status-panel-kicker,
+        .operator-kicker,
+        .operator-mini-label,
+        .operator-card-label,
+        .activity-time,
+        .activity-title,
+        .sec-head,
+        .ticker-strip-head .subtle-copy,
+        .logic-key,
+        .sym-card-v2-meta,
+        .dm-mono,
+        .ml-label,
+        .ml-axis,
+        .prox-label {
+            color: var(--text-soft) !important;
+        }
+        .top-title,
+        .operator-title {
+            font-size: var(--font-size-xl) !important;
+            font-weight: var(--font-weight-bold) !important;
+            line-height: var(--line-height-tight) !important;
+            letter-spacing: var(--letter-spacing-tight) !important;
+        }
+        .top-title {
+            font-size: var(--font-size-2xl) !important;
+        }
+        .status-panel-title,
+        .section-intro-title,
+        .workspace-map-title,
+        .detail-symbol,
+        .exec-symbol,
+        .operator-mini-value,
+        .operator-card-value,
+        .config-stat-value,
+        .hero-stat-value {
+            font-size: var(--font-size-lg) !important;
+            font-weight: var(--font-weight-semibold) !important;
+            line-height: var(--line-height-snug) !important;
+        }
+        .dash-metric-val,
+        .detail-info-cell-val,
+        .detail-price,
+        .metric-val-big {
+            font-size: var(--font-size-2xl) !important;
+            font-weight: var(--font-weight-bold) !important;
+            line-height: var(--line-height-tight) !important;
+            letter-spacing: var(--letter-spacing-tight) !important;
+        }
+        .sec-head,
+        .operator-kicker,
+        .operator-mini-label,
+        .operator-card-label,
+        .status-panel-kicker,
+        .status-metric-label,
+        .config-card-title,
+        .config-band-label,
+        .config-stat-label,
+        .config-row-key,
+        .detail-info-cell-label,
+        .dash-metric-label,
+        .activity-tag,
+        .badge {
+            font-size: var(--font-size-xs) !important;
+            font-weight: var(--font-weight-semibold) !important;
+            letter-spacing: var(--letter-spacing-wide) !important;
+            line-height: var(--line-height-snug) !important;
+        }
+        .subtle-copy,
+        .hero-note,
+        .status-panel-copy,
+        .status-metric-note,
+        .config-card-note,
+        .config-stat-sub,
+        .config-empty,
+        .workspace-map-copy,
+        .watchlist-tip,
+        .activity-body,
+        .exec-reason,
+        .thought-text,
+        .timing-help,
+        .operator-subtitle,
+        .operator-mini-note,
+        .operator-card-note,
+        .rail-empty {
+            font-size: var(--font-size-sm) !important;
+            line-height: var(--line-height-relaxed) !important;
+        }
+        .activity-time,
+        .order-time,
+        .thought-ts,
+        .dd-ts,
+        .config-row-key,
+        .hist-table th,
+        .detail-info-cell-label {
+            font-size: var(--font-size-xs) !important;
+        }
+        .watchlist-subtext,
+        .ticker-chip-price,
+        .feed-subline,
+        .feed-stat-label,
+        .feed-stat-value,
+        .order-detail,
+        .rail-row-meta,
+        .dd-note,
+        .dd-step-key {
+            font-size: var(--font-size-sm) !important;
+            line-height: var(--line-height-normal) !important;
+        }
+        .block-container,
+        .hist-table td,
+        .exec-price,
+        .exec-action.hold,
+        .logic-val-neutral,
+        .activity-tag,
+        .ticker-chip-symbol,
+        .order-symbol {
+            color: var(--text) !important;
+        }
+        .kv,
+        .config-row,
+        .config-band,
+        .dash-metric,
+        .sym-card-v2,
+        .rail-row,
+        .order-row,
+        .thought-row,
+        .activity-feed-row,
+        .dd-section,
+        .dd-path-step,
+        .hist-table th,
+        .hist-table td,
+        [data-testid="stTabs"] [role="tablist"] {
+            border-color: var(--line) !important;
+        }
+        .sym-card-v2:hover,
+        .sym-card-v2.sym-active,
+        .ticker-chip.active {
+            background: rgba(157, 167, 179, 0.08) !important;
+        }
+        .sym-card-v2.sym-error,
+        .detail-error-banner,
+        .kill-switch-row {
+            background: var(--error-bg) !important;
+            border-color: rgba(248, 81, 73, 0.3) !important;
+            color: var(--error) !important;
+        }
+        .status-panel.warn,
+        .operator-header-card.warn,
+        .operator-header-main.warn {
+            background: var(--panel) !important;
+            border-color: rgba(210, 153, 34, 0.35) !important;
+        }
+        .status-panel.err,
+        .operator-header-card.err,
+        .operator-header-main.err {
+            background: var(--panel) !important;
+            border-color: rgba(248, 81, 73, 0.35) !important;
+        }
+        .prox-track,
+        .ml-track {
+            background: #11161D !important;
+        }
+        .prox-above {
+            background: var(--success) !important;
+        }
+        .prox-below {
+            background: var(--error) !important;
+        }
+        .hist-table th,
+        .exec-row {
+            background: var(--panel) !important;
+        }
+        .trend-bar {
+            border-radius: 2px !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-# ── Bot singleton ─────────────────────────────────────────────────────────────
+# â”€â”€ Bot singleton â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# â”€â”€ Utilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def parse_mixed_iso_timestamps(values: pd.Series) -> pd.Series:
     try:
@@ -1323,6 +2700,12 @@ def parse_mixed_iso_timestamps(values: pd.Series) -> pd.Series:
 
 def _fmt_money(v: float) -> str:
     return f"${v:,.2f}"
+
+
+def _fmt_optional_money(v) -> str:
+    if v is None or pd.isna(v):
+        return "â€”"
+    return _fmt_money(float(v))
 
 
 def _relative_age(ts) -> str:
@@ -1361,7 +2744,7 @@ def _get_bar_timing(timeframe_minutes: int) -> dict[str, object]:
     }
 
 
-# ── HTML builders ─────────────────────────────────────────────────────────────
+# â”€â”€ HTML builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _ml_bar_html(
     prob: float | None,
@@ -1370,7 +2753,7 @@ def _ml_bar_html(
     confidence: float | None,
 ) -> str:
     if prob is None:
-        return "<div class='ml-wrap'><div class='ml-label'>ML Probability — n/a</div></div>"
+        return "<div class='ml-wrap'><div class='ml-label'>ML Probability â€” n/a</div></div>"
     pct = min(max(prob * 100, 0), 100)
     if buy_thr is not None and prob >= buy_thr:
         fill_color = "#4ade80"
@@ -1407,7 +2790,7 @@ def _ml_mini_bar_html(
     buy_thr: float | None,
     sell_thr: float | None,
 ) -> str:
-    """Compact track-only ML bar for watchlist cards — no labels, no axis."""
+    """Compact track-only ML bar for watchlist cards â€” no labels, no axis."""
     if prob is None:
         return ""
     pct = min(max(prob * 100, 0), 100)
@@ -1472,8 +2855,25 @@ def _kv(key: str, val: str) -> str:
     )
 
 
+def _decision_log_cell(label: str, value_html: str, meta_html: str = "", strong: bool = False) -> str:
+    value_cls = "decision-log-row-value strong" if strong else "decision-log-row-value"
+    meta = f"<div class='decision-log-row-meta'>{meta_html}</div>" if meta_html else ""
+    return (
+        "<div class='decision-log-cell-block'>"
+        f"<div class='decision-log-col-label'>{_escape_html(label)}</div>"
+        f"<div class='{value_cls}'>{value_html}</div>"
+        f"{meta}"
+        "</div>"
+    )
+
+
+def _decision_log_outcome_badge(outcome: str, tone: str) -> str:
+    tone_cls = {"good": "good", "warn": "warn", "neutral": "neutral"}.get(tone, "neutral")
+    return f"<span class='decision-log-outcome {tone_cls}'>{_escape_html(outcome)}</span>"
+
+
 def _escape_html(value) -> str:
-    return html.escape(str(value if value not in (None, "") else "—"))
+    return html.escape(str(value if value not in (None, "") else "â€”"))
 
 
 def _config_stat_html(label: str, value, subtext: str | None = None) -> str:
@@ -1524,25 +2924,25 @@ def _render_bar_timing(bot) -> None:
             color: #e8eef7;
           }}
         </style>
-        <div style="margin:0.35rem 0 0.75rem;padding:18px 20px;border-radius:18px;background:linear-gradient(135deg, rgba(18, 27, 41, 0.98), rgba(12, 16, 24, 0.98));border:1px solid rgba(96,165,250,0.14);box-shadow:0 16px 32px rgba(0, 0, 0, 0.18);">
+        <div style="margin:0.35rem 0 0.75rem;padding:12px;border-radius:8px;background:#151B23;border:1px solid #1F2733;box-shadow:none;">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;">
             <div style="min-width:240px;">
-              <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.14em;color:#7f93ab;font-weight:700;margin-bottom:0.45rem;">Next Bar In</div>
-              <div id="bot-timing-countdown" style="font-size:2.2rem;line-height:1;font-weight:800;color:#f8fbff;font-family:'DM Mono', monospace;"></div>
-              <div style="font-size:0.9rem;color:#9cb0c8;margin-top:0.55rem;">Next bar closes at <span id="bot-timing-close-inline" style="color:#f1f6fc;font-family:'DM Mono', monospace;font-weight:700;"></span></div>
+              <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.14em;color:#9DA7B3;font-weight:700;margin-bottom:0.45rem;">Next Bar In</div>
+              <div id="bot-timing-countdown" style="font-size:2.2rem;line-height:1;font-weight:800;color:#E6EDF3;font-family:'DM Mono', monospace;"></div>
+              <div style="font-size:0.9rem;color:#9DA7B3;margin-top:0.55rem;">Next bar closes at <span id="bot-timing-close-inline" style="color:#E6EDF3;font-family:'DM Mono', monospace;font-weight:700;"></span></div>
             </div>
             <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:12px;flex:1 1 420px;">
-              <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:12px 13px;">
-                <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;color:#7286a0;margin-bottom:0.35rem;">Current UTC</div>
-                <div id="bot-timing-now" style="font-size:1rem;font-weight:700;color:#f5f9ff;font-family:'DM Mono', monospace;"></div>
+              <div style="background:#151B23;border:1px solid #1F2733;border-radius:8px;padding:12px;">
+                <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;color:#9DA7B3;margin-bottom:0.35rem;">Current UTC</div>
+                <div id="bot-timing-now" style="font-size:1rem;font-weight:700;color:#E6EDF3;font-family:'DM Mono', monospace;"></div>
               </div>
-              <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:12px 13px;">
-                <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;color:#7286a0;margin-bottom:0.35rem;">Next Bar Close</div>
-                <div id="bot-timing-close" style="font-size:1rem;font-weight:700;color:#f5f9ff;font-family:'DM Mono', monospace;"></div>
+              <div style="background:#151B23;border:1px solid #1F2733;border-radius:8px;padding:12px;">
+                <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;color:#9DA7B3;margin-bottom:0.35rem;">Next Bar Close</div>
+                <div id="bot-timing-close" style="font-size:1rem;font-weight:700;color:#E6EDF3;font-family:'DM Mono', monospace;"></div>
               </div>
-              <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:12px 13px;">
-                <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;color:#7286a0;margin-bottom:0.35rem;">Bar Timeframe</div>
-                <div style="font-size:1rem;font-weight:700;color:#f5f9ff;font-family:'DM Mono', monospace;">{timeframe_minutes} min</div>
+              <div style="background:#151B23;border:1px solid #1F2733;border-radius:8px;padding:12px;">
+                <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.12em;color:#9DA7B3;margin-bottom:0.35rem;">Bar Timeframe</div>
+                <div style="font-size:1rem;font-weight:700;color:#E6EDF3;font-family:'DM Mono', monospace;">{timeframe_minutes} min</div>
               </div>
             </div>
           </div>
@@ -1592,7 +2992,7 @@ def _render_bar_timing(bot) -> None:
     )
 
 
-# ── Drilldown panel ───────────────────────────────────────────────────────────
+# â”€â”€ Drilldown panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _drilldown_label(event: DrilldownEvent) -> str:
     """Short selector label for one drilldown event."""
@@ -1602,7 +3002,7 @@ def _drilldown_label(event: DrilldownEvent) -> str:
         "risk.check": "risk",
         "position.closed": "exit",
     }.get(event.event_type, event.event_type)
-    action = event.action or "—"
+    action = event.action or "â€”"
     return f"{event.symbol}  {time_str}  [{etype_short}]  {action}"
 
 
@@ -1675,22 +3075,22 @@ def _drilldown_path_html(event: DrilldownEvent) -> str:
             outcome_note = f"reason: {_pretty_reason(event.rejection)}"
         else:
             outcome_note = "no actionable signal"
-        _step("→ Decision", f"<span class='badge {action_cls}'>{action}</span>", outcome_note)
+        _step("â†’ Decision", f"<span class='badge {action_cls}'>{action}</span>", outcome_note)
 
     elif et == "risk.check":
         action = (event.action or "").upper()
         action_cls = {"BUY": "b-buy", "SELL": "b-sell"}.get(action, "b-hold")
-        _step("Signal direction", f"<span class='badge {action_cls}'>{action or '—'}</span>")
+        _step("Signal direction", f"<span class='badge {action_cls}'>{action or 'â€”'}</span>")
         if event.allowed is True:
             _step("Risk gate", "<span class='dd-pass'>PASSED</span>", "all checks cleared")
         elif event.allowed is False:
             block_note = _pretty_reason(event.block_reason) if event.block_reason else "reason unknown"
             _step("Risk gate", "<span class='dd-reject'>BLOCKED</span>", block_note)
         else:
-            _step("Risk gate", "<span class='dd-step-val'>—</span>")
+            _step("Risk gate", "<span class='dd-step-val'>â€”</span>")
 
     elif et == "position.closed":
-        exit_label = _escape_html(event.exit_reason or "—")
+        exit_label = _escape_html(event.exit_reason or "â€”")
         exit_note = _pretty_reason(event.exit_reason) if event.exit_reason else ""
         _step("Exit trigger", f"<span class='dd-step-val'>{exit_label}</span>", exit_note)
         if event.pnl_usd is not None:
@@ -1731,7 +3131,7 @@ def _drilldown_panel_html(event: DrilldownEvent) -> str:
     }.get(et, "b-nosignal")
     action_badge_cls = {"BUY": "b-buy", "SELL": "b-sell", "HOLD": "b-hold"}.get(action, "b-nosignal")
 
-    ts_str = _format_datetime_pretty(event.timestamp_utc) if event.timestamp_utc else "—"
+    ts_str = _format_datetime_pretty(event.timestamp_utc) if event.timestamp_utc else "â€”"
 
     # Allowed / blocked display
     if event.allowed is True:
@@ -1743,14 +3143,14 @@ def _drilldown_panel_html(event: DrilldownEvent) -> str:
 
     # Primary rejection/block reason
     reason_raw = event.block_reason or event.rejection or event.exit_reason
-    reason_html = _escape_html(_pretty_reason(reason_raw) if reason_raw else "—")
+    reason_html = _escape_html(_pretty_reason(reason_raw) if reason_raw else "â€”")
 
     fields: list[str] = [
-        _kv("Symbol", _escape_html(event.symbol or "—")),
-        _kv("Timestamp", _escape_html(ts_str)),
+        _kv("Symbol", _escape_html(event.symbol or "â€”")),
+        _kv("Timestamp", ts_str),
         _kv("Event type", _escape_html(etype_label)),
-        _kv("Action", _escape_html(action or "—")),
-        _kv("Strategy mode", _escape_html(event.strategy_mode or "—")),
+        _kv("Action", _escape_html(action or "â€”")),
+        _kv("Strategy mode", _escape_html(event.strategy_mode or "â€”")),
         _kv("Allowed / blocked", allowed_html),
         _kv("Rejection / reason", reason_html),
     ]
@@ -1776,8 +3176,8 @@ def _drilldown_panel_html(event: DrilldownEvent) -> str:
         "<div class='dd-header'>"
         f"<span class='dd-symbol'>{_escape_html(event.symbol)}</span>"
         f"<span class='badge {etype_cls}'>{etype_label}</span>"
-        f"<span class='badge {action_badge_cls}'>{action or '—'}</span>"
-        f"<span class='dd-ts'>{_escape_html(ts_str)}</span>"
+        f"<span class='badge {action_badge_cls}'>{action or 'â€”'}</span>"
+        f"<span class='dd-ts'>{ts_str}</span>"
         "</div>"
         f"{''.join(fields)}"
         + _drilldown_path_html(event)
@@ -1785,38 +3185,267 @@ def _drilldown_panel_html(event: DrilldownEvent) -> str:
     )
 
 
+def _decision_log_outcome(event: DrilldownEvent) -> tuple[str, str, str]:
+    if event.event_type == "risk.check":
+        if event.allowed is False:
+            return "Blocked", "warn", _pretty_reason(event.block_reason)
+        if event.allowed is True:
+            return "Allowed", "good", "Passed risk checks"
+        return "Unknown", "neutral", "Risk state unavailable"
+    if event.event_type == "position.closed":
+        reason = _pretty_reason(event.exit_reason) if event.exit_reason else "Position closed"
+        return "Closed", "neutral", reason
+    action = (event.action or "").upper()
+    if action in {"BUY", "SELL"}:
+        return action, "good", "Actionable signal"
+    if event.rejection:
+        return "Rejected", "warn", _pretty_reason(event.rejection)
+    return "No signal", "neutral", "No actionable signal"
+
+
+def _normalize_decision_log_rows(candidates: list[DrilldownEvent]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    type_labels = {
+        "signal.evaluated": "Signal",
+        "risk.check": "Risk Check",
+        "position.closed": "Exit",
+    }
+    priority_map = {
+        "Blocked": 0,
+        "Rejected": 1,
+        "Closed": 2,
+        "BUY": 3,
+        "SELL": 3,
+        "Allowed": 4,
+        "No signal": 5,
+        "Unknown": 6,
+    }
+    for index, event in enumerate(candidates):
+        outcome, tone, reason = _decision_log_outcome(event)
+        timestamp = _parse_datetime(event.timestamp_utc)
+        event_type_label = type_labels.get(event.event_type, event.event_type.replace(".", " ").title())
+        summary = reason
+        if event.event_type == "signal.evaluated" and outcome in {"BUY", "SELL"}:
+            summary = f"{outcome} signal ready"
+        elif event.event_type == "position.closed" and event.pnl_usd is not None:
+            pnl_label = f"{'+' if event.pnl_usd >= 0 else '-'}${abs(event.pnl_usd):.2f}"
+            summary = f"{reason} · {pnl_label}"
+        rows.append(
+            {
+                "id": f"{event.symbol}|{event.event_type}|{event.timestamp_utc}|{index}",
+                "event": event,
+                "timestamp": timestamp,
+                "timestamp_label": _compact_time_str(event.timestamp_utc),
+                "timestamp_full": _format_datetime_pretty(event.timestamp_utc),
+                "symbol": event.symbol or "â€”",
+                "event_type": event.event_type,
+                "event_type_label": event_type_label,
+                "outcome": outcome,
+                "tone": tone,
+                "reason": reason,
+                "summary": summary,
+                "priority": priority_map.get(outcome, 7),
+                "search_text": " ".join(
+                    str(part or "")
+                    for part in [
+                        event.symbol,
+                        event.event_type,
+                        outcome,
+                        reason,
+                        event.block_reason,
+                        event.rejection,
+                        event.exit_reason,
+                        event.strategy_mode,
+                    ]
+                ).lower(),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            int(row["priority"]),
+            -(row["timestamp"].timestamp() if row["timestamp"] is not None else 0),
+        )
+    )
+    return rows
+
+
+def _render_decision_log_filters(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    event_options = ["All"] + sorted({str(row["event_type_label"]) for row in rows})
+    symbol_options = ["All"] + sorted({str(row["symbol"]) for row in rows})
+    outcome_options = ["All"] + sorted({str(row["outcome"]) for row in rows})
+    filter_cols = st.columns([1.15, 0.9, 0.9, 0.75, 1.3])
+    with filter_cols[0]:
+        event_filter = st.selectbox("Event Type", event_options, index=0, key="decision_log_event_type")
+    with filter_cols[1]:
+        symbol_filter = st.selectbox("Symbol", symbol_options, index=0, key="decision_log_symbol")
+    with filter_cols[2]:
+        outcome_filter = st.selectbox("Outcome", outcome_options, index=0, key="decision_log_outcome")
+    with filter_cols[3]:
+        max_rows = st.selectbox("Rows", [10, 20, 30, 50], index=1, key="decision_log_rows")
+    with filter_cols[4]:
+        search_text = st.text_input("Search", value="", placeholder="reason, symbol, event", key="decision_log_search").strip().lower()
+
+    filtered = rows
+    if event_filter != "All":
+        filtered = [row for row in filtered if row["event_type_label"] == event_filter]
+    if symbol_filter != "All":
+        filtered = [row for row in filtered if row["symbol"] == symbol_filter]
+    if outcome_filter != "All":
+        filtered = [row for row in filtered if row["outcome"] == outcome_filter]
+    if search_text:
+        filtered = [row for row in filtered if search_text in str(row["search_text"])]
+    return filtered[: int(max_rows)]
+
+
+def _render_decision_log_summary(rows: list[dict[str, object]]) -> None:
+    blocked_count = sum(1 for row in rows if row["outcome"] == "Blocked")
+    rejected_count = sum(1 for row in rows if row["outcome"] == "Rejected")
+    exit_count = sum(1 for row in rows if row["event_type"] == "position.closed")
+    summary_html = (
+        "<div class='decision-log-summary'>"
+        "<section class='decision-log-summary-card'>"
+        "<div class='tradeos-section-label'>Blocked</div>"
+        f"<div class='tradeos-primary-value'>{blocked_count}</div>"
+        "<div class='tradeos-body-text'>Recent blocked decisions</div>"
+        "</section>"
+        "<section class='decision-log-summary-card'>"
+        "<div class='tradeos-section-label'>Rejected</div>"
+        f"<div class='tradeos-primary-value'>{rejected_count}</div>"
+        "<div class='tradeos-body-text'>Filtered setups</div>"
+        "</section>"
+        "<section class='decision-log-summary-card'>"
+        "<div class='tradeos-section-label'>Closures</div>"
+        f"<div class='tradeos-primary-value'>{exit_count}</div>"
+        "<div class='tradeos-body-text'>Recent position exits</div>"
+        "</section>"
+        "</div>"
+    )
+    st.markdown(summary_html, unsafe_allow_html=True)
+
+
+def _render_decision_log_table(rows: list[dict[str, object]]) -> dict[str, object] | None:
+    if not rows:
+        st.markdown("<div class='decision-log-empty tradeos-body-text'>No events match the current filters.</div>", unsafe_allow_html=True)
+        return None
+
+    selected_id = st.session_state.get("decision_log_selected_id")
+    row_ids = {str(row["id"]) for row in rows}
+    if selected_id not in row_ids:
+        selected_id = str(rows[0]["id"])
+        st.session_state["decision_log_selected_id"] = selected_id
+
+    header_cols = st.columns([1.15, 0.7, 0.95, 0.85, 1.6, 0.7])
+    for col, label in zip(header_cols, ["Time", "Symbol", "Event", "Outcome", "Reason", "View"]):
+        col.markdown(f"<div class='tradeos-section-label'>{label}</div>", unsafe_allow_html=True)
+
+    selected_row: dict[str, object] | None = None
+    for row in rows:
+        row_cols = st.columns([1.15, 0.7, 0.95, 0.85, 1.6, 0.7])
+        row_cols[0].markdown(
+            _decision_log_cell("Time", str(row["timestamp_label"]), str(row["timestamp_full"])),
+            unsafe_allow_html=True,
+        )
+        row_cols[1].markdown(
+            _decision_log_cell("Symbol", _escape_html(row["symbol"]), strong=True),
+            unsafe_allow_html=True,
+        )
+        row_cols[2].markdown(
+            _decision_log_cell("Event", _escape_html(row["event_type_label"]), _escape_html(row["event_type"])),
+            unsafe_allow_html=True,
+        )
+        row_cols[3].markdown(
+            _decision_log_cell(
+                "Outcome",
+                _decision_log_outcome_badge(str(row["outcome"]), str(row["tone"])),
+            ),
+            unsafe_allow_html=True,
+        )
+        row_cols[4].markdown(
+            _decision_log_cell("Why", _escape_html(row["summary"]), _escape_html(row["reason"])),
+            unsafe_allow_html=True,
+        )
+        button_label = "Open" if str(row["id"]) != selected_id else "Selected"
+        if row_cols[5].button(button_label, key=f"decision_log_{row['id']}", use_container_width=True, type="secondary"):
+            st.session_state["decision_log_selected_id"] = str(row["id"])
+            selected_id = str(row["id"])
+        if str(row["id"]) == selected_id:
+            selected_row = row
+    return selected_row or rows[0]
+
+
+def _render_decision_log_detail(selected_row: dict[str, object] | None) -> None:
+    if selected_row is None:
+        st.markdown("<div class='decision-log-empty tradeos-body-text'>Select an event to inspect it.</div>", unsafe_allow_html=True)
+        return
+
+    event = selected_row["event"]
+    detail_meta = "".join(
+        [
+            _kv("Symbol", _escape_html(selected_row["symbol"])),
+            _kv("Timestamp", str(selected_row["timestamp_full"])),
+            _kv("Event", _escape_html(selected_row["event_type_label"])),
+            _kv("Outcome", _escape_html(selected_row["outcome"])),
+            _kv("Reason", _escape_html(selected_row["reason"])),
+        ]
+    )
+    st.markdown(
+        "<div class='decision-log-pane'>"
+        "<div class='decision-log-detail-hero'>"
+        "<div class='tradeos-section-label'>Selected Event</div>"
+        f"<div class='decision-log-detail-headline'>{_escape_html(selected_row['summary'])}</div>"
+        "<div class='decision-log-detail-chip-row'>"
+        f"<span class='decision-log-detail-chip'>{_escape_html(selected_row['symbol'])}</span>"
+        f"<span class='decision-log-detail-chip'>{_escape_html(selected_row['event_type_label'])}</span>"
+        f"{_decision_log_outcome_badge(str(selected_row['outcome']), str(selected_row['tone']))}"
+        "</div>"
+        "</div>"
+        f"<div class='decision-log-detail-grid'>{detail_meta}</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(_drilldown_panel_html(event), unsafe_allow_html=True)
+
+
 def _render_drilldown(state: DashboardState) -> None:
     """Render the Trade Decision Drilldown tab."""
+    st.markdown(
+        _section_intro_html(
+            "Decision Log",
+            "Trace a single cycle from signal to outcome",
+            "Use this area when you need the why behind a decision, not just the latest state.",
+        ),
+        unsafe_allow_html=True,
+    )
     candidates = list(state.drilldown_candidates)
 
     if not candidates:
         st.markdown(
             "<div class='rail-empty' style='margin-top:1.5rem'>"
-            "No recent decision events found. "
-            "Start the bot and wait for the first bar cycle to populate logs."
+            "No recent decision events are available yet. "
+            "This usually means the current session has not written its first full bar-cycle logs."
             "</div>",
             unsafe_allow_html=True,
         )
         return
 
-    labels = [_drilldown_label(ev) for ev in candidates]
-    idx = st.selectbox(
-        "Decision event",
-        range(len(labels)),
-        format_func=lambda i: labels[i],
-    )
-    if idx is None:
-        return
+    rows = _normalize_decision_log_rows(candidates)
+    filtered_rows = _render_decision_log_filters(rows)
+    _render_decision_log_summary(filtered_rows)
 
-    selected = candidates[int(idx)]
-    st.markdown(_drilldown_panel_html(selected), unsafe_allow_html=True)
+    left_pane, right_pane = st.columns([1.2, 1])
+    with left_pane:
+        st.markdown("<div class='decision-log-pane'>", unsafe_allow_html=True)
+        selected_row = _render_decision_log_table(filtered_rows)
+        st.markdown("</div>", unsafe_allow_html=True)
+    with right_pane:
+        _render_decision_log_detail(selected_row)
 
 
-# ── Error page ────────────────────────────────────────────────────────────────
+# â”€â”€ Error page â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def render_startup_error(exc: Exception) -> None:
     st.markdown(
-        "<div class='ks-banner'>Bot initialization failed — see details below</div>",
+        "<div class='ks-banner'>Bot initialization failed â€” see details below</div>",
         unsafe_allow_html=True,
     )
     st.error(f"{type(exc).__name__}: {exc}")
@@ -1830,7 +3459,7 @@ def render_startup_error(exc: Exception) -> None:
         st.exception(exc)
 
 
-# ── Orders helper ─────────────────────────────────────────────────────────────
+# â”€â”€ Orders helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _orders_dataframe(recent_orders: list) -> pd.DataFrame:
     if not recent_orders:
@@ -1942,7 +3571,368 @@ def _position_rows(snapshot) -> list[dict[str, float | str | None]]:
     return rows
 
 
-# ── v2 HTML builders ─────────────────────────────────────────────────────────
+def _operator_chip_html(label: str, tone: str = "neutral") -> str:
+    safe_tone = tone if tone in {"good", "warn", "err"} else ""
+    cls = f"operator-chip {safe_tone}".strip()
+    return f"<span class='{cls}'>{_escape_html(label)}</span>"
+
+
+def _operator_card_html(label: str, value: str, note: str = "", tone: str = "neutral") -> str:
+    safe_tone = tone if tone in {"good", "warn", "err"} else ""
+    note_html = f"<div class='operator-card-note'>{_escape_html(note)}</div>" if note else ""
+    tone_cls = f" {safe_tone}" if safe_tone else ""
+    return (
+        f"<section class='operator-header-card{tone_cls}'>"
+        f"<div class='operator-card-label'>{_escape_html(label)}</div>"
+        f"<div class='operator-card-value{tone_cls}'>{_escape_html(value)}</div>"
+        f"{note_html}"
+        "</section>"
+    )
+
+
+def _operator_data_freshness_status(state: DashboardState, snapshot) -> tuple[str, str, str, str, str]:
+    freshness_text = _relative_age(snapshot.timestamp_utc) if state.has_persisted_snapshot else "No data yet"
+    freshness_note = _format_datetime_pretty(snapshot.timestamp_utc) if state.has_persisted_snapshot else "Waiting for first snapshot"
+    freshness_tone = "warn" if "stale" in (state.feed_status or "").lower() else ("good" if state.has_persisted_snapshot else "warn")
+    data_value = state.feed_status or "No data yet"
+    data_note = "Waiting for first snapshot" if not state.has_persisted_snapshot else freshness_text
+    live_health, live_note = _live_bot_process_health()
+    if state.has_persisted_snapshot and live_health != "running":
+        freshness_note = f"{live_note} Last saved snapshot: {freshness_note}"
+        freshness_tone = "err"
+        data_value = "No live bot heartbeat"
+        data_note = f"{live_note} Last saved snapshot: {freshness_text}"
+    return freshness_text, freshness_note, freshness_tone, data_value, data_note
+
+
+def _open_order_count(recent_orders: list) -> int:
+    active_statuses = {
+        "new",
+        "accepted",
+        "pending_new",
+        "accepted_for_bidding",
+        "partially_filled",
+        "pending_replace",
+    }
+    return sum(1 for order in recent_orders if str(getattr(order, "status", "")).lower() in active_statuses)
+
+
+def _header_warning_summary(state: DashboardState) -> tuple[str, str]:
+    if state.snapshot.kill_switch_triggered:
+        return "Kill switch active", "err"
+    if any(not check.allowed for check in state.latest_cycle_risk_checks):
+        return "Risk blocks active", "warn"
+    if state.session_warnings:
+        return str(state.session_warnings[0]), "warn"
+    feed_status = (state.feed_status or "").lower()
+    if "stale" in feed_status:
+        return "Feed stale", "warn"
+    return "No active blocks", "good"
+
+
+def _last_cycle_summary(
+    last_cycle_report,
+    latest_signal_rows: list,
+    latest_cycle_risk_checks: list,
+) -> tuple[str, str, str]:
+    if last_cycle_report is None:
+        return "No recent cycle", "Waiting for the first persisted cycle summary.", "warn"
+
+    evaluated = (
+        int(last_cycle_report.buy_signals or 0)
+        + int(last_cycle_report.sell_signals or 0)
+        + int(last_cycle_report.hold_signals or 0)
+        + int(last_cycle_report.error_signals or 0)
+    )
+    error_count = int(last_cycle_report.error_signals or 0)
+    blocked = sum(1 for row in latest_cycle_risk_checks if not row.allowed)
+    rejected = sum(
+        1
+        for row in latest_signal_rows
+        if row.decision_timestamp == last_cycle_report.decision_timestamp and getattr(row, "rejection", None)
+    )
+
+    if not last_cycle_report.processed_bar:
+        return (
+            "No new bar",
+            _cycle_reason_label(last_cycle_report.skip_reason),
+            "warn",
+        )
+    if int(last_cycle_report.orders_submitted or 0) > 0:
+        return (
+            f"{int(last_cycle_report.orders_submitted)} order(s) sent",
+            f"{evaluated} evaluated · {blocked} blocked · {rejected} rejected · {error_count} errors",
+            "good",
+        )
+    if error_count > 0:
+        return (
+            "Evaluation errors",
+            f"{evaluated} evaluated · {error_count} errors",
+            "err",
+        )
+    if blocked > 0:
+        return (
+            "Signals blocked",
+            f"{evaluated} evaluated · {blocked} blocked · {rejected} rejected",
+            "warn",
+        )
+    if int(last_cycle_report.buy_signals or 0) or int(last_cycle_report.sell_signals or 0):
+        return (
+            "Signals found, no orders",
+            f"{evaluated} evaluated · {rejected} rejected",
+            "warn",
+        )
+    return (
+        "No action",
+        f"{evaluated} evaluated · {rejected} rejected",
+        "neutral",
+    )
+
+
+def _operator_header_html(state: DashboardState, snapshot, recent_orders: list) -> str:
+    runtime_mode = _runtime_mode_label(state)
+    approval_label, approval_level, approval_note = _runtime_approval_text(state)
+    status_title, status_level, status_copy = _status_overview(state)
+    warning_text, warning_level = _header_warning_summary(state)
+    next_cycle_value, next_cycle_note = _next_cycle_text(state)
+    cfg = state.startup_config
+
+    session_label = cfg.session_id or "Unavailable" if cfg is not None else "Unavailable"
+    strategy_label = (
+        str(cfg.strategy_mode).replace("_", " ")
+        if cfg is not None and cfg.strategy_mode
+        else "Unknown"
+    )
+    execution_label = "Execution enabled" if cfg is not None and cfg.execution_enabled and runtime_mode != "Preview" else "Read only"
+    execution_tone = "good" if execution_label == "Execution enabled" else "warn"
+
+    freshness_text, freshness_note, freshness_tone, data_value, data_note = _operator_data_freshness_status(state, snapshot)
+    process_value, process_note, process_tone = _process_health_summary()
+    resync_value, resync_note, resync_tone = _resync_status_summary(state)
+    freshness_label = state.feed_status or "Unknown"
+    if data_value == "No live bot heartbeat":
+        freshness_label = "No live bot heartbeat"
+
+    open_positions = len(snapshot.positions)
+    open_orders = _open_order_count(recent_orders)
+    exposure_note = (
+        f"Cash {_fmt_money(snapshot.cash)} · Buying power {_fmt_money(snapshot.buying_power)}"
+    )
+    exposure_value = f"Eq {_fmt_money(snapshot.equity)}"
+    exposure_pnl = _fmt_money(snapshot.daily_pnl)
+    exposure_note = f"{exposure_note} · P/L {exposure_pnl}"
+    account_tone = "good" if snapshot.daily_pnl >= 0 else "err"
+
+    cycle_value, cycle_note, cycle_tone = _last_cycle_summary(
+        state.last_cycle_report,
+        list(state.latest_signal_rows),
+        list(state.latest_cycle_risk_checks),
+    )
+
+    chips = "".join(
+        [
+            _operator_chip_html(runtime_mode, "good" if runtime_mode in {"Paper", "Live"} else "warn"),
+            _operator_chip_html(approval_label, approval_level),
+            _operator_chip_html(execution_label, execution_tone),
+            _operator_chip_html(status_title, status_level),
+        ]
+    )
+
+    mini_cards = "".join(
+        [
+            (
+                "<div class='operator-mini'>"
+                "<div class='operator-mini-label'>Strategy</div>"
+                f"<div class='operator-mini-value'>{_escape_html(strategy_label.upper())}</div>"
+                f"<div class='operator-mini-note'>{_escape_html(status_copy)}</div>"
+                "</div>"
+            ),
+            (
+                "<div class='operator-mini'>"
+                "<div class='operator-mini-label'>Session</div>"
+                f"<div class='operator-mini-value'>{_escape_html(session_label)}</div>"
+                f"<div class='operator-mini-note'>{_escape_html(approval_note)}</div>"
+                "</div>"
+            ),
+            (
+                "<div class='operator-mini'>"
+                "<div class='operator-mini-label'>Last Update</div>"
+                f"<div class='operator-mini-value'>{_escape_html(freshness_text)}</div>"
+                f"<div class='operator-mini-note'>{_escape_html(freshness_note)}</div>"
+                "</div>"
+            ),
+            (
+                "<div class='operator-mini'>"
+                "<div class='operator-mini-label'>Exposure</div>"
+                f"<div class='operator-mini-value'>{open_positions} pos · {open_orders} orders</div>"
+                f"<div class='operator-mini-note'>{_escape_html(exposure_note)}</div>"
+                "</div>"
+            ),
+        ]
+    )
+
+    return (
+        f"<section class='operator-header {status_level if status_level in {'warn', 'err'} else ''}'>"
+        f"<div class='operator-header-main {status_level if status_level in {'warn', 'err'} else ''}'>"
+        "<div class='operator-header-top'>"
+        "<div class='operator-title-wrap'>"
+        "<div class='operator-kicker'>Operator Header</div>"
+        "<div class='operator-title'>TradeOS Live Monitor</div>"
+        f"<div class='operator-subtitle'>{_escape_html(status_copy)}</div>"
+        "</div>"
+        f"<div class='operator-chip-row'>{chips}</div>"
+        "</div>"
+        f"<div class='operator-main-grid'>{mini_cards}</div>"
+        "</div>"
+        f"{_operator_card_html('Safety', warning_text, 'Kill switch, stale data, and blocking conditions.', warning_level)}"
+        f"{_operator_card_html('Freshness', freshness_label, freshness_note, freshness_tone)}"
+        f"{_operator_card_html('Next Cycle', next_cycle_value, next_cycle_note, 'err' if next_cycle_value == 'No live bot heartbeat' else ('warn' if next_cycle_value == 'Overdue' else 'neutral'))}"
+        f"{_operator_card_html('Account', exposure_value, exposure_note, account_tone)}"
+        f"{_operator_card_html('Last Cycle', cycle_value, cycle_note, cycle_tone)}"
+        "</section>"
+    )
+
+
+# â”€â”€ v2 HTML builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _build_operator_header_summary(state: DashboardState, snapshot, recent_orders: list) -> dict[str, object]:
+    runtime_mode = _runtime_mode_label(state)
+    approval_label, approval_level, _approval_note = _runtime_approval_text(state)
+    status_title, status_level, _status_copy = _status_overview(state)
+    warning_text, warning_level = _header_warning_summary(state)
+    next_cycle_value, next_cycle_note = _next_cycle_text(state)
+    cfg = state.startup_config
+    session_label = cfg.session_id or "Unavailable" if cfg is not None else "Unavailable"
+    strategy_label = (
+        str(cfg.strategy_mode).replace("_", " ")
+        if cfg is not None and cfg.strategy_mode
+        else "Unknown"
+    )
+    execution_label = "Execution enabled" if cfg is not None and cfg.execution_enabled and runtime_mode != "Preview" else "Read only"
+    execution_tone = "good" if execution_label == "Execution enabled" else "warn"
+    freshness_text, freshness_note, freshness_tone, data_value, data_note = _operator_data_freshness_status(state, snapshot)
+    process_value, process_note, process_tone = _process_health_summary()
+    resync_value, resync_note, resync_tone = _resync_status_summary(state)
+    open_positions = len(snapshot.positions)
+    open_orders = _open_order_count(recent_orders)
+    account_value = _fmt_money(snapshot.equity)
+    account_tone = "good" if snapshot.daily_pnl >= 0 else "err"
+    cycle_value, cycle_note, cycle_tone = _last_cycle_summary(
+        state.last_cycle_report,
+        list(state.latest_signal_rows),
+        list(state.latest_cycle_risk_checks),
+    )
+    chips: list[tuple[str, str]] = [
+        (runtime_mode.upper(), "good" if runtime_mode in {"Paper", "Live"} else "warn"),
+        (approval_label.replace(" Runtime", "").upper(), approval_level),
+        (execution_label.upper(), execution_tone),
+        (resync_value.upper(), resync_tone),
+        (process_value.upper(), process_tone),
+    ]
+    if status_level in {"warn", "err"}:
+        chips.append((status_title.upper(), status_level))
+    return {
+        "title": "TradeOS Live Monitor",
+        "chips": chips,
+        "last_updated_value": freshness_text,
+        "last_updated_note": freshness_note,
+        "metadata": [
+            ("Strategy", strategy_label.upper()),
+            ("Session", session_label),
+            ("Exposure", f"{open_positions} positions · {open_orders} orders"),
+        ],
+        "status_cards": [
+            ("Safety", "System healthy" if warning_text == "No active blocks" else warning_text, "No active blocks" if warning_text == "No active blocks" else "Review control state", warning_level),
+            ("Data", data_value, data_note, freshness_tone),
+            ("Runtime", process_value, process_note, process_tone),
+            ("Resync", resync_value, resync_note, resync_tone),
+            ("Next Cycle", next_cycle_value, "First cycle not completed" if next_cycle_value == "Waiting" else next_cycle_note, "err" if next_cycle_value == "No live bot heartbeat" else ("warn" if next_cycle_value == "Overdue" else "neutral")),
+            ("Account", account_value, f"{open_positions} positions · {open_orders} orders", account_tone),
+            ("Last Cycle", cycle_value, "Waiting for first cycle" if state.last_cycle_report is None else cycle_note, cycle_tone),
+        ],
+    }
+
+
+def _render_operator_control_strip(summary: dict[str, object]) -> tuple[bool, bool]:
+    left_col, meta_col, toggle_col, action_col = st.columns([7.2, 2.8, 1.8, 1.4])
+    chips = "".join(_operator_chip_html(label, tone) for label, tone in summary["chips"])  # type: ignore[index]
+    with left_col:
+        st.markdown(
+            "<div class='operator-control-shell'>"
+            "<div class='operator-control-main'>"
+            f"<div class='operator-control-title tradeos-page-title'>{_escape_html(summary['title'])}</div>"
+            f"<div class='operator-chip-row'>{chips}</div>"
+            "</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    with meta_col:
+        st.markdown(
+            "<div class='operator-control-shell' style='justify-content:flex-end;border-bottom:none;margin-bottom:0;padding-bottom:0;'>"
+            "<div class='operator-meta-item'>"
+            "<div class='tradeos-section-label'>Last Updated</div>"
+            f"<div class='tradeos-secondary-value'>{_escape_html(summary['last_updated_value'])}</div>"
+            f"<div class='tradeos-meta-text'>{summary['last_updated_note']}</div>"
+            "</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    with toggle_col:
+        auto_refresh = st.checkbox(
+            "Auto refresh",
+            value=st.session_state.get("operator_auto_refresh", True),
+            key="operator_auto_refresh",
+        )
+    with action_col:
+        refresh = st.button("Refresh", use_container_width=True, type="secondary")
+    return refresh, auto_refresh
+
+
+def _render_operator_metadata_grid(summary: dict[str, object]) -> None:
+    items_html = "".join(
+        (
+            "<div class='operator-meta-item'>"
+            f"<div class='tradeos-section-label'>{_escape_html(label)}</div>"
+            f"<div class='tradeos-secondary-value'>{_escape_html(value)}</div>"
+            "</div>"
+        )
+        for label, value in summary["metadata"]  # type: ignore[index]
+    )
+    st.markdown(f"<div class='operator-meta-grid'>{items_html}</div>", unsafe_allow_html=True)
+
+
+def _render_operator_status_cards(summary: dict[str, object]) -> None:
+    cards_html = "".join(
+        (
+            f"<section class='operator-status-card{(' ' + tone) if tone in {'warn', 'err'} else ''}'>"
+            f"<div class='tradeos-section-label'>{_escape_html(label)}</div>"
+            f"<div class='tradeos-primary-value'>{_escape_html(value)}</div>"
+            f"<div class='tradeos-body-text'>{_escape_html(note)}</div>"
+            "</section>"
+        )
+        for label, value, note, tone in summary["status_cards"]  # type: ignore[index]
+    )
+    st.markdown(f"<div class='operator-status-grid'>{cards_html}</div>", unsafe_allow_html=True)
+
+
+def _render_operator_header(state: DashboardState, snapshot, recent_orders: list) -> bool:
+    summary = _build_operator_header_summary(state, snapshot, recent_orders)
+    st.markdown("<section class='operator-shell'>", unsafe_allow_html=True)
+    refresh, auto_refresh = _render_operator_control_strip(summary)
+    _render_operator_metadata_grid(summary)
+    _render_operator_status_cards(summary)
+    st.markdown("</section>", unsafe_allow_html=True)
+    if auto_refresh:
+        components.html(
+            """
+            <script>
+            window.setTimeout(() => window.parent.location.reload(), 15000);
+            </script>
+            """,
+            height=0,
+        )
+    return refresh
+
 
 def _metrics_bar_html(snapshot) -> str:
     pnl_cls = _pnl_cls(snapshot.daily_pnl)
@@ -1990,8 +3980,276 @@ def _hero_stat(label: str, value: str) -> str:
     )
 
 
+def _section_intro_html(kicker: str, title: str, body: str) -> str:
+    return (
+        "<section class='section-intro'>"
+        f"<div class='section-intro-kicker'>{_escape_html(kicker)}</div>"
+        f"<div class='section-intro-title'>{_escape_html(title)}</div>"
+        f"<div class='section-intro-body'>{_escape_html(body)}</div>"
+        "</section>"
+    )
+
+
+def _workspace_card_html(kicker: str, title: str, copy: str, meta: str) -> str:
+    return (
+        "<section class='workspace-map-card'>"
+        f"<div class='workspace-map-kicker'>{_escape_html(kicker)}</div>"
+        f"<div class='workspace-map-title'>{_escape_html(title)}</div>"
+        f"<div class='workspace-map-copy'>{_escape_html(copy)}</div>"
+        f"<div class='workspace-map-meta'>{_escape_html(meta)}</div>"
+        "</section>"
+    )
+
+
+def _workspace_map_html(state: DashboardState, snapshot) -> str:
+    drilldown_count = len(list(state.drilldown_candidates))
+    symbol_count = len(snapshot.symbols)
+    config_status = "Ready" if state.has_persisted_startup_config else "Missing"
+    return (
+        "<div class='workspace-map'>"
+        + _workspace_card_html(
+            "Start Here",
+            "Live Desk",
+            "Scan the watchlist, focus one symbol, and understand what the bot sees right now.",
+            f"{symbol_count} symbols in rotation",
+        )
+        + _workspace_card_html(
+            "Look Back",
+            "Performance",
+            "Review equity behavior and saved symbol history when you want patterns instead of snapshots.",
+            "Trend charts plus recent saved states",
+        )
+        + _workspace_card_html(
+            "Sanity Check",
+            "Setup",
+            "Confirm runtime mode, guardrails, and model thresholds without reading raw config files.",
+            f"Startup config: {config_status}",
+        )
+        + _workspace_card_html(
+            "Explain It",
+            "Decision Log",
+            "Trace a recent decision event from signal context through execution outcome.",
+            f"{drilldown_count} recent decision events",
+        )
+        + "</div>"
+    )
+
+
+def _status_panel_metric_html(label: str, value: str, note: str = "") -> str:
+    note_html = f"<div class='status-metric-note'>{_escape_html(note)}</div>" if note else ""
+    return (
+        "<div class='status-panel'>"
+        f"<div class='status-metric-label'>{_escape_html(label)}</div>"
+        f"<div class='status-metric-value'>{_escape_html(value)}</div>"
+        f"{note_html}"
+        "</div>"
+    )
+
+
+def _runtime_mode_label(state: DashboardState) -> str:
+    cfg = state.startup_config
+    if cfg is None:
+        return "Unknown"
+    launch_mode = str(cfg.launch_mode or "").strip().lower()
+    if launch_mode == "preview":
+        return "Preview"
+    if cfg.paper:
+        return "Paper"
+    return "Live"
+
+
+def _runtime_approval_text(state: DashboardState) -> tuple[str, str, str]:
+    cfg = state.startup_config
+    if cfg is None:
+        return "Approval Unknown", "warn", "No persisted startup metadata is available for this session."
+    if cfg.runtime_config_approved is True:
+        return "Approved Runtime", "good", "The persisted startup artifact marks this runtime as approved."
+    if cfg.runtime_config_approved is False:
+        reasons = "; ".join(cfg.runtime_config_rejection_reasons)
+        detail = reasons if reasons else "No rejection reasons were saved."
+        return "Unapproved Runtime", "err", detail
+    return "Approval Unknown", "warn", "This startup artifact does not record a runtime approval decision."
+
+
+def _next_cycle_text(state: DashboardState) -> tuple[str, str]:
+    if _is_past_session_flatten_deadline():
+        return (
+            "Closed",
+            "The live bot exits after the 3:55 PM ET flatten deadline and resumes next session.",
+        )
+
+    cfg = state.startup_config
+    timeframe_minutes = (
+        int(getattr(cfg, "bar_timeframe_minutes", 15) or 15)
+        if cfg is not None else 15
+    )
+    reference_value = None
+    if state.last_cycle_report is not None and state.last_cycle_report.decision_timestamp:
+        reference_value = state.last_cycle_report.decision_timestamp
+    elif state.has_persisted_snapshot:
+        snapshot_ts = getattr(state.snapshot, "timestamp_utc", None)
+        if snapshot_ts:
+            reference_value = snapshot_ts
+    if not reference_value:
+        return "Waiting", "The next decision time will appear after the first saved cycle."
+
+    reference_dt = _parse_datetime(reference_value)
+    if reference_dt is None:
+        return "Unknown", "The persisted timestamp could not be parsed safely."
+    next_dt = reference_dt + timedelta(minutes=timeframe_minutes)
+    now_utc = datetime.now(timezone.utc)
+    delta_seconds = int((next_dt - now_utc).total_seconds())
+    if delta_seconds >= 0:
+        minutes, seconds = divmod(delta_seconds, 60)
+        return (
+            next_dt.astimezone(_ET).strftime("%I:%M:%S %p ET"),
+            f"About {minutes}m {seconds:02d}s until the next scheduled bar close.",
+        )
+    overdue_seconds = abs(delta_seconds)
+    minutes, seconds = divmod(overdue_seconds, 60)
+    live_health, live_note = _live_bot_process_health()
+    if live_health != "running":
+        return (
+            "No live bot heartbeat",
+            f"{live_note} The last saved cycle is overdue by {minutes}m {seconds:02d}s.",
+        )
+    return (
+        "Overdue",
+        f"The next cycle would normally have arrived {minutes}m {seconds:02d}s ago.",
+    )
+
+
+def _is_past_session_flatten_deadline(now_utc: datetime | None = None) -> bool:
+    current_utc = now_utc or datetime.now(timezone.utc)
+    current_et = current_utc.astimezone(_ET)
+    return current_et.time() >= _SESSION_FLATTEN_AT
+
+
+def _status_overview(state: DashboardState) -> tuple[str, str, str]:
+    if _is_past_session_flatten_deadline():
+        freshness = _relative_age(state.snapshot.timestamp_utc) if state.has_persisted_snapshot else "n/a"
+        return (
+            "Closed",
+            "primary",
+            f"The trading session is past the 3:55 PM ET flatten deadline. Last saved snapshot is {freshness}.",
+        )
+
+    cfg = state.startup_config
+    if cfg is None and not state.has_persisted_snapshot:
+        return (
+            "Unavailable",
+            "err",
+            "No recent session data is available yet. Start a TradeOS session or wait for persisted startup metadata.",
+        )
+    if cfg is not None and state.last_cycle_report is None and not state.has_persisted_snapshot:
+        return (
+            "Initializing",
+            "warn",
+            "The session has startup metadata, but no saved decision cycle has been recorded yet.",
+        )
+    if cfg is not None and str(cfg.resync_status or "").upper() == "RESYNC_FAILED":
+        return (
+            "Resync Failed",
+            "err",
+            "Startup reconciliation did not complete safely. The dashboard may still show persisted state, but trading should remain blocked.",
+        )
+    if cfg is not None and str(cfg.resync_status or "").upper() == "RESYNC_DEGRADED":
+        return (
+            "Degraded",
+            "warn",
+            "Startup reconciliation recovered broker exposure, but the runtime should remain exits-only until the discrepancy is resolved.",
+        )
+    if cfg is not None and str(cfg.resync_status or "").upper() == "RESYNC_LOCKED":
+        return (
+            "Resync Locked",
+            "warn",
+            "Startup reconciliation is still in progress, so the runtime should not place fresh entries yet.",
+        )
+
+    freshness = _relative_age(state.snapshot.timestamp_utc) if state.has_persisted_snapshot else "n/a"
+    feed_status = (state.feed_status or "").lower()
+    live_health, live_note = _live_bot_process_health()
+    if state.has_persisted_snapshot and live_health != "running":
+        return (
+            "Live Bot Offline",
+            "err",
+            f"{live_note} The dashboard is showing persisted data from {freshness}.",
+        )
+    if "stale" in feed_status:
+        return (
+            "Stale",
+            "warn",
+            f"Persisted data looks behind the expected bar rhythm. Last saved snapshot is {freshness}.",
+        )
+    if state.last_cycle_report is not None and not state.last_cycle_report.processed_bar:
+        return (
+            "Waiting",
+            "primary",
+            f"The latest scheduler event did not process a new bar ({_cycle_reason_label(state.last_cycle_report.skip_reason).lower()}).",
+        )
+    if state.has_persisted_snapshot:
+        return (
+            "Running",
+            "primary",
+            f"Recent session data is available and the last saved snapshot is {freshness}.",
+        )
+    return (
+        "Waiting",
+        "warn",
+        "TradeOS has session metadata, but it has not saved a snapshot for this session yet.",
+    )
+
+
+def _global_status_bar_html(state: DashboardState, snapshot) -> str:
+    status_title, status_level, status_copy = _status_overview(state)
+    position_count = len(snapshot.positions)
+    symbol_count = len(state.startup_config.symbols) if state.startup_config is not None else len(snapshot.symbols)
+    next_cycle_value, next_cycle_note = _next_cycle_text(state)
+    approval_label, approval_level, approval_note = _runtime_approval_text(state)
+    runtime_mode = _runtime_mode_label(state)
+    active_config = (
+        state.startup_config.strategy_mode
+        if state.startup_config is not None else
+        "No persisted runtime"
+    )
+    active_note = (
+        "Currently active session metadata."
+        if state.startup_config is not None else
+        "The dashboard is showing only whatever persisted state is available."
+    )
+    position_value = "Open" if position_count else "Flat"
+    position_note = (
+        f"{position_count} open positions are reflected in the latest persisted snapshot."
+        if position_count else
+        "The latest persisted snapshot shows no open positions."
+    )
+    countdown_note = next_cycle_note
+    approval_html = (
+        "<div class='approval-chip-row'>"
+        f"<span class='approval-chip {approval_level}'>{_escape_html(approval_label)}</span>"
+        f"<span class='approval-chip'>{_escape_html(runtime_mode)}</span>"
+        "</div>"
+    )
+    return (
+        "<div class='status-strip'>"
+        f"<div class='status-panel {status_level}'>"
+        "<div class='status-panel-kicker'>Global Status</div>"
+        f"<div class='status-panel-title'>{_escape_html(status_title)}</div>"
+        f"<div class='status-panel-copy'>{_escape_html(status_copy)}</div>"
+        f"{approval_html}"
+        f"<div class='status-metric-note'>{_escape_html(approval_note)}</div>"
+        "</div>"
+        f"{_status_panel_metric_html('Mode', runtime_mode, 'Preview disables orders; paper/live reflects the account context saved at startup.')}"
+        f"{_status_panel_metric_html('Watching', str(symbol_count), 'Symbols from the active startup config when available.')}"
+        f"{_status_panel_metric_html('Positions', position_value, position_note)}"
+        f"{_status_panel_metric_html('Next Bar', next_cycle_value, countdown_note)}"
+        f"{_status_panel_metric_html('Active Config', active_config, active_note)}"
+        "</div>"
+    )
+
+
 def _header_summary_html(state: DashboardState, snapshot, last_cycle_report) -> str:
-    processed_text = "No cycle yet"
+    processed_text = "Waiting for first decision cycle"
     if last_cycle_report is not None and last_cycle_report.processed_bar:
         processed_text = _compact_time_str(last_cycle_report.decision_timestamp)
     elif last_cycle_report is not None:
@@ -2009,6 +4267,8 @@ def _header_summary_html(state: DashboardState, snapshot, last_cycle_report) -> 
     )
     if state.startup_config is None:
         mode_badge = "<span class='badge b-nosignal'>CONFIG MISSING</span>"
+    elif str(state.startup_config.launch_mode or "").strip().lower() == "preview":
+        mode_badge = "<span class='badge b-nosignal'>PREVIEW</span>"
     elif state.startup_config.paper:
         mode_badge = "<span class='badge b-hold'>PAPER</span>"
     else:
@@ -2039,7 +4299,7 @@ def _sym_card_v2_html(
         extra_cls = ""
 
     state_cls = {"BUY": "sym-s-buy", "SELL": "sym-s-sell"}.get(action, "")
-    price_str = f"${item.price:,.2f}" if item.price is not None else "—"
+    price_str = f"${item.price:,.2f}" if item.price is not None else "â€”"
     change_str = "n/a"
     if item.sma is not None and item.price is not None and item.sma != 0:
         delta = (item.price - item.sma) / item.sma * 100
@@ -2095,6 +4355,57 @@ def _status_card_html(level: str, title: str, body: str) -> str:
         f"<div class='status-card-body'>{body}</div>"
         f"</div>"
         f"</div>"
+    )
+
+
+def _drift_summary_html(report) -> str:
+    if report is None:
+        return ""
+
+    baseline = report.baseline
+    live = report.live
+    if report.alerts:
+        cards = "".join(
+            _status_card_html(
+                alert.severity,
+                alert.summary,
+                f"Observed: {alert.observed}. Expected: {alert.expected}. {alert.why_it_matters}",
+            )
+            for alert in report.alerts[:4]
+        )
+        status_line = f"{len(report.alerts)} active drift alert(s) in {live.window_label}."
+    elif baseline.valid_for_comparison:
+        cards = _status_card_html(
+            "info",
+            "Live behavior is within the validated profile",
+            "Current session metrics are staying within the operator drift thresholds sourced from the validated research profile.",
+        )
+        status_line = f"No active drift alerts in {live.window_label}."
+    else:
+        detail = "; ".join(baseline.validation_errors) or "validated baseline is unavailable"
+        cards = _status_card_html(
+            "warn",
+            "Drift comparison is running with an incomplete baseline",
+            detail,
+        )
+        status_line = "Baseline needs attention before drift comparisons are fully trustworthy."
+
+    metric_bits = []
+    if live.buy_signal_rate_per_symbol_per_day is not None:
+        metric_bits.append(f"Buy rate {live.buy_signal_rate_per_symbol_per_day:.2f}/sym/day")
+    if live.rejection_rate is not None:
+        metric_bits.append(f"Rejections {live.rejection_rate:.0%}")
+    if live.avg_bar_age_s is not None:
+        metric_bits.append(f"Avg bar age {live.avg_bar_age_s:.0f}s")
+
+    metric_text = " | ".join(metric_bits) if metric_bits else "Metrics will populate after more persisted session activity."
+    return (
+        "<div class='detail-history-card'>"
+        "<div class='sec-head'>Behavior Drift</div>"
+        f"<div class='subtle-copy' style='margin-bottom:0.7rem'>{status_line}</div>"
+        f"<div class='subtle-copy' style='margin-bottom:0.9rem'>Baseline source: {_escape_html(baseline.source_label)}. {metric_text}</div>"
+        f"{cards}"
+        "</div>"
     )
 
 
@@ -2166,9 +4477,17 @@ def _fmt_pct(v: float | None) -> str:
     return f"{sign}{v:.2f}%"
 
 
+def _timestamp_html(primary: str, secondary: str | None = None) -> str:
+    primary_html = html.escape(primary)
+    if not secondary:
+        return primary_html
+    secondary_html = html.escape(secondary)
+    return f"{primary_html}<br><span style='opacity:0.6;font-size:0.88em'>{secondary_html}</span>"
+
+
 def _compact_time_str(value: str | None) -> str:
     if not value:
-        return "—"
+        return "â€”"
     try:
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if dt.tzinfo is not None:
@@ -2177,11 +4496,12 @@ def _compact_time_str(value: str | None) -> str:
             et_str = et.strftime("%I:%M %p ET").lstrip("0")
             local_str = local.strftime("%I:%M %p").lstrip("0") + " local"
             if et.hour == local.hour and et.minute == local.minute:
-                return et_str
-            return f"{et_str}<br><span style='opacity:0.6;font-size:0.88em'>{local_str}</span>"
-        return dt.strftime("%I:%M %p").lstrip("0")
+                return html.escape(et_str)
+            return _timestamp_html(et_str, local_str)
+        return html.escape(dt.strftime("%I:%M %p").lstrip("0"))
     except ValueError:
-        return str(value)[11:16] if len(str(value)) >= 16 else str(value)
+        fallback = str(value)[11:16] if len(str(value)) >= 16 else str(value)
+        return html.escape(fallback)
 
 
 def _parse_datetime(value) -> datetime | None:
@@ -2202,18 +4522,22 @@ def _format_datetime_pretty(value, include_time: bool = True) -> str:
             et_str = et.strftime("%b %d, %Y · %I:%M %p ET").replace(" 0", " ")
             local_str = local.strftime("%I:%M %p").lstrip("0") + " local"
             if et.hour == local.hour and et.minute == local.minute:
-                return et_str
-            return f"{et_str}<br><span style='opacity:0.6;font-size:0.88em'>{local_str}</span>"
+                return html.escape(et_str)
+            return _timestamp_html(et_str, local_str)
         fmt = "%b %d, %Y · %I:%M %p ET" if include_time else "%b %d, %Y"
-        return parsed.strftime(fmt).replace(" 0", " ")
+        return html.escape(parsed.strftime(fmt).replace(" 0", " "))
     if value in (None, ""):
-        return "—"
-    return str(value)
+        return "â€”"
+    return html.escape(str(value))
 
 
 def _pretty_reason(reason: str | None) -> str:
     if not reason:
         return "n/a"
+    raw = str(reason).strip()
+    if "|" in raw:
+        parts = [_pretty_reason(part) for part in raw.split("|") if str(part).strip()]
+        return " + ".join(parts) if parts else "n/a"
     mapping = {
         "no_signal": "no actionable signal",
         "trend_filter": "filtered by trend filter",
@@ -2224,8 +4548,8 @@ def _pretty_reason(reason: str | None) -> str:
         "insufficient_buying_power": "blocked by buying power",
         "price_collar_breached": "blocked by price collar",
     }
-    key = str(reason).strip().lower().replace(" ", "_")
-    return mapping.get(key, str(reason).replace("_", " "))
+    key = raw.lower().replace(" ", "_")
+    return mapping.get(key, raw.replace("_", " "))
 
 
 def _logic_value_html(text: str, state: str = "neutral") -> str:
@@ -2238,12 +4562,15 @@ def _logic_value_html(text: str, state: str = "neutral") -> str:
 
 
 def _logic_line(label: str, value_html: str, note: str = "") -> str:
-    suffix = f" <span style='color:#8fa2b7'>{note}</span>" if note else ""
+    note_html = f"<div class='logic-note'>{html.escape(note)}</div>" if note else ""
     return (
         "<div class='logic-item'>"
-        "<span class='logic-bullet'>•</span>"
+        "<span class='logic-bullet'>&bull;</span>"
         f"<span class='logic-key'>{label}</span>"
-        f"<span>{value_html}{suffix}</span>"
+        "<div class='logic-body'>"
+        f"<div class='logic-main'>{value_html}</div>"
+        f"{note_html}"
+        "</div>"
         "</div>"
     )
 
@@ -2253,7 +4580,7 @@ def _ticker_strip_html(snapshot, latest_signals: dict, session_first_prices: dic
     first_prices = session_first_prices or {}
     for item in snapshot.symbols:
         signal_row = latest_signals.get(item.symbol)
-        price_str = f"${item.price:,.2f}" if item.price is not None else "—"
+        price_str = f"${item.price:,.2f}" if item.price is not None else "&mdash;"
         # Prefer intra-session % change computed from first recorded bar price.
         # Falls back to SMA20 deviation when no session baseline is available.
         first_price = first_prices.get(item.symbol)
@@ -2268,8 +4595,8 @@ def _ticker_strip_html(snapshot, latest_signals: dict, session_first_prices: dic
             color = "#4ade80" if change_val > 0 else ("#f87171" if change_val < 0 else "#93a5bc")
         change_html = (
             f"{_fmt_pct(change_val)}"
-            f"<span style='font-size:0.72em;color:#566778;font-weight:400;margin-left:3px'>{change_label}</span>"
-            if change_val is not None else "—"
+            f"<span class='ticker-chip-note'>{change_label}</span>"
+            if change_val is not None else "&mdash;"
         )
         chip_cls = "ticker-chip active" if item.symbol == selected_symbol else "ticker-chip"
         chips.append(
@@ -2279,12 +4606,12 @@ def _ticker_strip_html(snapshot, latest_signals: dict, session_first_prices: dic
             f"<span class='ticker-chip-change' style='color:{color}'>{change_html}</span>"
             "</div>"
         )
-    data_note = "session % from first recorded bar" if first_prices else "vs SMA20 — no session baseline yet"
+    data_note = "Session move from first recorded bar" if first_prices else "Latest move vs SMA20 because no session baseline is available yet"
     return (
         "<div class='ticker-strip'>"
         "<div class='ticker-strip-head'>"
         "<div class='workspace-label' style='margin-bottom:0'>Market snapshot</div>"
-        f"<div class='subtle-copy'>Latest bar-close prices · {data_note}</div>"
+        f"<div class='subtle-copy'>Latest bar-close prices &middot; {data_note}</div>"
         "</div>"
         f"<div class='ticker-strip-ribbon'>{''.join(chips)}</div>"
         "</div>"
@@ -2296,14 +4623,14 @@ def _execution_panel_html(recent_execution_activity: list) -> str:
         return (
             "<div class='exec-panel'>"
             "<div class='sec-head' style='margin-top:0;margin-bottom:0.6rem'>What Changed Recently</div>"
-            "<div class='rail-empty'>Nothing new has been written to the recent activity log yet.</div>"
+            "<div class='rail-empty'>Waiting for recent execution-side events. The bot may still be warming up, between bars, or simply not taking action yet.</div>"
             "</div>"
         )
     rows: list[str] = []
     for item in recent_execution_activity[:5]:
         time_str = _compact_time_str(item.observed_at_utc)
-        qty_str = f"{float(item.qty):.2f} sh" if item.qty is not None else "—"
-        price_str = f"${float(item.price):,.2f}" if item.price is not None else "—"
+        qty_str = f"{float(item.qty):.2f} sh" if item.qty is not None else "â€”"
+        price_str = f"${float(item.price):,.2f}" if item.price is not None else "â€”"
         reason_text = _pretty_reason(item.reason)
         side = (item.side or "HOLD").upper()
         row_cls = side.lower()
@@ -2365,20 +4692,60 @@ def _execution_panel_html(recent_execution_activity: list) -> str:
     )
 
 
+def _recent_activity_feed_html(recent_activity: list) -> str:
+    if not recent_activity:
+        return (
+            "<div class='exec-panel'>"
+            "<div class='sec-head' style='margin-top:0;margin-bottom:0.25rem'>Session Activity Feed</div>"
+            "<div class='subtle-copy' style='margin-bottom:0.85rem'>Recent saved signals, blocks, warnings, and state changes pulled from persisted logs.</div>"
+            "<div class='rail-empty'>No recent session activity is available yet. That usually means the current session has not written its first meaningful events.</div>"
+            "</div>"
+        )
+    rows: list[str] = []
+    for item in recent_activity[:8]:
+        badges = [f"<span class='activity-tag {item.level}'>{_escape_html(item.level)}</span>"]
+        if item.symbol:
+            badges.append(f"<span class='activity-tag'>{_escape_html(item.symbol)}</span>")
+        rows.append(
+            "<div class='activity-feed-row'>"
+            f"<div class='activity-time'>{_compact_time_str(item.observed_at_utc)}</div>"
+            "<div>"
+            f"<div class='activity-badges'>{''.join(badges)}</div>"
+            f"<div class='activity-title'>{_escape_html(item.title)}</div>"
+            f"<div class='activity-body'>{_escape_html(item.body)}</div>"
+            "</div>"
+            "</div>"
+        )
+    return (
+        "<div class='exec-panel'>"
+        "<div class='sec-head' style='margin-top:0;margin-bottom:0.25rem'>Session Activity Feed</div>"
+        "<div class='subtle-copy' style='margin-bottom:0.85rem'>Recent saved signals, blocks, warnings, and state changes pulled from persisted logs.</div>"
+        f"<div class='activity-feed-list'>{''.join(rows)}</div>"
+        "</div>"
+    )
+
+
 def _decision_logic_html(signal_row) -> str:
     if signal_row is None:
         return (
             "<div class='detail-history-card'>"
             "<div class='sec-head'>Why This Symbol Looks This Way</div>"
-            "<div class='rail-empty'>There is no saved decision breakdown yet for this symbol.</div>"
+            "<div class='rail-empty'>No saved decision breakdown is available for this symbol yet. The latest persisted logs have not captured enough detail to explain this view safely.</div>"
             "</div>"
         )
-    result_reason = _pretty_reason(signal_row.rejection)
-    if not signal_row.rejection:
+    result_reason = _pretty_reason(signal_row.final_signal_reason or signal_row.rejection)
+    if not signal_row.final_signal_reason and not signal_row.rejection:
         result_reason = "actionable signal present" if (signal_row.action or "").upper() in {"BUY", "SELL"} else "no explicit rejection persisted"
     trend_state = "YES" if signal_row.above_trend_sma else "NO"
+    strategy_mode = (signal_row.strategy_mode or "unknown").replace("_", " ").upper()
+    decision_summary = signal_row.decision_summary or "No richer saved explanation is available for this decision yet."
     items = "".join(
         [
+            _logic_line(
+                "Strategy",
+                _logic_value_html(strategy_mode, "neutral"),
+                f"regime {signal_row.regime_state}" if signal_row.regime_state else "",
+            ),
             _logic_line(
                 "Price vs SMA20",
                 _logic_value_html(_fmt_pct(signal_row.deviation_pct), "neutral"),
@@ -2417,6 +4784,44 @@ def _decision_logic_html(signal_row) -> str:
                 _logic_value_html("YES" if signal_row.holding else "NO", "yes" if signal_row.holding else "neutral"),
             ),
             _logic_line(
+                "Decision core",
+                _logic_value_html(_pretty_reason(signal_row.final_signal_reason), "neutral"),
+                decision_summary,
+            ),
+            _logic_line(
+                "Reference levels",
+                _logic_value_html(
+                    f"${signal_row.entry_reference_price:,.2f}" if signal_row.entry_reference_price is not None else "n/a",
+                    "neutral",
+                ),
+                " / ".join(
+                    part
+                    for part in [
+                        f"exit {signal_row.exit_reference_price:,.2f}" if signal_row.exit_reference_price is not None else "",
+                        f"stop {signal_row.stop_reference_price:,.2f}" if signal_row.stop_reference_price is not None else "",
+                        f"VWAP {signal_row.vwap:,.2f}" if signal_row.vwap is not None else "",
+                    ]
+                    if part
+                ),
+            ),
+            _logic_line(
+                "Branch context",
+                _logic_value_html(
+                    (signal_row.hybrid_branch_active or signal_row.mr_signal or "n/a").replace("_", " ").upper(),
+                    "neutral",
+                ),
+                " / ".join(
+                    part
+                    for part in [
+                        f"entry {signal_row.hybrid_entry_branch}" if signal_row.hybrid_entry_branch else "",
+                        f"regime {signal_row.hybrid_regime_branch}" if signal_row.hybrid_regime_branch else "",
+                        f"trend slope {signal_row.trend_sma_slope:.4f}" if signal_row.trend_sma_slope is not None else "",
+                        f"ADX {signal_row.adx:.1f}" if signal_row.adx is not None else "",
+                    ]
+                    if part
+                ),
+            ),
+            _logic_line(
                 "Result",
                 _logic_value_html((signal_row.action or "HOLD").upper(), "neutral"),
                 f"because {result_reason}",
@@ -2441,7 +4846,7 @@ def _cycle_summary_html(
         return (
             "<div class='cycle-summary'>"
             "<div class='workspace-label' style='margin-bottom:0.4rem'>Cycle recap</div>"
-            "<div class='cycle-summary-line'>No persisted cycle summary yet.</div>"
+            "<div class='cycle-summary-line'>Waiting for the first persisted decision cycle summary.</div>"
             "</div>"
         )
     latest_cycle_risk_checks = latest_cycle_risk_checks or []
@@ -2521,7 +4926,7 @@ def _render_detail_panel(
     *,
     ml_enabled: bool = True,
 ) -> None:
-    price_str = f"${item.price:,.2f}" if item.price is not None else "—"
+    price_str = f"${item.price:,.2f}" if item.price is not None else "â€”"
     try:
         sym_history = pd.DataFrame(storage.get_symbol_history(item.symbol, limit=20))
     except Exception:
@@ -2532,7 +4937,7 @@ def _render_detail_panel(
     else:
         error_text = ""
 
-    pos_str = "—"
+    pos_str = "â€”"
     if pos_row is not None:
         mv = _fmt_money(float(pos_row.get("market_value") or 0.0))
         qty = f"{float(pos_row.get('qty') or 0.0):.2f} sh"
@@ -2540,21 +4945,21 @@ def _render_detail_panel(
     hold_str = (
         f"{item.holding_minutes:.0f} min"
         if item.holding and item.holding_minutes is not None
-        else "—"
+        else "â€”"
     )
-    sma_str = f"${item.sma:,.2f}" if item.sma is not None else "—"
+    sma_str = f"${item.sma:,.2f}" if item.sma is not None else "â€”"
     ml_probability = item.ml_probability_up if ml_enabled else None
     ml_confidence = item.ml_confidence if ml_enabled else None
-    ml_str = f"{ml_probability:.3f}" if ml_probability is not None else "—"
-    signal_str = preview.status if preview is not None else "—"
-    delta_str = "—"
+    ml_str = f"{ml_probability:.3f}" if ml_probability is not None else "â€”"
+    signal_str = preview.status if preview is not None else "â€”"
+    delta_str = "â€”"
     if item.price is not None and item.sma not in (None, 0):
         diff_pct = ((item.price - item.sma) / item.sma) * 100
         sign = "+" if diff_pct >= 0 else ""
         delta_str = f"{sign}{diff_pct:.2f}%"
 
-    action_badge = _badge_html(item.action or "—") if item.action else "—"
-    signal_badge = _execution_status_badge(signal_str) if preview is not None else "—"
+    action_badge = _badge_html(item.action or "â€”") if item.action else "â€”"
+    signal_badge = _execution_status_badge(signal_str) if preview is not None else "â€”"
     context_copy = (
         f"Current action is {(item.action or 'HOLD').upper()} with {signal_str.lower().replace('_', ' ')} execution status."
         if preview is not None
@@ -2566,7 +4971,7 @@ def _render_detail_panel(
         "<div>"
         f"<div class='detail-symbol'>{item.symbol}</div>"
         f"<div class='detail-subline'><span>Updated {_relative_age(snapshot.timestamp_utc)}</span><span>&bull;</span><span>Selected symbol</span></div>"
-        f"<div class='detail-pill-row'>{action_badge}{signal_badge if signal_badge != '—' else ''}</div>"
+        f"<div class='detail-pill-row'>{action_badge}{signal_badge if signal_badge != 'â€”' else ''}</div>"
         "</div>"
         f"<div class='detail-price'>{price_str}</div>"
         "</div>"
@@ -2602,7 +5007,13 @@ def _render_detail_panel(
             if cols_wanted:
                 hist_df = sym_history[cols_wanted].tail(20)
                 _col_labels = {"timestamp_utc": "Time", "sma": "SMA", "price": "Price", "action": "Action"}
-                _action_cls = {"BUY": "hist-action-buy", "SELL": "hist-action-sell", "HOLD": "hist-action-hold", "ERROR": "hist-action-err"}
+                _action_cls = {
+                    "BUY": "hist-action-buy",
+                    "SELL": "hist-action-sell",
+                    "HOLD": "hist-action-hold",
+                    "ERROR": "hist-action-err",
+                    "SNAPSHOT_ONLY": "hist-action-snapshot",
+                }
                 thead = "".join(f"<th>{_col_labels.get(c, c)}</th>" for c in cols_wanted)
                 tbody = ""
                 for _, row in hist_df.iloc[::-1].iterrows():
@@ -2612,12 +5023,13 @@ def _render_detail_panel(
                         if c == "timestamp_utc":
                             tds += f"<td class='mono'>{_format_datetime_pretty(v)}</td>"
                         elif c in ("sma", "price"):
-                            tds += f"<td class='mono'>{'$' + f'{float(v):,.2f}' if v is not None else '—'}</td>"
+                            tds += f"<td class='mono'>{_fmt_optional_money(v)}</td>"
                         elif c == "action":
                             cls = _action_cls.get(str(v or "").upper(), "hist-action-hold")
-                            tds += f"<td class='{cls}'>{str(v or '—')}</td>"
+                            action_label = "Snapshot" if str(v or "").upper() == "SNAPSHOT_ONLY" else str(v or "—").replace("_", " ")
+                            tds += f"<td class='{cls}'>{html.escape(action_label)}</td>"
                         else:
-                            tds += f"<td>{str(v or '—')}</td>"
+                            tds += f"<td>{html.escape(str(v or '—'))}</td>"
                     tbody += f"<tr>{tds}</tr>"
                 st.markdown(
                     f"<div class='hist-wrap'><table class='hist-table'>"
@@ -2704,6 +5116,7 @@ def _render_right_rail(
     execution_previews: list, preview_lookup: dict,
     recent_narrations: list | None = None,
     recent_near_misses: list | None = None,
+    drift_report=None,
 ) -> None:
     alerts: list[tuple[str, str, list[str]]] = []
     error_syms = [
@@ -2722,6 +5135,9 @@ def _render_right_rail(
 
     if snapshot.kill_switch_triggered:
         alerts.append(("err", "Kill switch active", ["No new entries allowed"]))
+    if drift_report is not None:
+        for alert in drift_report.alerts[:3]:
+            alerts.append((alert.severity, alert.summary, [alert.observed]))
 
     if alerts:
         alerts_html = "".join(
@@ -2746,7 +5162,7 @@ def _render_right_rail(
             pnl_cls = "m-pos" if pnl >= 0 else "m-neg"
             held_text = (
                 f"{float(row['held_mins']):.0f} min"
-                if row.get("held_mins") is not None else "—"
+                if row.get("held_mins") is not None else "â€”"
             )
             positions_html += (
                 f"<div class='rail-row'>"
@@ -2762,7 +5178,7 @@ def _render_right_rail(
     else:
         positions_html = "<div class='rail-empty'>There are no open positions right now.</div>"
     st.markdown(
-        f"<div class='rail-card'><div class='sec-head'>What You’re Holding</div>{positions_html}</div>",
+        f"<div class='rail-card'><div class='sec-head'>What Youâ€™re Holding</div>{positions_html}</div>",
         unsafe_allow_html=True,
     )
 
@@ -2778,8 +5194,8 @@ def _render_right_rail(
             status = od.get("status", "")
 
             action_cls = "buy" if str(side).upper() == "BUY" else "sell"
-            price_str = f"${float(filled_avg):,.2f}" if filled_avg is not None else "—"
-            qty_str = f"{float(qty):.2f}" if qty is not None else "—"
+            price_str = f"${float(filled_avg):,.2f}" if filled_avg is not None else "â€”"
+            qty_str = f"{float(qty):.2f}" if qty is not None else "â€”"
             time_str = _compact_time_str(submitted)
 
             orders_html += (
@@ -2807,7 +5223,7 @@ def _render_right_rail(
     st.markdown(_near_misses_html(recent_near_misses or []), unsafe_allow_html=True)
 
 
-# ── Tab: Live ─────────────────────────────────────────────────────────────────
+# â”€â”€ Tab: Live â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _render_live(
     storage,
@@ -2816,6 +5232,7 @@ def _render_live(
     execution_previews: list | None = None,
     latest_signals: dict | None = None,
     recent_execution_activity: list | None = None,
+    recent_activity: list | None = None,
     last_cycle_report=None,
     latest_signal_rows: list | None = None,
     latest_cycle_risk_checks: list | None = None,
@@ -2824,11 +5241,14 @@ def _render_live(
     ml_enabled: bool = False,
     recent_narrations: list | None = None,
     recent_near_misses: list | None = None,
+    session_block_reason_counts: list | None = None,
+    drift_report=None,
 ) -> None:
     position_rows = _position_rows(snapshot)
     position_lookup = {str(row["symbol"]): row for row in position_rows}
     latest_signals = latest_signals or {}
     recent_execution_activity = recent_execution_activity or []
+    recent_activity = recent_activity or []
     latest_signal_rows = latest_signal_rows or []
     latest_cycle_risk_checks = latest_cycle_risk_checks or []
 
@@ -2837,7 +5257,7 @@ def _render_live(
     preview_lookup = {preview.symbol: preview for preview in execution_previews}
 
     if not snapshot.symbols:
-        st.info("No symbol data in snapshot.")
+        st.info("No symbol snapshot is available yet. The session may still be initializing or has not persisted its first cycle.")
         return
 
     if "selected_symbol" not in st.session_state:
@@ -2864,18 +5284,38 @@ def _render_live(
         ),
         unsafe_allow_html=True,
     )
+    st.markdown(_recent_activity_feed_html(recent_activity), unsafe_allow_html=True)
     st.markdown(_execution_panel_html(recent_execution_activity), unsafe_allow_html=True)
     st.markdown(
         _cycle_summary_html(
             last_cycle_report,
             latest_signal_rows,
             latest_cycle_risk_checks,
-            list(state.session_block_reason_counts) if hasattr(state, "session_block_reason_counts") else None,
+            session_block_reason_counts,
         ),
         unsafe_allow_html=True,
     )
+    drift_html = _drift_summary_html(drift_report)
+    if drift_html:
+        st.markdown(drift_html, unsafe_allow_html=True)
+    st.markdown(
+        _section_intro_html(
+            "Live Desk",
+            "Scan, inspect, and confirm the current market posture",
+            "Read the workspace from left to right: pick a symbol, inspect the thesis in the center, then validate portfolio and execution context on the rail.",
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div class='live-zones'>"
+        "<section class='live-zone'><div class='live-zone-title'>1. Symbol Explorer</div><div class='live-zone-copy'>The watchlist is your fast scan. Holdings and stronger actions are easier to spot first.</div></section>"
+        "<section class='live-zone'><div class='live-zone-title'>2. Focus Panel</div><div class='live-zone-copy'>The center column is the explanation surface for one symbol, including signals, state, and recent context.</div></section>"
+        "<section class='live-zone'><div class='live-zone-title'>3. Context Rail</div><div class='live-zone-copy'>The right rail keeps orders, holdings, and narration close by without crowding the main explanation panel.</div></section>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    left_col, center_col, right_col = st.columns([1, 3, 1.5])
+    left_col, center_col, right_col = st.columns([1.05, 1.85, 1.1])
 
     with left_col:
         st.markdown(
@@ -2942,20 +5382,29 @@ def _render_live(
             snapshot, position_rows, recent_orders, execution_previews, preview_lookup,
             recent_narrations=recent_narrations,
             recent_near_misses=recent_near_misses,
+            drift_report=drift_report,
         )
 
 
-# ── Tab: History ──────────────────────────────────────────────────────────────
+# â”€â”€ Tab: History â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _render_history(state: DashboardState, snapshot) -> None:
+    st.markdown(
+        _section_intro_html(
+            "Performance",
+            "Zoom out from the current cycle",
+            "This view is for trend reading: account trajectory, one symbol's saved behavior, and the shape of decisions over time.",
+        ),
+        unsafe_allow_html=True,
+    )
     symbols = list(state.startup_config.symbols) if state.startup_config is not None else [item.symbol for item in snapshot.symbols]
     ml_enabled = _strategy_mode_uses_ml(
         state.startup_config.strategy_mode if state.startup_config is not None else None
     )
     if not symbols:
-        st.info("No persisted startup config or symbol snapshot yet.")
+        st.info("No recent session data is available for history yet. Wait for a startup artifact or the first saved snapshot.")
         return
-    selected = st.radio("Symbol", symbols, horizontal=True)
+    selected = st.selectbox("Focus symbol", symbols, index=0)
 
     try:
         session_id = state.startup_config.session_id if state.startup_config is not None else None
@@ -2965,12 +5414,36 @@ def _render_history(state: DashboardState, snapshot) -> None:
         st.error(f"Could not load history: {exc}")
         return
 
+    history_points = len(symbol_history.index)
+    latest_action = "n/a"
+    if not symbol_history.empty and "action" in symbol_history.columns:
+        latest_actions = symbol_history["action"].dropna()
+        if not latest_actions.empty:
+            latest_action = str(latest_actions.iloc[-1]).upper()
+    st.markdown(
+        "<div class='history-shell'><div class='history-toolbar'>"
+        "<section class='history-stat'>"
+        "<div class='history-stat-label'>Current focus</div>"
+        f"<div class='history-stat-value'>{_escape_html(selected)}</div>"
+        "</section>"
+        "<section class='history-stat'>"
+        "<div class='history-stat-label'>Saved snapshots</div>"
+        f"<div class='history-stat-value'>{history_points}</div>"
+        "</section>"
+        "<section class='history-stat'>"
+        "<div class='history-stat-label'>Latest action</div>"
+        f"<div class='history-stat-value'>{_escape_html(latest_action)}</div>"
+        "</section>"
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
     left, right = st.columns([1.4, 1])
 
     with left:
         st.markdown("<div class='sec-head'>Account Equity</div>", unsafe_allow_html=True)
         if run_history.empty:
-            st.info("No run history yet.")
+            st.info("Run history has not been written yet for this session.")
         else:
             rh = run_history.copy()
             rh["ts"] = parse_mixed_iso_timestamps(rh["timestamp_utc"])
@@ -2995,15 +5468,15 @@ def _render_history(state: DashboardState, snapshot) -> None:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown(f"<div class='sec-head'>{selected} — Price vs SMA</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sec-head'>{selected} â€” Price vs SMA</div>", unsafe_allow_html=True)
         if symbol_history.empty:
-            st.info("No symbol history yet.")
+            st.info("This symbol does not have saved history for the current session yet.")
         else:
             sh = symbol_history.copy()
             sh["ts"] = parse_mixed_iso_timestamps(sh["timestamp_utc"])
             sh = sh.dropna(subset=["ts", "price", "sma"]).sort_values("ts")
             if sh.empty:
-                st.info("No price/SMA data saved yet.")
+                st.info("Saved history exists, but no price/SMA series has been persisted for this symbol yet.")
             else:
                 fig2 = go.Figure()
                 fig2.add_trace(go.Scatter(x=sh["ts"], y=sh["price"], name="Price", line=dict(color="#f1f5f9", width=2)))
@@ -3048,31 +5521,189 @@ def _render_history(state: DashboardState, snapshot) -> None:
                     st.plotly_chart(fig3, use_container_width=True)
 
     with right:
-        st.markdown(f"<div class='sec-head'>{selected} — Decision Mix</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sec-head'>{selected} â€” Decision Mix</div>", unsafe_allow_html=True)
         if not symbol_history.empty and "action" in symbol_history.columns:
             mix = symbol_history["action"].value_counts().rename_axis("action").reset_index(name="count")
             st.dataframe(mix, use_container_width=True, hide_index=True)
 
-        st.markdown(f"<div class='sec-head'>{selected} — Recent Snapshots</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sec-head'>{selected} â€” Recent Snapshots</div>", unsafe_allow_html=True)
         if not symbol_history.empty:
             latest = symbol_history.tail(10).copy()
             if "timestamp_utc" in latest.columns:
                 latest["Time"] = parse_mixed_iso_timestamps(latest["timestamp_utc"]).dt.strftime("%m-%d-%Y %I:%M %p")
             if "price" in latest.columns:
-                latest["Price"] = pd.to_numeric(latest["price"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
+                latest["Price"] = pd.to_numeric(latest["price"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "â€”")
             if "sma" in latest.columns:
-                latest["SMA"] = pd.to_numeric(latest["sma"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
+                latest["SMA"] = pd.to_numeric(latest["sma"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "â€”")
             if "action" in latest.columns:
-                latest["Action"] = latest["action"].fillna("—").astype(str).str.title()
+                latest["Action"] = latest["action"].fillna("â€”").astype(str).str.title()
             if ml_enabled and "ml_probability_up" in latest.columns:
-                latest["ML Up"] = pd.to_numeric(latest["ml_probability_up"], errors="coerce").map(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+                latest["ML Up"] = pd.to_numeric(latest["ml_probability_up"], errors="coerce").map(lambda v: f"{v:.2f}" if pd.notna(v) else "â€”")
             if "holding_minutes" in latest.columns:
-                latest["Hold Min"] = pd.to_numeric(latest["holding_minutes"], errors="coerce").round(1).map(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
+                latest["Hold Min"] = pd.to_numeric(latest["holding_minutes"], errors="coerce").round(1).map(lambda v: f"{v:.1f}" if pd.notna(v) else "â€”")
             display_cols = [c for c in ["Time", "Action", "Price", "SMA", "ML Up", "Hold Min"] if c in latest.columns]
             st.dataframe(latest[display_cols].iloc[::-1].reset_index(drop=True), use_container_width=True, hide_index=True)
+    _render_experiment_history()
 
 
-# ── Tab: Config ───────────────────────────────────────────────────────────────
+def _experiment_metric_direction(metric_name: str) -> bool:
+    return metric_name not in {"max_drawdown_pct"}
+
+
+def _experiment_metric_label(metric_name: str) -> str:
+    labels = {
+        "total_return_pct": "Total Return %",
+        "profit_factor": "Profit Factor",
+        "sharpe": "Sharpe",
+        "win_rate": "Win Rate",
+        "max_drawdown_pct": "Max Drawdown %",
+        "trade_count": "Trade Count",
+        "expectancy": "Expectancy",
+        "realized_pnl": "Realized PnL",
+    }
+    return labels.get(metric_name, metric_name.replace("_", " ").title())
+
+
+def _build_recent_experiment_table(experiments_df: pd.DataFrame, limit: int = 12) -> pd.DataFrame:
+    if experiments_df.empty:
+        return pd.DataFrame()
+    recent = experiments_df.head(limit).copy()
+    recent["Time"] = recent["timestamp"].dt.tz_convert(_ET).dt.strftime("%m-%d %I:%M %p")
+    recent["Strategy"] = recent["strategy_name"].fillna("n/a")
+    recent["Run"] = recent["run_type"].fillna("n/a")
+    recent["Summary"] = recent["summary_label"].fillna("n/a")
+    for column in ["total_return_pct", "profit_factor", "sharpe", "max_drawdown_pct", "trade_count"]:
+        if column in recent.columns:
+            recent[column] = pd.to_numeric(recent[column], errors="coerce")
+    selected = [column for column in ["Time", "Strategy", "Run", "Summary", "total_return_pct", "profit_factor", "sharpe", "max_drawdown_pct", "trade_count", "dataset_name"] if column in recent.columns]
+    renamed = recent[selected].rename(
+        columns={
+            "total_return_pct": "Return %",
+            "profit_factor": "PF",
+            "sharpe": "Sharpe",
+            "max_drawdown_pct": "Max DD %",
+            "trade_count": "Trades",
+            "dataset_name": "Dataset",
+        }
+    )
+    return renamed.reset_index(drop=True)
+
+
+def _build_top_experiment_table(experiments_df: pd.DataFrame, metric_name: str, limit: int = 8) -> pd.DataFrame:
+    if experiments_df.empty or metric_name not in experiments_df.columns:
+        return pd.DataFrame()
+    metric_df = experiments_df.dropna(subset=[metric_name]).copy()
+    if metric_df.empty:
+        return pd.DataFrame()
+    metric_df = metric_df.sort_values(metric_name, ascending=not _experiment_metric_direction(metric_name)).head(limit)
+    metric_df["Time"] = metric_df["timestamp"].dt.tz_convert(_ET).dt.strftime("%m-%d %I:%M %p")
+    metric_df["Strategy"] = metric_df["strategy_name"].fillna("n/a")
+    metric_df["Summary"] = metric_df["summary_label"].fillna("n/a")
+    metric_df["Run"] = metric_df["run_type"].fillna("n/a")
+    metric_df["Metric"] = pd.to_numeric(metric_df[metric_name], errors="coerce")
+    selected = [column for column in ["Time", "Strategy", "Run", "Summary", "Metric", "dataset_name"] if column in metric_df.columns]
+    return metric_df[selected].rename(columns={"dataset_name": "Dataset"}).reset_index(drop=True)
+
+
+def _render_experiment_history() -> None:
+    experiments_df = load_experiment_log_frame(DEFAULT_LOG_PATH)
+    st.markdown("<div class='sec-head'>Experiment History</div>", unsafe_allow_html=True)
+    if experiments_df.empty:
+        st.info(f"No experiment log entries found yet at {DEFAULT_LOG_PATH}.")
+        return
+
+    available_metrics = [
+        metric for metric in [
+            "total_return_pct",
+            "profit_factor",
+            "sharpe",
+            "win_rate",
+            "max_drawdown_pct",
+            "trade_count",
+            "expectancy",
+            "realized_pnl",
+        ]
+        if metric in experiments_df.columns and experiments_df[metric].notna().any()
+    ]
+    if not available_metrics:
+        st.info("Experiment log entries exist, but none of the tracked metrics are populated yet.")
+        return
+    metric_name = st.selectbox(
+        "Experiment metric",
+        available_metrics,
+        format_func=_experiment_metric_label,
+        key="experiment_history_metric",
+    )
+
+    latest_good = experiments_df[experiments_df["summary_label"] == "improved vs prior"].head(1)
+    latest_good_text = "No clearly improved run logged yet."
+    if not latest_good.empty:
+        row = latest_good.iloc[0]
+        metric_value = row.get(metric_name)
+        metric_text = f"{metric_value:.3f}" if pd.notna(metric_value) else "n/a"
+        latest_good_text = f"{row.get('strategy_name') or 'n/a'} at {row['timestamp'].tz_convert(_ET).strftime('%m-%d %I:%M %p')} with {_experiment_metric_label(metric_name)} {metric_text}."
+
+    top_row = experiments_df.dropna(subset=[metric_name]).sort_values(
+        metric_name,
+        ascending=not _experiment_metric_direction(metric_name),
+    ).head(1)
+    top_metric_text = "n/a"
+    if not top_row.empty:
+        value = top_row.iloc[0][metric_name]
+        top_metric_text = f"{value:.3f}" if pd.notna(value) else "n/a"
+
+    hdr_left, hdr_mid, hdr_right = st.columns(3)
+    with hdr_left:
+        st.metric("Logged runs", len(experiments_df))
+    with hdr_mid:
+        st.metric(f"Best {_experiment_metric_label(metric_name)}", top_metric_text)
+    with hdr_right:
+        st.caption(f"Last clearly good result: {latest_good_text}")
+
+    trend_df = experiments_df.dropna(subset=[metric_name]).sort_values("timestamp")
+    if not trend_df.empty:
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=trend_df["timestamp"],
+                y=trend_df[metric_name],
+                mode="lines+markers",
+                line=dict(color="#67b8ff", width=2),
+                marker=dict(
+                    size=8,
+                    color=[
+                        "#4ce2c5" if label == "improved vs prior"
+                        else "#f59e0b" if label == "insufficient evidence"
+                        else "#f87171"
+                        for label in trend_df["summary_label"].fillna("")
+                    ],
+                ),
+                text=trend_df["strategy_name"].fillna("n/a"),
+                hovertemplate="%{text}<br>%{x}<br>%{y}<extra></extra>",
+                name=_experiment_metric_label(metric_name),
+            )
+        )
+        fig.update_layout(
+            paper_bgcolor="#1a1d2e",
+            plot_bgcolor="#1a1d2e",
+            font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=11),
+            margin=dict(l=0, r=0, t=20, b=0),
+            xaxis=dict(gridcolor="#2d3148"),
+            yaxis=dict(gridcolor="#2d3148", title=_experiment_metric_label(metric_name)),
+            height=280,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    left, right = st.columns([1.25, 1])
+    with left:
+        st.markdown("<div class='sec-head'>Recent Experiments</div>", unsafe_allow_html=True)
+        st.dataframe(_build_recent_experiment_table(experiments_df), use_container_width=True, hide_index=True)
+    with right:
+        st.markdown(f"<div class='sec-head'>Top Runs By {_experiment_metric_label(metric_name)}</div>", unsafe_allow_html=True)
+        st.dataframe(_build_top_experiment_table(experiments_df, metric_name), use_container_width=True, hide_index=True)
+
+
+# â”€â”€ Tab: Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _render_config(state: DashboardState, snapshot) -> None:
     cfg = state.startup_config
@@ -3118,8 +5749,16 @@ def _render_config(state: DashboardState, snapshot) -> None:
         if state.ignored_snapshot_symbols:
             session_rows.append(("Ignored snapshot symbols", ", ".join(state.ignored_snapshot_symbols)))
         if cfg is not None:
+            approval_text = (
+                "approved"
+                if cfg.runtime_config_approved is True else
+                "unapproved"
+                if cfg.runtime_config_approved is False else
+                "unknown"
+            )
             session_rows.append(("Runtime config path", cfg.runtime_config_path or "n/a"))
             session_rows.append(("Runtime overrides", ", ".join(cfg.runtime_overrides) or "none"))
+            session_rows.append(("Runtime approval", approval_text))
         st.markdown("".join(_kv(k, v) for k, v in session_rows), unsafe_allow_html=True)
 
     with right:
@@ -3155,7 +5794,7 @@ def _render_config(state: DashboardState, snapshot) -> None:
             if model_names:
                 st.markdown(_kv("Model", ", ".join(model_names)), unsafe_allow_html=True)
             ml_rows = [
-                f"{item.symbol}: buy ≥ {item.ml_buy_threshold:.2f}  sell ≤ {item.ml_sell_threshold:.2f}"
+                f"{item.symbol}: buy â‰¥ {item.ml_buy_threshold:.2f}  sell â‰¤ {item.ml_sell_threshold:.2f}"
                 for item in snapshot.symbols
                 if getattr(item, "ml_buy_threshold", None) is not None
             ]
@@ -3165,9 +5804,17 @@ def _render_config(state: DashboardState, snapshot) -> None:
                 st.markdown(_kv("Thresholds", "n/a"), unsafe_allow_html=True)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# â”€â”€ Main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _render_config_v2(state: DashboardState, snapshot) -> None:
+    st.markdown(
+        _section_intro_html(
+            "Setup",
+            "See the runtime shape without digging through files",
+            "This section groups the bot's operating mode, session context, guardrails, and ML gates so the configuration reads like a system overview.",
+        ),
+        unsafe_allow_html=True,
+    )
     cfg = state.startup_config
     ml_enabled = _strategy_mode_uses_ml(cfg.strategy_mode if cfg is not None else None)
     left, right = st.columns(2)
@@ -3227,8 +5874,27 @@ def _render_config_v2(state: DashboardState, snapshot) -> None:
         if state.ignored_snapshot_symbols:
             session_rows.append(("Ignored snapshot symbols", ", ".join(state.ignored_snapshot_symbols)))
         if cfg is not None:
+            approval_text = (
+                "approved"
+                if cfg.runtime_config_approved is True else
+                "unapproved"
+                if cfg.runtime_config_approved is False else
+                "unknown"
+            )
             session_rows.append(("Runtime config path", cfg.runtime_config_path or "n/a"))
             session_rows.append(("Runtime overrides", ", ".join(cfg.runtime_overrides) or "none"))
+            session_rows.append(("Runtime approval", approval_text))
+            session_rows.append(("ML lookback bars", str(cfg.ml_lookback_bars or "n/a")))
+            if cfg.strategy_mode == "mean_reversion":
+                session_rows.append(("MR exit style", cfg.mean_reversion_exit_style or "n/a"))
+                session_rows.append(("MR max ATR pctile", f"{cfg.mean_reversion_max_atr_percentile:.1f}" if cfg.mean_reversion_max_atr_percentile else "off"))
+                session_rows.append(("MR trend filter", "on" if cfg.mean_reversion_trend_filter else "off"))
+                session_rows.append(("MR slope filter", "on" if cfg.mean_reversion_trend_slope_filter else "off"))
+                session_rows.append(("MR stop", f"{cfg.mean_reversion_stop_pct * 100:.2f}%" if cfg.mean_reversion_stop_pct else "off"))
+            session_rows.append(("SMA stop", f"{cfg.sma_stop_pct * 100:.2f}%" if cfg.sma_stop_pct else "off"))
+            session_rows.append(("Breakout max stop", f"{cfg.breakout_max_stop_pct * 100:.2f}%" if cfg.breakout_max_stop_pct else "off"))
+            if cfg.runtime_config_rejection_reasons:
+                session_rows.append(("Approval notes", "; ".join(cfg.runtime_config_rejection_reasons)))
         st.markdown(
             "<section class='config-card'>"
             "<div class='config-card-top'>"
@@ -3337,12 +6003,6 @@ def main() -> None:
     recent_orders = state.recent_orders
     execution_previews = None
     last_cycle_report = state.last_cycle_report
-    header_symbol_count = len(state.startup_config.symbols) if state.startup_config is not None else len(snapshot.symbols)
-    header_mode_label = (
-        state.startup_config.strategy_mode
-        if state.startup_config is not None
-        else ("snapshot only" if state.has_persisted_snapshot else "no persisted startup config")
-    )
     dashboard_config = state.startup_config or SimpleNamespace(
         paper=False,
         symbols=[],
@@ -3355,28 +6015,7 @@ def main() -> None:
         get_price_feed_status=lambda: state.feed_status,
     )
 
-    hdr_l, hdr_r = st.columns([2.2, 1])
-    with hdr_l:
-        st.markdown(_header_summary_html(state, snapshot, last_cycle_report), unsafe_allow_html=True)
-
-    with hdr_r:
-        monitor_badge = "<span class='badge b-nosignal'>READ ONLY</span>"
-        if last_cycle_report is not None and last_cycle_report.processed_bar:
-            last_text = f"Last bar: {_format_datetime_pretty(last_cycle_report.decision_timestamp)}"
-        elif last_cycle_report is not None:
-            last_text = _cycle_reason_label(last_cycle_report.skip_reason)
-        else:
-            last_text = "No persisted cycle yet"
-        st.markdown(
-            "<div class='action-card'>"
-            "<div class='workspace-label'>What You Can Do Here</div>"
-            f"<div class='status-inline' style='justify-content:flex-start;margin-bottom:0.45rem'>{monitor_badge}</div>"
-            f"<div class='status-emphasis'>{last_text}</div>"
-            "<div class='subtle-copy' style='margin-top:0.35rem'>You can inspect the live bot here, but trades are still managed by the running bot process.</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        refresh = st.button("Refresh", use_container_width=False, type="secondary")
+    refresh = _render_operator_header(state, snapshot, recent_orders)
 
     if refresh:
         try:
@@ -3385,12 +6024,6 @@ def main() -> None:
             recent_orders = state.recent_orders
             execution_previews = None
             last_cycle_report = state.last_cycle_report
-            header_symbol_count = len(state.startup_config.symbols) if state.startup_config is not None else len(snapshot.symbols)
-            header_mode_label = (
-                state.startup_config.strategy_mode
-                if state.startup_config is not None
-                else ("snapshot only" if state.has_persisted_snapshot else "no persisted startup config")
-            )
             dashboard_config = state.startup_config or SimpleNamespace(
                 paper=False,
                 symbols=[],
@@ -3406,57 +6039,13 @@ def main() -> None:
             render_startup_error(exc)
             return
 
-    st.markdown(_metrics_bar_html(snapshot), unsafe_allow_html=True)
-    _render_bar_timing(bot)
-
-    try:
-        feed_status = bot.get_price_feed_status()
-        if "stale" in feed_status.lower():
-            dot_cls = "dot-error"
-        elif "fresh" in feed_status.lower() or "received" in feed_status.lower():
-            dot_cls = "dot-live"
-        else:
-            dot_cls = "dot-rest"
-    except Exception:
-        feed_status = "unavailable"
-        dot_cls = "dot-error"
-    st.markdown(
-        _feed_health_html(feed_status, dot_cls, snapshot, getattr(bot.config, "bar_timeframe_minutes", 15) or 15),
-        unsafe_allow_html=True,
-    )
-
     status_cards: list[str] = []
-    if not state.has_persisted_snapshot:
-        status_cards.append(
-            _status_card_html(
-                "info",
-                "Waiting for the first saved update",
-                "Start `tradeos live` or wait for the bot to write its first cycle.",
-            )
-        )
-    if not state.has_persisted_startup_config:
-        if state.has_persisted_snapshot:
-            status_cards.append(
-                _status_card_html(
-                    "warn",
-                    "Setup details are still missing",
-                    "Snapshot data exists, but startup_config.json has not been saved for this session yet.",
-                )
-            )
-        else:
-            status_cards.append(
-                _status_card_html(
-                    "warn",
-                    "Setup details are still missing",
-                    "The setup panels will stay partial until `tradeos live` writes startup_config.json.",
-                )
-            )
     for message in state.session_warnings:
-        status_cards.append(_status_card_html("warn", "Heads up", message))
+        status_cards.append(_status_card_html("warn", "Runtime Warning", message))
     if status_cards:
         st.markdown("".join(status_cards), unsafe_allow_html=True)
 
-    live_tab, history_tab, config_tab, drill_tab = st.tabs(["Live", "History", "Config", "Drilldown"])
+    live_tab, history_tab, config_tab, drill_tab = st.tabs(["Live Desk", "Performance", "Setup", "Decision Log"])
 
     with live_tab:
         _render_live(
@@ -3466,6 +6055,7 @@ def main() -> None:
             execution_previews,
             state.latest_signals,
             list(state.recent_execution_activity),
+            list(state.recent_activity),
             last_cycle_report,
             list(state.latest_signal_rows),
             list(state.latest_cycle_risk_checks),
@@ -3475,6 +6065,8 @@ def main() -> None:
             ),
             recent_narrations=list(state.recent_narrations),
             recent_near_misses=list(state.recent_near_misses),
+            session_block_reason_counts=list(state.session_block_reason_counts),
+            drift_report=state.drift_report,
         )
 
     with history_tab:
@@ -3489,3 +6081,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

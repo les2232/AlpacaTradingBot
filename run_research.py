@@ -21,6 +21,7 @@ Primary outputs written under /results:
   - best_config_latest.json
   - stability_report.json
   - trade_decision.json
+  - drift_profile.json
 
 This script is intentionally different from run_compare_suite.ps1:
   - run_research.py is the configurable multi-window research workflow
@@ -35,6 +36,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
+from daily_report import DEFAULT_BACKTEST, WARN
+from research.experiment_log import log_experiment_run
+import strategy_report
 
 # ---------------------------------------------------------------------------
 # PATHS
@@ -49,6 +53,7 @@ BEST_CONFIG_PATH      = RESULTS_DIR / "best_config_latest.json"
 STABILITY_REPORT_PATH = RESULTS_DIR / "stability_report.json"
 TRADE_DECISION_PATH   = RESULTS_DIR / "trade_decision.json"
 LIVE_CONFIG_PATH      = CONFIG_DIR / "live_config.json"
+DRIFT_PROFILE_PATH    = RESULTS_DIR / "drift_profile.json"
 
 
 def _load_live_runtime_defaults() -> dict:
@@ -372,6 +377,9 @@ CONFIG_COLS = [
     "breakout_tight_stop_fraction",
     "mean_reversion_exit_style",
     "mean_reversion_max_atr_percentile",
+    "mean_reversion_trend_filter",
+    "mean_reversion_trend_slope_filter",
+    "mean_reversion_stop_pct",
 ]
 
 METRIC_COLS = [
@@ -656,6 +664,9 @@ def step_write_live_config(
         "breakout_tight_stop_fraction",
         "mean_reversion_exit_style",
         "mean_reversion_max_atr_percentile",
+        "mean_reversion_trend_filter",
+        "mean_reversion_trend_slope_filter",
+        "mean_reversion_stop_pct",
         "atr_multiple",
         "atr_percentile_threshold",
         "ml_probability_buy",
@@ -687,6 +698,12 @@ def step_write_live_config(
         "breakout_tight_stop_fraction": float(best_row["breakout_tight_stop_fraction"]),
         "mean_reversion_exit_style": best_row["mean_reversion_exit_style"],
         "mean_reversion_max_atr_percentile": float(best_row["mean_reversion_max_atr_percentile"]),
+        "mean_reversion_trend_filter": _coerce_boolish(best_row["mean_reversion_trend_filter"], "mean_reversion_trend_filter"),
+        "mean_reversion_trend_slope_filter": _coerce_boolish(
+            best_row["mean_reversion_trend_slope_filter"],
+            "mean_reversion_trend_slope_filter",
+        ),
+        "mean_reversion_stop_pct": float(best_row["mean_reversion_stop_pct"]),
     }
 
     payload = {
@@ -1026,6 +1043,120 @@ def step_save_trade_decision(decision: dict, output_path: Path) -> None:
     _log(f"Trade decision  : {output_path}")
 
 
+def _safe_metric(row: dict, key: str) -> float | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_hybrid_branch_participation(best_row: dict) -> dict[str, float] | None:
+    mr_share = _safe_metric(best_row, "mr_branch_trade_share_pct")
+    bb_share = _safe_metric(best_row, "bb_branch_trade_share_pct")
+    participation: dict[str, float] = {}
+    if mr_share is not None:
+        participation["mean_reversion"] = mr_share / 100.0 if mr_share > 1.0 else mr_share
+    if bb_share is not None:
+        participation["bollinger_breakout"] = bb_share / 100.0 if bb_share > 1.0 else bb_share
+    return participation or None
+
+
+def build_drift_profile_payload(
+    *,
+    best_row: dict,
+    dataset_path: Path,
+    approved: bool,
+    stability: dict,
+    regime: dict,
+) -> dict:
+    symbols, symbol_source, manifest = _resolve_dataset_symbols(dataset_path)
+    symbol_count = len(symbols)
+    timeframe_text = str(manifest.get("timeframe") or "").strip()
+    timeframe_minutes = _parse_timeframe_to_minutes(timeframe_text) if timeframe_text else None
+    trades_per_day = _safe_metric(best_row, "trades_per_day")
+    buy_rate = (
+        trades_per_day / symbol_count
+        if trades_per_day is not None and symbol_count > 0
+        else None
+    )
+    hybrid_branch_participation = _build_hybrid_branch_participation(best_row)
+
+    return {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "approved": approved,
+        "source_artifacts": {
+            "dataset": str(dataset_path),
+            "dataset_symbol_source": symbol_source,
+            "best_config": str(BEST_CONFIG_PATH),
+            "trade_decision": str(TRADE_DECISION_PATH),
+            "stability_report": str(STABILITY_REPORT_PATH),
+            "live_config": str(LIVE_CONFIG_PATH),
+        },
+        "context": {
+            "strategy_mode": best_row.get("strategy_mode"),
+            "symbols": symbols,
+            "symbol_count": symbol_count,
+            "timeframe": timeframe_text or None,
+            "bar_timeframe_minutes": timeframe_minutes,
+            "stable": bool(stability.get("stable", False)),
+            "market_regime": regime.get("regime"),
+        },
+        "performance": {
+            "trades_per_day": trades_per_day,
+            "win_rate": _safe_metric(best_row, "win_rate"),
+            "profit_factor": _safe_metric(best_row, "profit_factor"),
+            "sharpe_ratio": _safe_metric(best_row, "sharpe_ratio"),
+            "realized_pnl": _safe_metric(best_row, "realized_pnl"),
+            "combined_score": _safe_metric(best_row, "combined_score"),
+        },
+        "metrics": {
+            "buy_signal_rate_per_symbol_per_day": buy_rate,
+            "sell_signal_rate_per_symbol_per_day": buy_rate,
+            "rejection_rate": float(DEFAULT_BACKTEST["rejection_rate"]),
+            "rejection_breakdown": None,
+            "hybrid_branch_participation": hybrid_branch_participation,
+            "avg_bar_age_s": float(WARN["avg_bar_age_s"]),
+            "stale_bar_rate": 0.0,
+        },
+        "metric_sources": {
+            "buy_signal_rate_per_symbol_per_day": "best_row.trades_per_day / promoted symbol_count",
+            "sell_signal_rate_per_symbol_per_day": "derived from long-only trades_per_day cadence",
+            "rejection_rate": "daily_report.DEFAULT_BACKTEST.rejection_rate",
+            "rejection_breakdown": "not available from current research artifacts",
+            "hybrid_branch_participation": (
+                "best_row branch share columns"
+                if hybrid_branch_participation is not None
+                else "not available for this promoted strategy"
+            ),
+            "avg_bar_age_s": "daily_report.WARN.avg_bar_age_s",
+            "stale_bar_rate": "validated operator expectation: zero stale bars",
+        },
+    }
+
+
+def step_save_drift_profile(
+    best_row: dict,
+    dataset_path: Path,
+    approved: bool,
+    stability: dict,
+    regime: dict,
+    output_path: Path,
+) -> None:
+    payload = build_drift_profile_payload(
+        best_row=best_row,
+        dataset_path=dataset_path,
+        approved=approved,
+        stability=stability,
+        regime=regime,
+    )
+    _ensure_dir(output_path.parent)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _log(f"Drift profile   : {output_path}")
+
+
 def _report_outputs(output_csv: Path) -> None:
     """Print paths of all CSV files the backtest runner produced."""
     # backtest_runner.py appends these suffixes when --output-csv is given.
@@ -1049,6 +1180,7 @@ def main() -> None:
     _log(f"Stability report   : {STABILITY_REPORT_PATH}")
     _log(f"Trade decision     : {TRADE_DECISION_PATH}")
     _log(f"Live config target : {LIVE_CONFIG_PATH}")
+    _log(f"Drift profile      : {DRIFT_PROFILE_PATH}")
 
     window_results: list[dict] = []
     primary_sweep_csv: Path | None = None
@@ -1153,6 +1285,24 @@ def main() -> None:
         )
         step_save_trade_decision(decision, TRADE_DECISION_PATH)
 
+        if approved:
+            _section("Save drift profile")
+            step_save_drift_profile(
+                primary["best_row"],
+                primary["dataset"],
+                approved,
+                stability,
+                regime,
+                DRIFT_PROFILE_PATH,
+            )
+        else:
+            _section("Save drift profile")
+            _log("Skipped drift profile generation because the selected config was not approved.")
+
+        _section("Generate operator reports")
+        for report_path in strategy_report.write_reports(SCRIPT_DIR):
+            _log(f"Report       : {report_path}")
+
     except RuntimeError as exc:
         _section("FAILED")
         _log(f"Error: {exc}")
@@ -1161,6 +1311,48 @@ def main() -> None:
     _section("Done")
     if primary_sweep_csv:
         _report_outputs(primary_sweep_csv)
+    if window_results:
+        primary = window_results[-1]
+        log_experiment_run(
+            run_type="research_pipeline",
+            script_path=__file__,
+            entrypoint=sys.argv[0],
+            strategy_name=str(primary["best_row"].get("strategy_mode") or "unknown"),
+            dataset_path=primary["dataset"],
+            symbols=SNAPSHOT_SYMBOLS,
+            params={
+                "dataset_arg": args.dataset,
+                "validation_windows": VALIDATION_WINDOWS,
+                "snapshot_timeframe": SNAPSHOT_TIMEFRAME,
+                "snapshot_feed": SNAPSHOT_FEED,
+                "snapshot_adjustment": SNAPSHOT_ADJUSTMENT,
+                "snapshot_align_mode": SNAPSHOT_ALIGN_MODE,
+                "sweep_params": dict(SWEEP_PARAMS),
+                "fixed_params": dict(FIXED_PARAMS),
+            },
+            metrics={
+                "total_return_pct": primary["best_row"].get("total_return_pct"),
+                "profit_factor": primary["best_row"].get("profit_factor"),
+                "sharpe": primary["best_row"].get("sharpe_ratio"),
+                "win_rate": primary["best_row"].get("win_rate"),
+                "max_drawdown_pct": primary["best_row"].get("max_drawdown_pct"),
+                "trade_count": primary["best_row"].get("total_trades"),
+                "expectancy": primary["best_row"].get("expectancy"),
+                "realized_pnl": primary["best_row"].get("realized_pnl"),
+            },
+            output_path=RESULTS_DIR,
+            summary_path=STABILITY_REPORT_PATH,
+            extra_fields={
+                "approved": approved,
+                "approval_reasons": rejection_reasons,
+                "stable": stability["stable"],
+                "stability_reasons": stability["reasons"],
+                "market_regime": regime["regime"],
+                "primary_sweep_csv": str(primary_sweep_csv) if primary_sweep_csv else None,
+                "trade_decision_path": str(TRADE_DECISION_PATH),
+                "best_config_path": str(BEST_CONFIG_PATH),
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,47 @@
+{
+  "dataset_path": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e",
+  "symbol_count": 15,
+  "symbols": [
+    "ABBV",
+    "AMD",
+    "BAC",
+    "C",
+    "COP",
+    "GOOGL",
+    "HD",
+    "HON",
+    "JPM",
+    "LLY",
+    "MSFT",
+    "QCOM",
+    "TSLA",
+    "WFC",
+    "XOM"
+  ],
+  "timeframe": "15Min",
+  "feed": "iex",
+  "session_filter": null,
+  "score_mode": "return_20_plus_60",
+  "rank_lookback_bars": 20,
+  "eligible_percent": 0.2,
+  "horizons": [
+    5,
+    10,
+    20
+  ],
+  "timestamps_total": 1583,
+  "timestamps_ranked": 1523,
+  "timestamps_skipped": 60,
+  "observation_count": 22845,
+  "spread_observation_count": 4534,
+  "walk_forward_window_count": 0,
+  "success_criteria": {
+    "top_beats_middle_horizon_count": 0,
+    "top_beats_bottom_horizon_count": 0,
+    "positive_spread_horizon_count": 0,
+    "spread_horizon_count": 3,
+    "positive_spread_time_slice_count": 6,
+    "top_bucket_max_membership_share_pct": 9.967170059093894,
+    "signal_audit_pass": false
+  }
+}

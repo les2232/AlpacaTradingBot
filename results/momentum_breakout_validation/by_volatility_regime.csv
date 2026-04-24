@@ -1,0 +1,4 @@
+volatility_regime,signal_count,avg_forward_return_pct,realized_trade_count,realized_expectancy,realized_win_rate
+high_vol,32,-0.23224118900268242,26,-2.5574154432962404,38.46153846153847
+low_vol,4,0.1451671898021999,3,1.7022249023971578,66.66666666666666
+mid_vol,8,-0.6549715418852387,7,-6.418302058017583,0.0

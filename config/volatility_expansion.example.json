@@ -1,0 +1,23 @@
+{
+  "source": {
+    "dataset": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e"
+  },
+  "runtime": {
+    "strategy_mode": "volatility_expansion",
+    "symbols": ["AMD", "JPM", "HON", "C"],
+    "sma_bars": 20,
+    "time_window_mode": "combined_windows",
+    "regime_filter_enabled": true,
+    "atr_percentile_threshold": 0.0,
+    "volatility_expansion_lookback_bars": 20,
+    "volatility_expansion_entry_buffer_pct": 0.001,
+    "volatility_expansion_max_atr_percentile": 35.0,
+    "volatility_expansion_trend_filter": false,
+    "volatility_expansion_min_slope": 0.0,
+    "volatility_expansion_use_volume_confirm": true,
+    "volatility_expansion_exit_style": "fixed_bars",
+    "volatility_expansion_hold_bars": 4,
+    "volatility_expansion_stop_pct": 0.0,
+    "volatility_expansion_take_profit_pct": 0.0
+  }
+}

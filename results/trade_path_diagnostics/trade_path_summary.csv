@@ -1,0 +1,2 @@
+raw_signal_count,closed_trade_count,avg_signal_to_entry_gap_pct,avg_best_net_exit_pct,avg_realized_return_pct,diagnosis
+200,75,0.030409221899089768,0.49815997089263875,-0.08523852796494384,"The strategy is producing some favorable excursion, but it is not capturing it reliably."

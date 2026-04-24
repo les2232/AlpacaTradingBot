@@ -1,0 +1,18 @@
+{
+  "classification": {
+    "label": "not ready",
+    "reason": "The strategy does not show positive raw continuation or realized expectancy on this sample."
+  },
+  "baseline": {
+    "strategy_mode": "momentum_breakout",
+    "signal_count": 44,
+    "closed_trade_count": 36,
+    "backtest_result": {
+      "realized_pnl": -106.31424122463386,
+      "expectancy": -2.9531733673509404,
+      "win_rate": 33.33333333333333,
+      "profit_factor": 0.30155789724276977,
+      "max_drawdown_pct": 1.077277577171026
+    }
+  }
+}

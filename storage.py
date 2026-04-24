@@ -69,6 +69,13 @@ class BotStorage:
                     decision_ts TEXT PRIMARY KEY,
                     claimed_at_utc TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS processed_order_fills (
+                    order_id TEXT NOT NULL,
+                    filled_qty REAL NOT NULL,
+                    claimed_at_utc TEXT NOT NULL,
+                    PRIMARY KEY (order_id, filled_qty)
+                );
                 """
             )
             symbol_columns = {
@@ -115,6 +122,18 @@ class BotStorage:
                 VALUES (?, ?)
                 """,
                 (decision_ts, claimed_at_utc),
+            )
+            return int(cursor.rowcount or 0) == 1
+
+    def claim_order_fill(self, order_id: str, filled_qty: float, claimed_at_utc: str) -> bool:
+        normalized_qty = round(float(filled_qty), 6)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO processed_order_fills (order_id, filled_qty, claimed_at_utc)
+                VALUES (?, ?, ?)
+                """,
+                (order_id, normalized_qty, claimed_at_utc),
             )
             return int(cursor.rowcount or 0) == 1
 

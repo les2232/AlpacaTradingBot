@@ -1,0 +1,54 @@
+{
+  "dataset_path": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__sip__97d4a1837aaa__regular",
+  "timeframe": "15Min",
+  "feed": "sip",
+  "session_filter": "regular",
+  "symbol_count": 15,
+  "symbols": [
+    "ABBV",
+    "AMD",
+    "BAC",
+    "C",
+    "COP",
+    "GOOGL",
+    "HD",
+    "HON",
+    "JPM",
+    "LLY",
+    "MSFT",
+    "QCOM",
+    "TSLA",
+    "WFC",
+    "XOM"
+  ],
+  "lookback_bars": 20,
+  "horizons": [
+    5,
+    10,
+    20
+  ],
+  "total_rows": 23790,
+  "rows_after_symbol_sort": 23790,
+  "rows_with_lookback": 23490,
+  "rows_with_all_horizons": 23490,
+  "timestamps_total": 1586,
+  "timestamps_ranked": 1566,
+  "timestamps_dropped_lt3": 20,
+  "symbol_observations_used": 23490,
+  "spread_observations_used": 4663,
+  "dropped_rows_for_lookback": 300,
+  "dropped_rows_for_max_horizon": 0,
+  "interpretation": {
+    "top_beats_bottom_horizons": [
+      5,
+      10,
+      20
+    ],
+    "spread_positive_horizon_ratio": 1.0,
+    "spread_positive_time_slice_ratio": 0.6666666666666666,
+    "best_spread_horizon_bars": 20,
+    "best_spread_mean_return_pct": 0.036372721714541735,
+    "top_bucket_most_frequent_symbol": "COP",
+    "top_bucket_membership_share_pct": 9.757343550446999
+  }
+}

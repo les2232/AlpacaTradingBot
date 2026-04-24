@@ -49,7 +49,8 @@ def _trace_id(symbol: str, decision_ts: str) -> str:
 
 def _make_file_logger(name: str, path: Path) -> logging.Logger:
     path.parent.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger(name)
+    logger_name = f"{name}.{path.resolve()}".replace("\\", "/")
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     if not logger.handlers:
@@ -74,25 +75,38 @@ class BotLogger:
         logs/2026-04-09/positions.jsonl    -- position open / close with PnL
         logs/2026-04-09/risk.jsonl         -- kill switch + position limit checks
         logs/2026-04-09/bars.jsonl         -- bar timing / stale detection
+        logs/2026-04-09/lifecycle.jsonl    -- process start / stop breadcrumbs
     """
 
-    def __init__(self, log_root: str | Path = "logs") -> None:
+    def __init__(self, log_root: str | Path = "logs", session_id: str | None = None) -> None:
+        self.log_root = Path(log_root)
         date_str = datetime.now().strftime("%Y-%m-%d")
-        day_dir = Path(log_root) / date_str
+        day_dir = self.log_root / date_str
 
         self._signals  = _make_file_logger("bot.signals",  day_dir / "signals.jsonl")
         self._exec     = _make_file_logger("bot.exec",     day_dir / "execution.jsonl")
         self._pos      = _make_file_logger("bot.positions",day_dir / "positions.jsonl")
         self._risk     = _make_file_logger("bot.risk",     day_dir / "risk.jsonl")
         self._bars     = _make_file_logger("bot.bars",     day_dir / "bars.jsonl")
+        self._lifecycle = _make_file_logger("bot.lifecycle", day_dir / "lifecycle.jsonl")
+        self._session_id = session_id
 
         # Track signal bar prices for slippage calculation at fill time
         self._signal_bar_prices: dict[str, float] = {}
 
     def _emit(self, logger: logging.Logger, event: str, **fields) -> None:
+        if self._session_id and "session_id" not in fields:
+            fields["session_id"] = self._session_id
         fields["event"] = event
         fields["ts"] = _utcnow()
         logger.info(json.dumps(fields, default=str))
+
+    # ------------------------------------------------------------------
+    # 0. Process lifecycle
+    # ------------------------------------------------------------------
+
+    def lifecycle(self, stage: str, **fields) -> None:
+        self._emit(self._lifecycle, "process.lifecycle", stage=stage, **fields)
 
     # ------------------------------------------------------------------
     # 1. Bar received / timing
@@ -147,6 +161,7 @@ class BotLogger:
         window_open: bool,
         rejection: str | None,  # None if action is BUY/SELL, else the reason it's HOLD
         ml_prob: float | None = None,
+        extra_fields: dict[str, object] | None = None,
     ) -> None:
         deviation_pct = round((bar_close - sma) / sma * 100, 4) if sma > 0 else None
         trace = _trace_id(symbol, decision_ts)
@@ -155,7 +170,7 @@ class BotLogger:
         if action in ("BUY", "SELL"):
             self._signal_bar_prices[symbol] = bar_close
 
-        self._emit(self._signals, "signal.evaluated",
+        payload = dict(
             trace=trace,
             symbol=symbol,
             decision_ts=decision_ts,
@@ -175,6 +190,9 @@ class BotLogger:
             holding=holding,
             rejection=rejection,
         )
+        if extra_fields:
+            payload.update(extra_fields)
+        self._emit(self._signals, "signal.evaluated", **payload)
 
     # ------------------------------------------------------------------
     # 3. Risk checks — one call per symbol per BUY attempt
@@ -427,6 +445,7 @@ class BotLogger:
         entry_price: float,
         qty: float,
         strategy_mode: str,
+        entry_branch: str | None = None,
     ) -> None:
         self._emit(self._pos, "position.opened",
             trace=_trace_id(symbol, decision_ts),
@@ -435,6 +454,7 @@ class BotLogger:
             qty=qty,
             notional=round(entry_price * qty, 2),
             strategy_mode=strategy_mode,
+            entry_branch=entry_branch,
         )
 
     def position_closed(

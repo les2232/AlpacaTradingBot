@@ -1,0 +1,3 @@
+variant_id,family,rank_lookback_bars,eligible_percent,pullback_depth_atr,hold_bars,trade_count,expectancy,win_rate,profit_factor,avg_hold_bars,total_pnl,total_return_pct,max_drawdown_pct,top_positive_symbol_share
+selected_baseline_stitched_oos,baseline,,,,5,83,-0.320711988953493,46.98795180722892,0.9635808910612186,5.0,-26.61909508313992,-2.661909508313992,3.1707818588379366,0.36438925331544986
+selected_pullback_stitched_oos,pullback,,,,5,75,-1.5213846435139147,48.0,0.852595411839132,5.0,-114.1038482635436,-11.410384826354358,3.6912059519190175,0.3784621422148297

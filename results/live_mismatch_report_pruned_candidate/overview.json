@@ -1,0 +1,50 @@
+{
+  "config_path": "config\\live_config.pruned_candidate.json",
+  "dataset_path": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260320T000000Z__20260422T000000Z__iex__b92c5adddeca",
+  "start_date": "2026-04-14",
+  "end_date": "2026-04-21",
+  "effective_symbols": [
+    "AMD",
+    "BAC",
+    "C",
+    "COP",
+    "GOOGL",
+    "HD",
+    "JPM",
+    "MSFT",
+    "QCOM",
+    "TSLA",
+    "WFC"
+  ],
+  "backtest": {
+    "realized_pnl": -62.64761125345888,
+    "total_return_pct": -0.6264761125346376,
+    "win_rate": 39.285714285714285,
+    "profit_factor": 0.708365438615196,
+    "total_trades": 112,
+    "closed_trades": 56
+  },
+  "live": {
+    "buy_signals": 16,
+    "closed_trades": 7,
+    "realized_pnl": -67.2
+  },
+  "gaps": {
+    "closed_trade_gap": 49,
+    "realized_pnl_gap": 4.552388746541126
+  },
+  "top_live_block_reasons": {
+    "GOOGL": [
+      {
+        "block_reason": "max_orders_per_minute",
+        "count": 1
+      }
+    ],
+    "MSFT": [
+      {
+        "block_reason": "outside_entry_window",
+        "count": 1
+      }
+    ]
+  }
+}

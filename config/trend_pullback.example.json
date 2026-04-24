@@ -1,0 +1,19 @@
+{
+  "runtime": {
+    "strategy_mode": "trend_pullback",
+    "sma_bars": 15,
+    "entry_threshold_pct": 0.0015,
+    "threshold_mode": "static_pct",
+    "atr_percentile_threshold": 0.0,
+    "time_window_mode": "combined_windows",
+    "regime_filter_enabled": false,
+    "trend_pullback_min_adx": 20.0,
+    "trend_pullback_min_slope": 0.0,
+    "trend_pullback_entry_threshold": 0.0015,
+    "trend_pullback_min_atr_percentile": 20.0,
+    "trend_pullback_max_atr_percentile": 0.0,
+    "trend_pullback_exit_style": "fixed_bars",
+    "trend_pullback_hold_bars": 4,
+    "trend_pullback_stop_pct": 0.0
+  }
+}

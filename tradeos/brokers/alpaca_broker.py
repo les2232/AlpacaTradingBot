@@ -25,6 +25,9 @@ _PRICE_STREAM_FEED_BY_NAME = {
     "delayed_sip": DataFeed.DELAYED_SIP,
 }
 
+_DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
+_DEFAULT_READ_TIMEOUT_SECONDS = 20.0
+
 
 def _minutes_to_timeframe(minutes: int) -> TimeFrame:
     if minutes >= 60 and minutes % 60 == 0:
@@ -39,6 +42,40 @@ def _normalize_enum_text(value: Any) -> str:
     return text.lower()
 
 
+def _read_timeout_seconds(env_name: str, default: float) -> float:
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _normalize_data_feed_name(raw_value: str | None, *, default: str = "iex") -> str:
+    normalized = str(raw_value or default).strip().lower()
+    return normalized if normalized in _PRICE_STREAM_FEED_BY_NAME else default
+
+
+def _install_default_request_timeout(
+    client: Any,
+    *,
+    connect_timeout_seconds: float,
+    read_timeout_seconds: float,
+) -> None:
+    session = getattr(client, "_session", None)
+    request = getattr(session, "request", None)
+    if session is None or request is None:
+        return
+
+    def _request_with_timeout(method: str, url: str, **kwargs: Any) -> Any:
+        kwargs.setdefault("timeout", (connect_timeout_seconds, read_timeout_seconds))
+        return request(method, url, **kwargs)
+
+    session.request = _request_with_timeout
+
+
 class AlpacaBroker(BrokerClient):
     def __init__(
         self,
@@ -47,12 +84,34 @@ class AlpacaBroker(BrokerClient):
         api_secret: str,
         paper: bool,
         symbols: list[str],
+        price_stream_feed: str = "iex",
+        latest_data_feed: str = "iex",
     ) -> None:
         self._api_key = api_key
         self._api_secret = api_secret
         self._symbols = list(symbols)
         self._trading = TradingClient(api_key, api_secret, paper=paper)
         self._data = StockHistoricalDataClient(api_key, api_secret)
+        connect_timeout_seconds = _read_timeout_seconds(
+            "ALPACA_HTTP_CONNECT_TIMEOUT_SECONDS",
+            _DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        )
+        read_timeout_seconds = _read_timeout_seconds(
+            "ALPACA_HTTP_READ_TIMEOUT_SECONDS",
+            _DEFAULT_READ_TIMEOUT_SECONDS,
+        )
+        _install_default_request_timeout(
+            self._trading,
+            connect_timeout_seconds=connect_timeout_seconds,
+            read_timeout_seconds=read_timeout_seconds,
+        )
+        _install_default_request_timeout(
+            self._data,
+            connect_timeout_seconds=connect_timeout_seconds,
+            read_timeout_seconds=read_timeout_seconds,
+        )
+        self._price_stream_feed_name = _normalize_data_feed_name(price_stream_feed)
+        self._latest_data_feed_name = _normalize_data_feed_name(latest_data_feed)
         self._stream_enabled = os.getenv("ENABLE_PRICE_STREAM", "true").lower() != "false"
         self._stream_error: str | None = None
         self._latest_prices: dict[str, float] = {}
@@ -61,6 +120,7 @@ class AlpacaBroker(BrokerClient):
         self._price_lock = threading.Lock()
         self._data_stream: StockDataStream | None = None
         self._stream_thread: threading.Thread | None = None
+        self._stream_restart_lock = threading.Lock()
 
     def get_account(self) -> BrokerAccount:
         account = cast(Any, self._trading).get_account()
@@ -79,13 +139,12 @@ class AlpacaBroker(BrokerClient):
         return bool(getattr(clock, "is_open", False))
 
     def _preferred_price_stream_feed(self) -> DataFeed:
-        raw = os.getenv("PRICE_STREAM_FEED", "iex").strip().lower()
-        return _PRICE_STREAM_FEED_BY_NAME.get(raw, DataFeed.IEX)
+        return _PRICE_STREAM_FEED_BY_NAME.get(self._price_stream_feed_name, DataFeed.IEX)
 
     def _latest_trade_feeds(self) -> list[DataFeed]:
-        preferred = self._preferred_price_stream_feed()
+        preferred = _PRICE_STREAM_FEED_BY_NAME.get(self._latest_data_feed_name, DataFeed.IEX)
         feeds: list[DataFeed] = []
-        for feed in (preferred, DataFeed.IEX, DataFeed.SIP):
+        for feed in (preferred, self._preferred_price_stream_feed(), DataFeed.IEX, DataFeed.SIP):
             if feed not in feeds:
                 feeds.append(feed)
         return feeds
@@ -99,26 +158,46 @@ class AlpacaBroker(BrokerClient):
         if self._stream_error:
             return f"stream error: {self._stream_error}"
         if self._stream_thread is None:
-            return "stream idle"
+            return f"stream idle ({self._price_stream_feed_name})"
         if active_symbols == 0:
-            return "stream connecting"
-        return f"live stream active for {active_symbols}/{len(self._symbols)} symbols"
+            return f"stream connecting ({self._price_stream_feed_name})"
+        return (
+            f"live stream active for {active_symbols}/{len(self._symbols)} symbols "
+            f"(stream={self._price_stream_feed_name}, latest={self._latest_data_feed_name})"
+        )
 
     def _start_price_stream(self) -> None:
-        if not self._stream_enabled or self._stream_thread is not None:
+        if not self._stream_enabled:
             return
+        with self._stream_restart_lock:
+            if self._stream_thread is not None and self._stream_thread.is_alive() and self._stream_error is None:
+                return
+            self._reset_price_stream()
+            try:
+                stream_feed = self._preferred_price_stream_feed()
+                self._data_stream = StockDataStream(self._api_key, self._api_secret, feed=stream_feed)
+                self._data_stream.subscribe_trades(self._handle_trade, *self._symbols)
+                self._stream_thread = threading.Thread(target=self._run_price_stream, daemon=True)
+                self._stream_thread.start()
+                self._stream_error = None
+            except Exception as exc:
+                self._stream_error = str(exc)
+                self._data_stream = None
+                self._stream_thread = None
 
-        try:
-            stream_feed = self._preferred_price_stream_feed()
-            self._data_stream = StockDataStream(self._api_key, self._api_secret, feed=stream_feed)
-            self._data_stream.subscribe_trades(self._handle_trade, *self._symbols)
-            self._stream_thread = threading.Thread(target=self._run_price_stream, daemon=True)
-            self._stream_thread.start()
-            self._stream_error = None
-        except Exception as exc:
-            self._stream_error = str(exc)
-            self._data_stream = None
-            self._stream_thread = None
+    def _reset_price_stream(self) -> None:
+        stream = self._data_stream
+        self._data_stream = None
+        self._stream_thread = None
+        if stream is None:
+            return
+        for method_name in ("stop", "close"):
+            method = getattr(stream, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
 
     def _run_price_stream(self) -> None:
         try:
@@ -127,6 +206,8 @@ class AlpacaBroker(BrokerClient):
             self._data_stream.run()
         except Exception as exc:
             self._stream_error = str(exc)
+        finally:
+            self._stream_thread = None
 
     async def _handle_trade(self, trade: Any) -> None:
         symbol = str(getattr(trade, "symbol", ""))

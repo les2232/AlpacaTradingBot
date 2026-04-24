@@ -58,6 +58,80 @@ def _to_ratio(value: Any) -> float | None:
     return numeric / 100.0 if numeric > 1.0 else numeric
 
 
+def _to_optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    return None
+
+
+def _normalize_runtime_for_comparison(runtime: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(runtime, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key in (
+        "strategy_mode",
+        "sma_bars",
+        "entry_threshold_pct",
+        "ml_probability_buy",
+        "ml_probability_sell",
+        "threshold_mode",
+        "atr_multiple",
+        "atr_percentile_threshold",
+        "time_window_mode",
+        "regime_filter_enabled",
+        "orb_filter_mode",
+        "breakout_exit_style",
+        "breakout_tight_stop_fraction",
+        "mean_reversion_exit_style",
+        "mean_reversion_max_atr_percentile",
+        "mean_reversion_trend_filter",
+        "mean_reversion_trend_slope_filter",
+        "mean_reversion_stop_pct",
+        "symbols",
+        "bar_timeframe_minutes",
+    ):
+        if key not in runtime:
+            continue
+        value = runtime[key]
+        normalized[key] = list(value) if isinstance(value, list) else value
+    return normalized
+
+
+def _normalize_research_config_for_comparison(config: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key in (
+        "strategy_mode",
+        "sma_bars",
+        "entry_threshold_pct",
+        "ml_probability_buy",
+        "ml_probability_sell",
+        "threshold_mode",
+        "atr_multiple",
+        "atr_percentile_threshold",
+        "time_window_mode",
+        "regime_filter_enabled",
+        "orb_filter_mode",
+        "breakout_exit_style",
+        "breakout_tight_stop_fraction",
+        "mean_reversion_exit_style",
+        "mean_reversion_max_atr_percentile",
+        "mean_reversion_trend_filter",
+        "mean_reversion_trend_slope_filter",
+        "mean_reversion_stop_pct",
+    ):
+        if key in config:
+            normalized[key] = config[key]
+    return normalized
+
+
 def load_backtest_baseline(repo_root: Path | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     base = dict(DEFAULT_BACKTEST)
     source = {
@@ -65,13 +139,20 @@ def load_backtest_baseline(repo_root: Path | None = None) -> tuple[dict[str, Any
         "live_config_path": None,
         "research_config_path": None,
         "research_metrics_used": False,
+        "live_config_approved": None,
+        "research_approved": None,
+        "research_matches_live_runtime": None,
+        "validation_errors": [],
+        "valid_for_comparison": True,
     }
 
     root = repo_root or Path(__file__).resolve().parent
     live_config = _load_json_file(root / "config" / "live_config.json")
+    live_runtime: dict[str, Any] | None = None
     if live_config is not None:
         runtime = live_config.get("runtime")
         if isinstance(runtime, dict):
+            live_runtime = runtime
             symbols = runtime.get("symbols")
             if isinstance(symbols, list) and symbols:
                 base["symbols"] = len(symbols)
@@ -83,11 +164,53 @@ def load_backtest_baseline(repo_root: Path | None = None) -> tuple[dict[str, Any
                 base["bars_per_day"] = max(1, int((6.5 * 60) / timeframe_minutes))
             source["mode"] = "live_config"
             source["live_config_path"] = str(root / "config" / "live_config.json")
+        live_source = live_config.get("source")
+        if isinstance(live_source, dict) and "approved" in live_source:
+            source["live_config_approved"] = _to_optional_bool(live_source.get("approved"))
+            if source["live_config_approved"] is False:
+                reasons = live_source.get("rejection_reasons") or []
+                reasons_text = ", ".join(str(item) for item in reasons if str(item))
+                detail = f"live config is approved=false"
+                if reasons_text:
+                    detail = f"{detail} ({reasons_text})"
+                source["validation_errors"].append(detail)
 
     research = _load_json_file(root / "results" / "best_config_latest.json")
     if research is not None:
+        source["research_config_path"] = str(root / "results" / "best_config_latest.json")
+        if "approved" in research:
+            source["research_approved"] = _to_optional_bool(research.get("approved"))
+            if source["research_approved"] is False:
+                reasons = research.get("rejection_reasons") or []
+                reasons_text = ", ".join(str(item) for item in reasons if str(item))
+                detail = f"research artifact is approved=false"
+                if reasons_text:
+                    detail = f"{detail} ({reasons_text})"
+                source["validation_errors"].append(detail)
+
+        research_config = _normalize_research_config_for_comparison(research.get("config"))
+        live_runtime_cmp = _normalize_runtime_for_comparison(live_runtime)
+        if live_runtime_cmp and research_config:
+            mismatches: list[str] = []
+            for key, research_value in research_config.items():
+                if key not in live_runtime_cmp:
+                    continue
+                if live_runtime_cmp[key] != research_value:
+                    mismatches.append(f"{key}: live={live_runtime_cmp[key]!r} research={research_value!r}")
+            source["research_matches_live_runtime"] = len(mismatches) == 0
+            if mismatches:
+                source["validation_errors"].append(
+                    "research config does not match live runtime (" + "; ".join(mismatches) + ")"
+                )
+
         performance = research.get("performance")
-        if isinstance(performance, dict):
+        research_valid = (
+            isinstance(performance, dict)
+            and source["research_approved"] is not False
+            and source["research_matches_live_runtime"] is not False
+            and source["live_config_approved"] is not False
+        )
+        if isinstance(performance, dict) and research_valid:
             try:
                 trades_per_day_value = float(performance.get("trades_per_day"))
             except (TypeError, ValueError):
@@ -98,8 +221,9 @@ def load_backtest_baseline(repo_root: Path | None = None) -> tuple[dict[str, Any
             if win_rate is not None:
                 base["win_rate"] = win_rate
             source["research_metrics_used"] = True
-            source["research_config_path"] = str(root / "results" / "best_config_latest.json")
             source["mode"] = "live_config+research" if source["mode"] == "live_config" else "research"
+
+    source["valid_for_comparison"] = len(source["validation_errors"]) == 0
 
     return base, source
 
@@ -395,6 +519,10 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict, log_health: dic
     """
     concerns = []
     n_sym = BACKTEST["symbols"]
+    if not BACKTEST_SOURCE.get("valid_for_comparison", True):
+        validation_errors = BACKTEST_SOURCE.get("validation_errors") or []
+        detail = "; ".join(str(item) for item in validation_errors if str(item)) or "baseline validation failed"
+        concerns.append(f"BASELINE INVALID: {detail}")
 
     # --- Slippage ---
     if ex["avg_slippage_bps"] is not None:
@@ -541,6 +669,10 @@ def print_report(
     row("Bars evaluated",        fmt(bar_q["evaluated"]),
         f"(expect ~{expected_bars} = {n_sym} syms × {bt_bars} bars)")
     row("Baseline source",       str(BACKTEST_SOURCE.get("mode", "defaults")))
+    if not BACKTEST_SOURCE.get("valid_for_comparison", True):
+        print("  Baseline validation:")
+        for item in BACKTEST_SOURCE.get("validation_errors", []):
+            print(f"    - {item}")
     avg_age = bar_q["avg_age_s"]
     row("Avg bar age (s)",        fmt(avg_age, ".1f"),
         flag=_flag(avg_age or 0, WARN["avg_bar_age_s"], low_is_bad=False) if avg_age else "")
@@ -737,6 +869,10 @@ def main() -> None:
         "--json", action="store_true",
         help="Output machine-readable JSON instead of the formatted report."
     )
+    parser.add_argument(
+        "--require-approved-baseline", action="store_true",
+        help="Exit with an error if the report baseline is unapproved or mismatched."
+    )
     args = parser.parse_args()
 
     log_dir = Path(args.log_root) / args.date
@@ -754,6 +890,10 @@ def main() -> None:
     pos        = compute_positions(logs["positions"])
     log_health = compute_log_health(logs)
     concerns   = detect_concerns(bar_q, sig, ex, pos, log_health)
+    if args.require_approved_baseline and not BACKTEST_SOURCE.get("valid_for_comparison", True):
+        for item in BACKTEST_SOURCE.get("validation_errors", []):
+            print(f"Baseline validation error: {item}", file=sys.stderr)
+        sys.exit(2)
 
     if args.json:
         import json as _json

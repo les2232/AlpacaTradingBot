@@ -1,0 +1,3 @@
+symbol,block_reason,count
+GOOGL,max_orders_per_minute,1
+MSFT,outside_entry_window,1

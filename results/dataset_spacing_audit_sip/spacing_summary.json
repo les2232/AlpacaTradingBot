@@ -1,0 +1,6 @@
+{
+  "dataset": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__sip__97d4a1837aaa",
+  "timeframe": "15Min",
+  "classification": "real integrity issue",
+  "reason": "The dataset has 272 missing within-session 15-minute slots across 20 trading days; this is not explained by overnight or weekend gaps."
+}

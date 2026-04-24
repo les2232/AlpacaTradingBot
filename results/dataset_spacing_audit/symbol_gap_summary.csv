@@ -1,0 +1,16 @@
+symbol,bars,trading_days,within_session_missing_days,missing_slots_from_typical_session
+ABBV,1583,61,3,3
+AMD,1583,61,3,3
+BAC,1583,61,3,3
+C,1583,61,3,3
+COP,1583,61,3,3
+GOOGL,1583,61,3,3
+HD,1583,61,3,3
+HON,1583,61,3,3
+JPM,1583,61,3,3
+LLY,1583,61,3,3
+MSFT,1583,61,3,3
+QCOM,1583,61,3,3
+TSLA,1583,61,3,3
+WFC,1583,61,3,3
+XOM,1583,61,3,3

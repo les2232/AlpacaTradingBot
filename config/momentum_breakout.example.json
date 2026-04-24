@@ -1,0 +1,22 @@
+{
+  "source": {
+    "dataset": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e"
+  },
+  "runtime": {
+    "strategy_mode": "momentum_breakout",
+    "symbols": ["AMD", "JPM", "HON", "C"],
+    "sma_bars": 20,
+    "time_window_mode": "combined_windows",
+    "regime_filter_enabled": true,
+    "atr_percentile_threshold": 0.0,
+    "momentum_breakout_lookback_bars": 20,
+    "momentum_breakout_entry_buffer_pct": 0.001,
+    "momentum_breakout_min_adx": 20.0,
+    "momentum_breakout_min_slope": 0.0,
+    "momentum_breakout_min_atr_percentile": 20.0,
+    "momentum_breakout_exit_style": "fixed_bars",
+    "momentum_breakout_hold_bars": 3,
+    "momentum_breakout_stop_pct": 0.0,
+    "momentum_breakout_take_profit_pct": 0.0
+  }
+}

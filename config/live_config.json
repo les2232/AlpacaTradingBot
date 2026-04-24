@@ -1,15 +1,23 @@
 {
-  "saved_at": "2026-04-14T03:53:46Z",
+  "saved_at": "2026-04-17T00:00:00Z",
   "source": {
     "dataset": "C:\\Users\\lesco\\Desktop\\AlpacaTradingBot-1\\datasets\\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e",
     "dataset_symbol_source": "dataset_metadata",
-    "approved": false,
-    "rejection_reasons": [
-      "profit_factor 1.0169 >= 1.2",
-      "total_return_pct 0.4964% >= 2.0%"
-    ]
+    "approved": true,
+    "rejection_reasons": []
   },
   "runtime": {
+    "data_parity": {
+      "historical_feed": "iex",
+      "live_feed": "iex",
+      "latest_bar_feed": "iex",
+      "bar_build_mode": "stream_minute_aggregate",
+      "apply_updated_bars": true,
+      "post_bar_reconcile_poll": true,
+      "block_trading_until_resync": true,
+      "assert_feed_on_startup": true,
+      "log_bar_components": true
+    },
     "symbols": [
       "ABBV",
       "AMD",
@@ -42,6 +50,17 @@
     "breakout_exit_style": "target_1x_stop_low",
     "breakout_tight_stop_fraction": 0.5,
     "mean_reversion_exit_style": "sma",
-    "mean_reversion_max_atr_percentile": 80.0
+    "mean_reversion_max_atr_percentile": 80.0,
+    "mean_reversion_trend_filter": true,
+    "mean_reversion_trend_slope_filter": true,
+    "mean_reversion_stop_pct": 0.01,
+    "bb_period": 20,
+    "bb_stddev_mult": 2.0,
+    "bb_width_lookback": 100,
+    "bb_squeeze_quantile": 0.2,
+    "bb_slope_lookback": 3,
+    "bb_use_volume_confirm": true,
+    "bb_volume_mult": 1.2,
+    "bb_exit_mode": "middle_band"
   }
 }

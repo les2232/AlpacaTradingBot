@@ -1,0 +1,2 @@
+dataset,timeframe,symbols,trading_days,shared_timestamp_grid,typical_session,typical_bars_per_day,within_session_missing_days,partial_or_shifted_days,total_missing_slots
+C:\Users\lesco\Desktop\AlpacaTradingBot-1\datasets\ABBV-AMD-BAC-C-COP-GOOGL-HD-HON-JPM-LLY-MSFT-QCOM-TSLA-WFC-XOM__15Min__20260114T000000Z__20260414T000000Z__iex__a12e17d2fc4e,15Min,15,61,True,09:30-15:45,26,3,0,3

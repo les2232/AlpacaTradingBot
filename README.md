@@ -1,124 +1,77 @@
 # TradeOS
 
-TradeOS is a strategy-driven trading system with a broker adapter layer, shared live execution, backtesting, and offline research components. The current live backend is Alpaca.
+TradeOS is a strategy-driven trading workspace for Alpaca-based paper/live execution, Streamlit monitoring, offline backtesting, dataset generation, and research validation. The supported interfaces are the `tradeos` CLI and the Streamlit dashboard; the older desktop UI layer has been intentionally removed. The repo shares one strategy engine across live trading and offline analysis, so changes in core files can affect both operator workflows and research results.
 
-The current default operating rules are frozen in [TRADING_SPEC.md](TRADING_SPEC.md).
-The current operator workflow is documented in [OPERATIONS.md](OPERATIONS.md).
+## Start Here
 
-## Quick Start As A Program
+Read these first:
 
-For day-of trading operations, prefer the workflow in [OPERATIONS.md](OPERATIONS.md):
+1. [`OPERATIONS.md`](OPERATIONS.md) for the day-of operator workflow.
+2. [`TRADING_SPEC.md`](TRADING_SPEC.md) for the frozen trading behavior and runtime safety expectations.
+3. [`PROJECT_MAP.md`](PROJECT_MAP.md) for a full repo map and module guide.
+4. [`CLEANUP_AUDIT.md`](CLEANUP_AUDIT.md) for current cleanup findings and deferred work.
+5. [`DESKTOP_REMOVAL_AUDIT.md`](DESKTOP_REMOVAL_AUDIT.md) for the desktop UI removal audit.
+6. [`ARTIFACT_STORAGE_POLICY.md`](ARTIFACT_STORAGE_POLICY.md) for the artifact and output storage rules.
 
-- use one `tradeos live` process only
-- use `tradeos dashboard` for monitoring only
-- keep `config/live_config.json` as the runtime trading-settings source of truth
+## Main Modes
 
-This repo now has an installable package and a single top-level command.
+### Live or preview trading
 
-Install it from the repo root:
+- `tradeos live`
+  Runs the live bot with normal execution behavior.
+- `tradeos preview`
+  Runs the same runtime path with execution disabled.
+- `.\start_dashboard.ps1`
+  Preferred operator launcher. Starts or reuses the live bot and dashboard together.
+
+### Monitoring
+
+- `tradeos dashboard`
+  Starts the Streamlit dashboard directly.
+- `.\start_dashboard.ps1 -DashboardOnly`
+  Opens monitoring without starting a live bot.
+
+Streamlit is now the only supported UI surface in the repository.
+
+### Research and offline analysis
+
+- `tradeos snapshot ...`
+  Builds a versioned dataset under `datasets/`.
+- `tradeos backtest ...`
+  Replays a dataset through the shared strategy engine.
+- `tradeos research`
+  Runs the broader research pipeline.
+- `tradeos experiments ...`
+  Runs the backtest experiment batch.
+- `tradeos report ...`
+  Generates the daily diagnostic report.
+
+There are also many focused `run_*.py` scripts at the repo root for specific validations and experiments. Treat those as research utilities, not as part of the normal operator path.
+
+### Experiment logging and review
+
+- successful research and backtest-oriented runs now append structured entries to `results/experiment_log.jsonl`
+- the log is append-only JSONL so it is easy to diff, parse, and extend
+- the Streamlit dashboard `Performance` tab now includes an `Experiment History` section for recent runs, metric trends, and top results
+
+Useful commands:
+
+```powershell
+python run_research.py
+python run_backtest_experiments.py --dataset datasets\YOUR_DATASET
+python run_momentum_breakout_validation.py --output-dir results\momentum_breakout_validation
+python -m streamlit run dashboard.py
+```
+
+## Minimal Setup
+
+Install the project from the repo root:
 
 ```powershell
 python -m pip install -e .
 ```
 
-Then use the program entry point:
-
-```powershell
-tradeos --help
-```
-
-Main commands:
-
-- `tradeos preview` runs the live bot with order execution disabled
-- `tradeos live` runs the live bot with normal execution behavior
-- `tradeos paper` is a compatibility-friendly alias for the current paper-account execution workflow
-- `tradeos backtest ...` passes arguments through to `backtest_runner.py`
-- `tradeos snapshot ...` passes arguments through to `dataset_snapshotter.py`
-- `tradeos research` runs the research pipeline
-- `tradeos experiments ...` runs the backtest experiment batch
-- `tradeos report ...` runs the daily diagnostic report
-- `tradeos dashboard` launches the browser-based Streamlit dashboard
-
-You can also run the package without installing the script wrapper:
-
-```powershell
-python -m tradeos --help
-```
-
-## Current Behavior Snapshot
-
-The live bot currently enforces these behaviors:
-
-- decisions are based on completed bars only
-- only one decision timestamp is processed per completed bar
-- Alpaca market clock must be open before execution proceeds
-- regular-hours trading window is enforced for execution
-- no new entries after the configured session cutoff
-- open positions are force-flattened into the end-of-day window
-- the daily-loss kill switch can block new entries and trigger flattening
-- symbol snapshots and order history are persisted to SQLite
-
-One implementation detail is intentionally duplicated for safety:
-
-- end-of-day flatten protection exists both inside the live decision path and in a background thread in [trading_bot.py](trading_bot.py)
-- the in-loop guard protects normal decision flow
-- the background thread acts as a wall-clock fail-safe if the loop drifts or stalls
-
-## Current Live Strategy
-
-The active strategy is **`mean_reversion`**, configured in `config/live_config.json`.
-
-Key settings as of 2026-04-08:
-- 15-symbol universe (see `config/live_config.json` for the list)
-- 15-minute bars, 20-bar SMA, entry pullback threshold 0.2%
-- ATR percentile filter ≤ 80, exit on SMA recross, no trend filter
-
-**Why mean reversion:** IS/OOS backtests on the 15-symbol universe showed IS PF 1.189 and OOS PF 1.431 — stronger and more stable than the prior hybrid baseline.
-
-**`hybrid` mode** remains available in the strategy engine but is not the current live selection.
-
-**Older research artifacts** (comparison CSVs, prior `best_config_latest.json`) may reflect earlier SMA or hybrid experiments. They are preserved for reference but do not represent the current live configuration.
-
-See `results/strategy_status.md` for a concise summary of current strategy evidence.
-
-## Repository Map
-
-- [trading_bot.py](trading_bot.py)
-  Live/paper trading entry point. Loads `.env`, builds the runtime `BotConfig`, evaluates completed 15-minute bars, applies execution safety checks, places broker-backed orders, and writes snapshots to SQLite.
-- [strategy.py](strategy.py)
-  Shared decision engine for `sma`, `ml`, `hybrid`, `breakout`, and `mean_reversion`. This is the main logic shared by live trading and backtests.
-- [backtest_runner.py](backtest_runner.py)
-  Offline backtest CLI. Replays saved datasets through the shared strategy layer, supports sweeps, and compares strategy modes.
-- [dataset_snapshotter.py](dataset_snapshotter.py)
-  Dataset-building CLI. Downloads historical bars with the current Alpaca-backed data path and writes versioned datasets under `datasets/`.
-- [ml/feature_pipeline.py](ml/feature_pipeline.py)
-  Offline feature engineering aligned to the live ML feature vector.
-- [ml/train.py](ml/train.py)
-  Offline model training entry point. Saves the logistic model used by live and backtest ML paths.
-- [ml/predict.py](ml/predict.py)
-  Offline-model inference helpers used by the live bot. The saved model in `ml/models/logistic_latest.pkl` is the source of truth for ML inference.
-- [storage.py](storage.py)
-  SQLite persistence for account snapshots, symbol snapshots, and order history.
-- [dashboard.py](dashboard.py)
-  Streamlit dashboard that reuses the live bot config and snapshot capture path.
-- [run_research.py](run_research.py)
-  Convenience research pipeline that snapshots data, runs sweeps, and writes timestamped results.
-- [run_compare_suite.ps1](run_compare_suite.ps1)
-  PowerShell wrapper for a standard strategy comparison suite.
-- [universe.py](universe.py)
-  Standalone universe builder module. It is intentionally independent and not yet wired into live trading.
-
-## Entry Points
-
-### Live paper trading
-
-Install dependencies:
-
-```powershell
-python -m pip install -e .
-```
-
-Create a `.env` file:
+Create a `.env` with Alpaca credentials and runtime guardrails:
 
 ```env
 ALPACA_API_KEY=your_key
@@ -129,237 +82,176 @@ MAX_OPEN_POSITIONS=3
 MAX_DAILY_LOSS_USD=300
 ```
 
-> **Note:** Runtime trading settings (symbols, strategy mode, bar timeframe, indicator parameters) are driven by `config/live_config.json`, not `.env`. Set secrets and risk limits in `.env`; set strategy config in `config/live_config.json`.
+Keep active trading settings in [`config/live_config.json`](config/live_config.json). In this repo, `.env` is for secrets and risk limits, while `config/live_config.json` is the runtime trading-settings source of truth.
 
-Run the live bot directly:
-
-```powershell
-tradeos live
-```
-
-Preview one or more decision cycles without placing orders:
+## Typical Commands
 
 ```powershell
+tradeos --help
 tradeos preview
-```
-
-### Backtests
-
-Run a single backtest:
-
-```powershell
+tradeos live
+tradeos dashboard
 tradeos backtest --dataset datasets\YOUR_DATASET --strategy-mode sma
-```
-
-Run the canned breakout comparison batch into an isolated experiment folder:
-
-```powershell
-tradeos experiments --dataset datasets\YOUR_DATASET
-```
-
-Or use the wrapper with the current large breakout dataset already filled in:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File run_breakout_research.ps1
-```
-
-That writes a timestamped folder under `results\experiments\` with:
-
-- the individual backtest CSV outputs for each run
-- `comparison_summary.csv`
-- `comparison_per_symbol.csv`
-- `comparison_report.md`
-
-Compare `sma`, `ml`, and `hybrid`:
-
-```powershell
-tradeos backtest --dataset datasets\YOUR_DATASET --strategy-mode-list sma,ml,hybrid
-```
-
-Run the standard comparison suite:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File run_compare_suite.ps1
-```
-
-### Automated research pipeline
-
-Run the broader research workflow:
-
-```powershell
+tradeos snapshot --symbols AAPL MSFT NVDA --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z --timeframe 15Min --feed iex
 tradeos research
 ```
 
-Or use the PowerShell wrapper that logs output to `logs/`:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File run_research.ps1
-```
-
-### Dataset generation
-
-Build a versioned dataset snapshot:
-
-```powershell
-tradeos snapshot --symbols AAPL MSFT NVDA --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z --timeframe 15Min --feed iex
-```
-
-This writes a dataset directory under `datasets/` containing:
-
-- `bars.parquet`
-- `manifest.json`
-
-### Session Launcher
-
-Start the live bot and dashboard together:
+PowerShell wrappers still used in practice:
 
 ```powershell
 .\start_dashboard.ps1
+powershell -ExecutionPolicy Bypass -File run_research.ps1
+powershell -ExecutionPolicy Bypass -File run_compare_suite.ps1
 ```
 
-This is the preferred one-click launcher. By default it:
+## Repository Shape
 
-- starts `tradeos live` unless a live bot is already running
-- starts or reuses the Streamlit dashboard
-- opens the browser when the dashboard is ready
+The intended boundary is:
 
-Monitoring-only alternative:
+- `live runtime`: operator-facing execution, broker integration, locks, risk checks, persistence
+- `shared strategy`: signal logic and indicators reused by live and offline paths
+- `dashboard`: read-only monitoring and diagnostics
+- `research`: validation, sweeps, audits, and experiment runners
+- `artifacts`: datasets, logs, results, and disposable local scratch output
 
-```powershell
-.\start_dashboard.ps1 -DashboardOnly
-```
+The current cleanup direction is a conservative `v2-in-place`: reduce repo-root noise, extract shared internals into smaller modules, and preserve the existing CLI and operator workflow while the internals become more structured.
 
-### Dashboard
+### Core runtime
 
-Run the dashboard directly without the combined launcher:
+- [`alpaca_trading_bot/cli.py`](alpaca_trading_bot/cli.py)
+  Main CLI implementation.
+- [`trading_bot.py`](trading_bot.py)
+  Live execution loop, risk gates, runtime protections, and broker-backed order flow.
+- [`strategy.py`](strategy.py)
+  Shared strategy engine used by live trading and backtests.
+- [`tradeos/brokers/alpaca_broker.py`](tradeos/brokers/alpaca_broker.py)
+  Broker adapter for Alpaca.
+- [`storage.py`](storage.py)
+  SQLite persistence for runtime history.
+- [`botlog.py`](botlog.py)
+  JSONL event logging under `logs/`.
 
-Direct CLI alternative:
+### Dashboard and diagnostics
 
-```powershell
-tradeos dashboard
-```
+- [`dashboard.py`](dashboard.py)
+  Streamlit monitoring UI.
+- [`dashboard_state.py`](dashboard_state.py)
+  Dashboard-side state loading and drilldown logic.
+- [`daily_report.py`](daily_report.py)
+  Diagnostic reporting.
+- [`drift_monitor.py`](drift_monitor.py)
+  Drift-analysis support used by the dashboard and reports.
 
-Streamlit usually serves on `http://localhost:8501`.
+### Offline research
 
-## Config Flow
+- [`dataset_snapshotter.py`](dataset_snapshotter.py)
+  Dataset creation into `datasets/`.
+- [`backtest_runner.py`](backtest_runner.py)
+  Offline simulation against saved datasets.
+- [`research/`](research/)
+  Current research-only validation, audit, and experiment scripts.
+- [`research/legacy_experiments/`](research/legacy_experiments/)
+  Historical sweep-era and archival experiment runners preserved for reproducibility.
+- root-level `run_*.py` and helper wrappers
+  Compatibility entry points that keep existing imports and commands stable while the real implementations live under `research/` or `research/legacy_experiments/`.
 
-There are three distinct config paths in this repo:
+### Docs and runbooks
 
-### 1. Environment variables for live runtime
+- [`OPERATIONS.md`](OPERATIONS.md)
+- [`TRADING_SPEC.md`](TRADING_SPEC.md)
+- [`PROJECT_MAP.md`](PROJECT_MAP.md)
+- [`CLEANUP_AUDIT.md`](CLEANUP_AUDIT.md)
+- [`V2_CLEANUP_EXECUTION_PLAN.md`](V2_CLEANUP_EXECUTION_PLAN.md)
 
-[trading_bot.py](trading_bot.py) reads `.env` and environment variables through `load_config()`, then builds a `BotConfig` dataclass. This path is for live and paper execution only.
+### Legacy holding area
 
-Examples:
+- [`repo_quarantine/`](repo_quarantine/)
+  Holding area for intentionally removed or retired material. The legacy desktop UI runtime has already been removed from the repository.
 
-- `BOT_SYMBOLS`
-- `STRATEGY_MODE`
-- `SMA_BARS`
-- `ML_PROBABILITY_BUY`
-- `ML_PROBABILITY_SELL`
-- `MAX_DAILY_LOSS_USD`
-- `EXECUTE_ORDERS`
+## Data and Outputs
 
-### 2. CLI arguments for offline tools
+- `datasets/`
+  Versioned offline datasets, usually `bars.parquet` plus `manifest.json`.
+- `results/`
+  Shared artifact area. Root-level files are current promoted artifacts; subdirectories hold active research runs and archived historical outputs.
+- `logs/`
+  Runtime JSONL logs and startup metadata.
+- `bot_history.db`
+  Default SQLite runtime history database.
 
-[backtest_runner.py](backtest_runner.py) and [dataset_snapshotter.py](dataset_snapshotter.py) are CLI-driven. They do not use the live bot `.env` flow for their main runtime parameters.
+The repo also generates many local test and analysis artifacts such as `test_botlog_*`, `test_logs_*`, `test_dashboard_logs_*`, `inspect_dataset_*`, `tmp_test_artifacts/`, and `output/`.
 
-Examples:
+Artifact policy:
 
-- `--dataset`
-- `--strategy-mode`
-- `--strategy-mode-list`
-- `--symbols`
-- `--start`
-- `--end`
-- `--feed`
+- keep current promoted artifacts such as `results/best_config_latest.json`, `results/trade_decision.json`, and `results/strategy_status.md` at the `results/` root for compatibility
+- put active research runs in dedicated subdirectories under `results/`
+- use `results/archive/` for reviewed historical outputs
+- keep scratch and test artifacts ignored and disposable
 
-### 3. Runtime config objects
+See [`ARTIFACT_POLICY_AUDIT.md`](ARTIFACT_POLICY_AUDIT.md), [`ARTIFACT_STORAGE_POLICY.md`](ARTIFACT_STORAGE_POLICY.md), and [`results/README.md`](results/README.md) for the working policy.
 
-The code then narrows raw config into dataclasses or normalized internal structures:
+## Experiment Log Notes
 
-- `BotConfig` in [trading_bot.py](trading_bot.py)
-- `StrategyConfig` in [strategy.py](strategy.py)
-- `BacktestConfig` in [backtest_runner.py](backtest_runner.py)
-- `UniverseConfig` in [universe.py](universe.py)
+The experiment log currently records:
 
-That split is intentional:
+- timestamp
+- run type and script name
+- strategy, symbols, dataset metadata, and key parameters when available
+- normalized core metrics such as return, profit factor, sharpe, win rate, drawdown, trade count, expectancy, and realized pnl when the source script exposes them
+- output paths, summary artifact paths, and git branch/commit context
+- a compact change fingerprint and a conservative auto-summary versus the most recent comparable run
 
-- `.env` drives live execution
-- CLI flags drive offline tools
-- runtime dataclasses hold normalized values after parsing
+How logs are generated:
 
-## Shared Logic
+- current research entrypoints append a log entry after a successful run completes
+- the logger reuses metrics already produced by each script rather than recomputing performance
+- if there is a recent comparable run for the same script and strategy, the logger labels the new run as `improved vs prior`, `worse than prior`, `trade count collapsed`, or `insufficient evidence`
 
-The repo is organized around a small set of shared components rather than separate live and research implementations:
+How to extend the logger for a new research script:
 
-- [strategy.py](strategy.py) is shared by live trading and backtests.
-- The ML feature vector is intentionally kept aligned between the live bot and the backtester.
-- [storage.py](storage.py) is only for live/dashboard persistence, not backtest output.
+1. Import `log_experiment_run` from [`research/experiment_log.py`](research/experiment_log.py).
+2. Call it near the end of the script after final metrics and artifact paths are known.
+3. Pass the script's existing result metrics and parameters directly; avoid recomputing anything just for logging.
+4. If the script writes a JSON summary artifact, pass that path as `summary_path` so the dashboard has a stable anchor.
 
-## Known Overlap And Cleanup Notes
+## Where New Code Goes
 
-These areas are currently intentional but worth knowing about:
+- Put runtime-sensitive code near the existing core files and packages.
+- Put new validation, audit, sweep, and experiment scripts under [`research/`](research/).
+- Put older archival experiment runners that still need to be preserved under [`research/legacy_experiments/`](research/legacy_experiments/).
+- Keep root-level wrappers only when compatibility with existing imports, tests, or scripts still matters.
 
-- End-of-day flatten logic exists in two places in [trading_bot.py](trading_bot.py):
-  - inside `run_once()` as a fail-safe execution guard
-  - inside the background thread started in `main()` as a wall-clock fail-safe
-  This is protective overlap, not yet unified.
-- The dashboard initializes the live bot directly instead of using a separate read-only service layer. That keeps behavior aligned, but it also means dashboard startup depends on the same Alpaca credentials and bot initialization path as live trading.
-- [run_research.py](run_research.py) and [run_compare_suite.ps1](run_compare_suite.ps1) overlap somewhat as research orchestration tools. The Python script is a configurable pipeline; the PowerShell script is a fixed comparison suite.
-- [universe.py](universe.py) is present but not yet integrated into live bot symbol selection. This is intentional and low-risk for now.
+## Safety Boundaries
 
-## Data And Results
+Treat these files as sensitive:
 
-- Live snapshots are written to `bot_history.db` by default. Override with `BOT_DB_PATH` if needed.
-- Offline datasets live under `datasets/`.
-- Backtest and research outputs live under `results/`.
+- [`trading_bot.py`](trading_bot.py)
+- [`strategy.py`](strategy.py)
+- [`alpaca_trading_bot/cli.py`](alpaca_trading_bot/cli.py)
+- [`start_dashboard.ps1`](start_dashboard.ps1)
+- [`tradeos/brokers/alpaca_broker.py`](tradeos/brokers/alpaca_broker.py)
+- [`storage.py`](storage.py)
+- [`dashboard_state.py`](dashboard_state.py)
+- [`config/live_config.json`](config/live_config.json)
 
-Typical generated artifacts include:
+Important constraints already enforced in the repo:
 
-- `datasets/<dataset_id>/bars.parquet`
-- `datasets/<dataset_id>/manifest.json`
-- `results/<name>.csv`
-- `results/<name>_per_symbol.csv`
-- `results/<name>_robust_top10.csv`
-- `results/<name>_winner_by_symbol.csv`
-- `results/best_config_latest.json`
-- `results/stability_report.json`
-- `results/trade_decision.json`
-- `results/compare_suite_YYYYMMDD_HHMMSS/...`
+- one live-process lock
+- completed-bar-only decision cadence
+- market-hours and session-cutoff guards
+- end-of-day flatten protections
+- daily-loss kill switch behavior
+- runtime approval checks for `config/live_config.json`
 
-## Practical Workflow
+Do not casually refactor or deduplicate those paths during cleanup work.
 
-A safe working order for this repo is:
+Recommended first cleanup slice:
 
-1. Build or refresh a dataset with [dataset_snapshotter.py](dataset_snapshotter.py).
-2. Train or refresh the offline model with [ml/train.py](ml/train.py) if you are changing ML inputs.
-3. Run either:
-   [run_research.py](run_research.py) for a configurable multi-window research pipeline with approval, stability, and regime reporting, or
-   [run_compare_suite.ps1](run_compare_suite.ps1) for a fixed comparison suite across known datasets.
-4. Preview the live bot with `EXECUTE_ORDERS=false`.
-5. Use [dashboard.py](dashboard.py) to inspect snapshots and recent order flow.
+1. ignore and artifact hygiene
+2. boundary docs and repo orientation
+3. shared config extraction between live and backtest paths
+4. strategy helper extraction before touching the live loop
 
-## Research Workflow Guide
+## Naming Notes
 
-Use [run_research.py](run_research.py) when you want a configurable workflow that:
-
-- snapshots fresh data for one or more validation windows
-- runs parameter sweeps
-- ranks results into leaderboard CSVs
-- writes decision artifacts such as:
-  - `best_config_latest.json`
-  - `stability_report.json`
-  - `trade_decision.json`
-
-Use [run_compare_suite.ps1](run_compare_suite.ps1) when you want a fixed repeatable benchmark run that:
-
-- uses specific existing datasets
-- compares `sma`, `ml`, and `hybrid`
-- performs a fixed ML threshold sweep
-- writes all outputs into one timestamped subfolder under `results/`
-
-## Notes
-
-- `IEX` data is easier to access on more Alpaca accounts, but it can distort volume-sensitive research compared with `SIP`.
-- Live trading is long-only and intraday-only by default.
-- The live bot is designed around completed bars, not partially formed bars.
+`tradeos` is the preferred current product and CLI name. Some compatibility layers still use the older `alpaca_trading_bot` package name or the `alpaca-bot` script alias. Those leftovers are intentional for compatibility unless changed in a dedicated migration.
