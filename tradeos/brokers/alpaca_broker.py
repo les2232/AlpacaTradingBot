@@ -311,11 +311,10 @@ class AlpacaBroker(BrokerClient):
         bars = cast(list[Any], bars_response.data.get(symbol, []))
         normalized: list[BrokerBar] = []
         for bar in bars:
-            timestamp = cast(datetime, getattr(bar, "timestamp"))
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.replace(tzinfo=timezone.utc)
-            else:
-                timestamp = timestamp.astimezone(timezone.utc)
+            # Preserve the source value for the context-rich TradeOS cycle
+            # validator. It rejects missing, invalid, and naive timestamps
+            # before any bar can reach strategy or order execution.
+            timestamp = cast(datetime, getattr(bar, "timestamp", None))
             normalized.append(
                 BrokerBar(
                     timestamp=timestamp,

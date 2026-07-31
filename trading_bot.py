@@ -96,8 +96,182 @@ DATA_FEED_CHOICES = ("iex", "sip", "delayed_sip")
 BAR_BUILD_MODE_CHOICES = ("stream_minute_aggregate", "historical_preaggregated")
 
 
+class BarFreshnessStatus(str, Enum):
+    FRESH = "fresh"
+    MISSING_TIMESTAMP = "missing_timestamp"
+    INVALID_TIMESTAMP = "invalid_timestamp"
+    TIMEZONE_NAIVE_TIMESTAMP = "timezone_naive_timestamp"
+    FUTURE_OR_IN_PROGRESS_TIMESTAMP = "future_or_in_progress_timestamp"
+    STALE_TIMESTAMP = "stale_timestamp"
+
+
+@dataclass(frozen=True)
+class BarFreshnessValidation:
+    status: BarFreshnessStatus
+    symbol: str
+    decision_timestamp_utc: datetime
+    reference_time_utc: datetime
+    timeframe_minutes: int
+    max_data_delay_seconds: int
+    timestamp_type: str
+    bar_start_utc: datetime | None = None
+    bar_close_utc: datetime | None = None
+    age_seconds: float | None = None
+    detail: str = ""
+
+    @property
+    def accepted(self) -> bool:
+        return self.status is BarFreshnessStatus.FRESH
+
+
 class StaleMarketDataError(RuntimeError):
-    """Raised when the most recent completed bar is too old to trust."""
+    """Raised when completed market data is not safe to use."""
+
+
+class UnsafeBarTimestampError(StaleMarketDataError):
+    def __init__(
+        self,
+        validation: BarFreshnessValidation,
+        message: str | None = None,
+    ) -> None:
+        self.validation = validation
+        super().__init__(
+            message
+            or (
+                f"{validation.symbol}:{validation.status.value}: "
+                f"{validation.detail}"
+            )
+        )
+
+
+def _require_aware_utc(value: datetime, *, field_name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise RuntimeError(f"{field_name} must be a datetime.")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise RuntimeError(f"{field_name} must be timezone-aware.")
+    return value.astimezone(timezone.utc)
+
+
+def validate_bar_timestamp(
+    raw_timestamp: object,
+    *,
+    symbol: str,
+    decision_timestamp: datetime,
+    reference_time: datetime,
+    timeframe_minutes: int,
+    max_data_delay_seconds: int,
+) -> BarFreshnessValidation:
+    """Validate one decision bar timestamp without consulting wall-clock time."""
+
+    decision_utc = _require_aware_utc(
+        decision_timestamp,
+        field_name="decision_timestamp",
+    )
+    reference_utc = _require_aware_utc(
+        reference_time,
+        field_name="reference_time",
+    )
+    if timeframe_minutes <= 0:
+        raise RuntimeError("timeframe_minutes must be greater than zero.")
+    if max_data_delay_seconds < 0:
+        raise RuntimeError("max_data_delay_seconds cannot be negative.")
+
+    timestamp_type = type(raw_timestamp).__name__
+    common = {
+        "symbol": symbol,
+        "decision_timestamp_utc": decision_utc,
+        "reference_time_utc": reference_utc,
+        "timeframe_minutes": timeframe_minutes,
+        "max_data_delay_seconds": max_data_delay_seconds,
+        "timestamp_type": timestamp_type,
+    }
+    if raw_timestamp is None:
+        return BarFreshnessValidation(
+            status=BarFreshnessStatus.MISSING_TIMESTAMP,
+            detail="market bar has no timestamp",
+            **common,
+        )
+
+    parsed_timestamp: datetime
+    if isinstance(raw_timestamp, datetime):
+        parsed_timestamp = raw_timestamp
+    elif isinstance(raw_timestamp, str):
+        timestamp_text = raw_timestamp.strip()
+        if not timestamp_text:
+            return BarFreshnessValidation(
+                status=BarFreshnessStatus.INVALID_TIMESTAMP,
+                detail="market bar timestamp is an empty string",
+                **common,
+            )
+        if timestamp_text.endswith(("Z", "z")):
+            timestamp_text = f"{timestamp_text[:-1]}+00:00"
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp_text)
+        except ValueError:
+            return BarFreshnessValidation(
+                status=BarFreshnessStatus.INVALID_TIMESTAMP,
+                detail="market bar timestamp could not be parsed",
+                **common,
+            )
+    else:
+        return BarFreshnessValidation(
+            status=BarFreshnessStatus.INVALID_TIMESTAMP,
+            detail="market bar timestamp has an unsupported type",
+            **common,
+        )
+
+    try:
+        offset = parsed_timestamp.utcoffset()
+    except (OverflowError, ValueError):
+        return BarFreshnessValidation(
+            status=BarFreshnessStatus.INVALID_TIMESTAMP,
+            detail="market bar timestamp has an invalid UTC offset",
+            **common,
+        )
+    if parsed_timestamp.tzinfo is None or offset is None:
+        return BarFreshnessValidation(
+            status=BarFreshnessStatus.TIMEZONE_NAIVE_TIMESTAMP,
+            detail="market bar timestamp is timezone-naive",
+            **common,
+        )
+
+    try:
+        bar_start_utc = parsed_timestamp.astimezone(timezone.utc)
+        bar_close_utc = bar_start_utc + timedelta(minutes=timeframe_minutes)
+        age_seconds = (reference_utc - bar_close_utc).total_seconds()
+    except (OverflowError, ValueError):
+        return BarFreshnessValidation(
+            status=BarFreshnessStatus.INVALID_TIMESTAMP,
+            detail="market bar timestamp is outside the supported datetime range",
+            **common,
+        )
+
+    temporal = {
+        **common,
+        "bar_start_utc": bar_start_utc,
+        "bar_close_utc": bar_close_utc,
+        "age_seconds": age_seconds,
+    }
+    if bar_close_utc > decision_utc or bar_close_utc > reference_utc:
+        return BarFreshnessValidation(
+            status=BarFreshnessStatus.FUTURE_OR_IN_PROGRESS_TIMESTAMP,
+            detail="market bar has not completed by the decision/reference time",
+            **temporal,
+        )
+    if age_seconds > max_data_delay_seconds:
+        return BarFreshnessValidation(
+            status=BarFreshnessStatus.STALE_TIMESTAMP,
+            detail=(
+                f"market bar age {age_seconds:.1f}s exceeds "
+                f"{max_data_delay_seconds}s"
+            ),
+            **temporal,
+        )
+    return BarFreshnessValidation(
+        status=BarFreshnessStatus.FRESH,
+        detail="market bar is completed and fresh",
+        **temporal,
+    )
 
 
 @dataclass(frozen=True)
@@ -1768,26 +1942,44 @@ class TradeOSBot:
             return
 
         blocking_reasons: list[str] = []
+        first_rejection: BarFreshnessValidation | None = None
         for symbol in self.active_symbols:
             intraday_bars = self._get_intraday_bars(
                 symbol,
                 2,
                 decision_timestamp=decision_timestamp,
             )
-            if not intraday_bars:
-                blocking_reasons.append(f"{symbol}:no_completed_bar")
+            validation = validate_bar_timestamp(
+                (
+                    getattr(intraday_bars[-1], "timestamp", None)
+                    if intraday_bars
+                    else None
+                ),
+                symbol=symbol,
+                decision_timestamp=decision_timestamp,
+                reference_time=decision_timestamp,
+                timeframe_minutes=self.config.bar_timeframe_minutes,
+                max_data_delay_seconds=self.config.max_data_delay_seconds,
+            )
+            if not validation.accepted:
+                self._log_bar_timestamp_rejection(validation)
+                first_rejection = first_rejection or validation
+                blocking_reasons.append(f"{symbol}:{validation.status.value}")
                 continue
-            latest_bar_close = self._latest_bar_close_time(intraday_bars)
+            latest_bar_close = validation.bar_close_utc
+            if latest_bar_close is None:
+                raise RuntimeError("Accepted bar validation is missing a close timestamp.")
             latest_bar_date_et = latest_bar_close.astimezone(_ET).date()
             if latest_bar_date_et != decision_timestamp.astimezone(_ET).date():
+                validation = replace(
+                    validation,
+                    status=BarFreshnessStatus.STALE_TIMESTAMP,
+                    detail="market bar belongs to a previous trading session",
+                )
+                self._log_bar_timestamp_rejection(validation)
+                first_rejection = first_rejection or validation
                 blocking_reasons.append(
                     f"{symbol}:previous_session_bar:{latest_bar_close.isoformat()}"
-                )
-                continue
-            bar_delay_seconds = max(0.0, (decision_timestamp - latest_bar_close).total_seconds())
-            if bar_delay_seconds > self.config.max_data_delay_seconds:
-                blocking_reasons.append(
-                    f"{symbol}:bar_age={bar_delay_seconds:.0f}s"
                 )
 
         if blocking_reasons:
@@ -1795,10 +1987,13 @@ class TradeOSBot:
             remaining = len(blocking_reasons) - min(len(blocking_reasons), 5)
             if remaining > 0:
                 sample = f"{sample}, +{remaining} more"
-            raise StaleMarketDataError(
+            message = (
                 "startup market data not ready; refusing to trade until every symbol has "
                 f"a same-session completed bar ({sample})"
             )
+            if first_rejection is not None:
+                raise UnsafeBarTimestampError(first_rejection, message=message)
+            raise StaleMarketDataError(message)
 
         self._startup_market_data_validated_for_et_date = session_date_et
 
@@ -1864,14 +2059,85 @@ class TradeOSBot:
     def _bar_interval(self) -> timedelta:
         return timedelta(minutes=self.config.bar_timeframe_minutes)
 
+    def _utc_now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
     def get_decision_timestamp(self, now: datetime | None = None) -> datetime:
-        current_time = now or datetime.now(timezone.utc)
+        current_time = now or self._utc_now()
         bar_seconds = int(self._bar_interval().total_seconds())
         decision_unix = int(current_time.timestamp()) // bar_seconds * bar_seconds
         return datetime.fromtimestamp(decision_unix, tz=timezone.utc)
 
     def _get_bar_start_time(self, bar: BrokerBar) -> datetime:
         return bar.timestamp
+
+    def _log_bar_timestamp_rejection(
+        self,
+        validation: BarFreshnessValidation,
+    ) -> None:
+        log_method = getattr(getattr(self, "blog", None), "bar_timestamp_rejected", None)
+        if callable(log_method):
+            log_method(
+                symbol=validation.symbol,
+                decision_ts=validation.decision_timestamp_utc.isoformat(),
+                reference_time_utc=validation.reference_time_utc.isoformat(),
+                rejection_code=validation.status.value,
+                timestamp_type=validation.timestamp_type,
+                timeframe_minutes=validation.timeframe_minutes,
+                max_data_delay_seconds=validation.max_data_delay_seconds,
+                bar_start_utc=(
+                    validation.bar_start_utc.isoformat()
+                    if validation.bar_start_utc is not None
+                    else None
+                ),
+                bar_close_utc=(
+                    validation.bar_close_utc.isoformat()
+                    if validation.bar_close_utc is not None
+                    else None
+                ),
+                age_seconds=validation.age_seconds,
+                detail=validation.detail,
+            )
+        logger.warning(
+            "bar timestamp rejected symbol=%s code=%s detail=%s",
+            validation.symbol,
+            validation.status.value,
+            validation.detail,
+        )
+
+    def _reject_bar_timestamp(
+        self,
+        validation: BarFreshnessValidation,
+        *,
+        message: str | None = None,
+    ) -> None:
+        self._log_bar_timestamp_rejection(validation)
+        raise UnsafeBarTimestampError(validation, message=message)
+
+    def _validate_latest_completed_bar(
+        self,
+        *,
+        symbol: str,
+        bars: list[BrokerBar],
+        decision_timestamp: datetime,
+        reference_time: datetime,
+    ) -> BarFreshnessValidation:
+        raw_timestamp = (
+            getattr(bars[-1], "timestamp", None)
+            if bars
+            else None
+        )
+        validation = validate_bar_timestamp(
+            raw_timestamp,
+            symbol=symbol,
+            decision_timestamp=decision_timestamp,
+            reference_time=reference_time,
+            timeframe_minutes=self.config.bar_timeframe_minutes,
+            max_data_delay_seconds=self.config.max_data_delay_seconds,
+        )
+        if not validation.accepted:
+            self._reject_bar_timestamp(validation)
+        return validation
 
     def _get_bars(
         self,
@@ -1899,11 +2165,33 @@ class TradeOSBot:
             start=start,
             end=request_end,
         )
-        completed_bars = [
-            bar
-            for bar in bars
-            if (self._get_bar_start_time(bar) + timedelta(minutes=timeframe_minutes)) <= aligned_decision_timestamp
-        ]
+        completed_bars: list[BrokerBar] = []
+        incomplete_validations: list[BarFreshnessValidation] = []
+        structural_rejections = {
+            BarFreshnessStatus.MISSING_TIMESTAMP,
+            BarFreshnessStatus.INVALID_TIMESTAMP,
+            BarFreshnessStatus.TIMEZONE_NAIVE_TIMESTAMP,
+        }
+        for bar in bars:
+            validation = validate_bar_timestamp(
+                getattr(bar, "timestamp", None),
+                symbol=symbol,
+                decision_timestamp=aligned_decision_timestamp,
+                reference_time=aligned_decision_timestamp,
+                timeframe_minutes=timeframe_minutes,
+                max_data_delay_seconds=self.config.max_data_delay_seconds,
+            )
+            if validation.status in structural_rejections:
+                self._reject_bar_timestamp(validation)
+            if validation.bar_start_utc is None or validation.bar_close_utc is None:
+                self._reject_bar_timestamp(validation)
+            normalized_bar = replace(bar, timestamp=validation.bar_start_utc)
+            if validation.bar_close_utc <= aligned_decision_timestamp:
+                completed_bars.append(normalized_bar)
+            else:
+                incomplete_validations.append(validation)
+        if not completed_bars and incomplete_validations:
+            self._reject_bar_timestamp(incomplete_validations[-1])
         result = completed_bars[-bars_needed:]
         self._bars_cache[cache_key] = result
         return result
@@ -2030,18 +2318,8 @@ class TradeOSBot:
         )
         return ml_signal
 
-    def evaluate_symbol(
-        self,
-        symbol: str,
-        position: Position | None,
-        decision_timestamp: datetime | None = None,
-    ) -> SymbolEvaluation:
-        aligned_decision_timestamp = decision_timestamp or self.get_decision_timestamp()
-        holding = _has_long_position(position)
-        short_position = _has_short_position(position)
-        strategy = self._strategy_for_symbol(symbol)
-        effective_strategy_mode = strategy.config.strategy_mode
-        bars_needed = max(
+    def _bars_needed_for_strategy(self, strategy: Strategy) -> int:
+        return max(
             self.config.sma_bars,
             25,
             50,  # minimum for trend_sma (50-bar SMA used by mean_reversion_trend_filter)
@@ -2056,10 +2334,55 @@ class TradeOSBot:
             ),
             estimate_regime_lookback_bars(self.config.bar_timeframe_minutes),
         )
+
+    def _validate_cycle_bar_freshness(
+        self,
+        *,
+        decision_timestamp: datetime,
+        reference_time: datetime | None = None,
+    ) -> dict[str, BarFreshnessValidation]:
+        validations: dict[str, BarFreshnessValidation] = {}
+        # Lookback inputs are shared across per-symbol strategy modes. Reuse
+        # the already-initialized default strategy so rejection happens before
+        # per-symbol strategy lookup or decision evaluation.
+        bars_needed = self._bars_needed_for_strategy(self.strategy)
+        for symbol in self.config.symbols:
+            bars = self._get_intraday_bars(
+                symbol,
+                bars_needed,
+                decision_timestamp=decision_timestamp,
+            )
+            observed_at = reference_time or self._utc_now()
+            validations[symbol] = self._validate_latest_completed_bar(
+                symbol=symbol,
+                bars=bars,
+                decision_timestamp=decision_timestamp,
+                reference_time=observed_at,
+            )
+        return validations
+
+    def evaluate_symbol(
+        self,
+        symbol: str,
+        position: Position | None,
+        decision_timestamp: datetime | None = None,
+    ) -> SymbolEvaluation:
+        aligned_decision_timestamp = decision_timestamp or self.get_decision_timestamp()
+        holding = _has_long_position(position)
+        short_position = _has_short_position(position)
+        strategy = self._strategy_for_symbol(symbol)
+        effective_strategy_mode = strategy.config.strategy_mode
+        bars_needed = self._bars_needed_for_strategy(strategy)
         intraday_bars = self._get_intraday_bars(
             symbol,
             bars_needed,
             decision_timestamp=aligned_decision_timestamp,
+        )
+        freshness = self._validate_latest_completed_bar(
+            symbol=symbol,
+            bars=intraday_bars,
+            decision_timestamp=aligned_decision_timestamp,
+            reference_time=aligned_decision_timestamp,
         )
         closes = [float(bar.close) for bar in intraday_bars]
         highs = [float(bar.high) for bar in intraday_bars]
@@ -2096,8 +2419,10 @@ class TradeOSBot:
             raise RuntimeError(
                 f"Not enough completed bars for {symbol} at {aligned_decision_timestamp.isoformat()}: got {len(closes)}"
             )
-        latest_bar_close = self._latest_bar_close_time(intraday_bars)
-        bar_delay_seconds = max(0.0, (aligned_decision_timestamp - latest_bar_close).total_seconds())
+        latest_bar_close = freshness.bar_close_utc
+        bar_delay_seconds = freshness.age_seconds
+        if latest_bar_close is None or bar_delay_seconds is None:
+            raise RuntimeError("Accepted bar validation is missing freshness metadata.")
         self.blog.bar_received(
             symbol=symbol,
             bar_close=closes[-1],
@@ -2106,10 +2431,6 @@ class TradeOSBot:
             bar_age_s=bar_delay_seconds,
             decision_ts=aligned_decision_timestamp.isoformat(),
         )
-        if bar_delay_seconds > self.config.max_data_delay_seconds:
-            raise StaleMarketDataError(
-                f"Stale completed bars for {symbol}: latest close {latest_bar_close.isoformat()}"
-            )
 
         price = closes[-1]
         sma = (
@@ -3181,6 +3502,22 @@ class TradeOSBot:
                 f"errors={error_signals} orders_submitted={orders_submitted}"
             )
 
+        def _market_data_skip_reason(exc: StaleMarketDataError) -> str:
+            if isinstance(exc, UnsafeBarTimestampError):
+                return f"bar_timestamp_rejected:{exc.validation.status.value}"
+            return "stale_market_data"
+
+        def _validate_before_signal_order_submission() -> None:
+            try:
+                self._validate_cycle_bar_freshness(
+                    decision_timestamp=decision_timestamp,
+                )
+            except StaleMarketDataError as exc:
+                skip_reason = _market_data_skip_reason(exc)
+                print(f"[CYCLE] {skip_reason}: {exc}")
+                _set_cycle_report(processed_bar=False, skip_reason=skip_reason)
+                raise
+
         if execute_orders and should_process and not self._claim_global_decision_execution(decision_timestamp):
             snapshot = self.build_snapshot(
                 decision_timestamp=decision_timestamp,
@@ -3194,13 +3531,18 @@ class TradeOSBot:
         try:
             if execute_orders and should_process and self._is_regular_hours(decision_timestamp):
                 self._validate_startup_market_data(decision_timestamp)
+            if should_process:
+                self._validate_cycle_bar_freshness(
+                    decision_timestamp=decision_timestamp,
+                )
             snapshot = self.build_snapshot(
                 decision_timestamp=decision_timestamp,
                 evaluate_signals=should_process,
             )
         except StaleMarketDataError as exc:
-            print(f"[CYCLE] stale_market_data: {exc}")
-            _set_cycle_report(processed_bar=False, skip_reason="stale_market_data")
+            skip_reason = _market_data_skip_reason(exc)
+            print(f"[CYCLE] {skip_reason}: {exc}")
+            _set_cycle_report(processed_bar=False, skip_reason=skip_reason)
             raise
 
         print(f"Connected. Cash: {snapshot.cash} Buying power: {snapshot.buying_power}")
@@ -3320,6 +3662,16 @@ class TradeOSBot:
             _set_cycle_report(processed_bar=True, skip_reason="preview_only")
             self.record_state(snapshot)
             return snapshot
+
+        try:
+            self._validate_cycle_bar_freshness(
+                decision_timestamp=decision_timestamp,
+            )
+        except StaleMarketDataError as exc:
+            skip_reason = _market_data_skip_reason(exc)
+            print(f"[CYCLE] {skip_reason}: {exc}")
+            _set_cycle_report(processed_bar=False, skip_reason=skip_reason)
+            raise
 
         print(
             f"[CYCLE] Entering live execution branch buy_signals={buy_signals} "
@@ -3620,6 +3972,7 @@ class TradeOSBot:
                         trade_budget=trade_budget,
                         recent_order_count=recent_order_count,
                     )
+                    _validate_before_signal_order_submission()
                     order = self.place_market_buy(
                         symbol,
                         buying_power_available=remaining_buying_power,
@@ -3743,6 +4096,7 @@ class TradeOSBot:
                         remaining_buying_power=remaining_buying_power,
                         recent_order_count=recent_order_count,
                     )
+                    _validate_before_signal_order_submission()
                     order = self.place_market_sell(
                         symbol,
                         positions[symbol],
@@ -3772,6 +4126,8 @@ class TradeOSBot:
                         recent_order_count=recent_order_count,
                     )
 
+            except StaleMarketDataError:
+                raise
             except Exception as exc:
                 import traceback
                 print(f"{symbol} ERROR: {exc}")

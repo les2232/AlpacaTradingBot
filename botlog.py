@@ -139,6 +139,38 @@ class BotLogger:
                 threshold_s=60,
             )
 
+    def bar_timestamp_rejected(
+        self,
+        *,
+        symbol: str,
+        decision_ts: str,
+        reference_time_utc: str,
+        rejection_code: str,
+        timestamp_type: str,
+        timeframe_minutes: int,
+        max_data_delay_seconds: int,
+        bar_start_utc: str | None,
+        bar_close_utc: str | None,
+        age_seconds: float | None,
+        detail: str,
+    ) -> None:
+        self._emit(
+            self._bars,
+            "bar.timestamp_rejected",
+            trace=_trace_id(symbol, decision_ts),
+            symbol=symbol,
+            decision_ts=decision_ts,
+            reference_time_utc=reference_time_utc,
+            rejection_code=rejection_code,
+            timestamp_type=timestamp_type,
+            timeframe_minutes=timeframe_minutes,
+            max_data_delay_seconds=max_data_delay_seconds,
+            bar_start_utc=bar_start_utc,
+            bar_close_utc=bar_close_utc,
+            age_seconds=round(age_seconds, 2) if age_seconds is not None else None,
+            detail=detail,
+        )
+
     # ------------------------------------------------------------------
     # 2. Signal evaluation — one call per symbol per bar
     # ------------------------------------------------------------------

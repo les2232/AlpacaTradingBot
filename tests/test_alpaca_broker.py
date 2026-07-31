@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from tradeos.brokers.alpaca_broker import _install_default_request_timeout, AlpacaBroker
@@ -132,3 +133,28 @@ def test_price_feed_status_includes_configured_feed_names() -> None:
 
     assert "stream=iex" in status
     assert "latest=sip" in status
+
+
+def test_get_bars_preserves_source_timestamp_for_cycle_validation() -> None:
+    naive_timestamp = datetime(2026, 4, 22, 15, 30)
+    source_bar = SimpleNamespace(
+        timestamp=naive_timestamp,
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.5,
+        volume=1_000.0,
+    )
+    broker = AlpacaBroker.__new__(AlpacaBroker)
+    broker._data = SimpleNamespace(
+        get_stock_bars=lambda request: SimpleNamespace(data={"AMD": [source_bar]})
+    )
+
+    bars = broker.get_bars(
+        "AMD",
+        timeframe_minutes=15,
+        start=datetime(2026, 4, 22, 14, 0, tzinfo=timezone.utc),
+        end=datetime(2026, 4, 22, 15, 45, tzinfo=timezone.utc),
+    )
+
+    assert bars[0].timestamp is naive_timestamp
