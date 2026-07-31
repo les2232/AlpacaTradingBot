@@ -117,3 +117,58 @@ def test_botlogger_lifecycle_persists_process_stage() -> None:
         assert rows[0]["symbol_count"] == 15
     finally:
         shutil.rmtree(base_dir, ignore_errors=True)
+
+
+def test_botlogger_persists_structured_decision_cycle_event(
+    tmp_path: Path,
+) -> None:
+    logger = BotLogger(log_root=tmp_path, session_id="owner-a")
+    logger.decision_cycle(
+        stage="duplicate_skipped",
+        decision_ts="2026-04-23T15:45:00+00:00",
+        owner_id="owner-b",
+        reason="duplicate_cycle",
+        status="completed",
+        existing_owner_id="owner-a",
+        latest_decision_ts="2026-04-23T15:45:00+00:00",
+        symbol_fingerprint="AMD|MSFT",
+        symbol_count=2,
+    )
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    lifecycle = tmp_path / date_str / "lifecycle.jsonl"
+    rows = [
+        json.loads(line)
+        for line in lifecycle.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert rows == [
+        {
+            "trace": "CYCLE_1776959100",
+            "decision_ts": "2026-04-23T15:45:00+00:00",
+            "owner_id": "owner-b",
+            "reason": "duplicate_cycle",
+            "status": "completed",
+            "existing_owner_id": "owner-a",
+            "latest_decision_ts": "2026-04-23T15:45:00+00:00",
+            "symbol_fingerprint": "AMD|MSFT",
+            "symbol_count": 2,
+            "session_id": "owner-a",
+            "event": "decision_cycle.duplicate_skipped",
+            "ts": rows[0]["ts"],
+        }
+    ]
+
+    for attribute in (
+        "_signals",
+        "_exec",
+        "_pos",
+        "_risk",
+        "_bars",
+        "_lifecycle",
+    ):
+        file_logger = getattr(logger, attribute)
+        for handler in list(file_logger.handlers):
+            handler.close()
+            file_logger.removeHandler(handler)

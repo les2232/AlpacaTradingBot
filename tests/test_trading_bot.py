@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import Mock
 from uuid import uuid4
 import json
 import os
@@ -591,6 +592,72 @@ def test_main_logs_startup_failed_when_preflight_raises(monkeypatch) -> None:
             },
         )
     ]
+
+
+def test_main_started_after_flatten_deadline_flattens_before_shutdown(
+    monkeypatch,
+) -> None:
+    position = SimpleNamespace(symbol="AMD", qty=2.0)
+    flatten_positions = Mock(return_value=[])
+    lifecycle_events: list[tuple[str, dict]] = []
+    fake_bot = SimpleNamespace(
+        perform_startup_resync=lambda: None,
+        perform_startup_preflight=lambda *, execute_orders: None,
+        blog=SimpleNamespace(
+            lifecycle=lambda stage, **fields: lifecycle_events.append(
+                (stage, fields)
+            )
+        ),
+        data_parity_summary=lambda: {},
+        _et_now=lambda: datetime(
+            2026,
+            4,
+            23,
+            16,
+            1,
+            tzinfo=timezone(timedelta(hours=-4)),
+        ),
+        get_positions_by_symbol=Mock(return_value={"AMD": position}),
+        get_open_orders=Mock(return_value=[]),
+        flatten_positions=flatten_positions,
+        _seconds_until_next_bar=lambda: 0.0,
+        build_snapshot=lambda evaluate_signals=False: SimpleNamespace(),
+        record_state=lambda snapshot: None,
+    )
+
+    class ImmediateThread:
+        def __init__(self, *, target, **kwargs) -> None:
+            self.target = target
+
+        def start(self) -> None:
+            self.target()
+
+    monkeypatch.setattr(trading_bot, "load_dotenv", lambda path: None)
+    monkeypatch.setattr(
+        trading_bot,
+        "TradeOSBot",
+        lambda config, session_id=None: fake_bot,
+    )
+    monkeypatch.setattr(trading_bot.threading, "Thread", ImmediateThread)
+    monkeypatch.setenv("EXECUTE_ORDERS", "true")
+
+    trading_bot.main(
+        config=trading_bot.BotConfig(
+            symbols=["AMD"],
+            max_usd_per_trade=200.0,
+            max_symbol_exposure_usd=200.0,
+            max_open_positions=3,
+            max_daily_loss_usd=300.0,
+            sma_bars=20,
+            bar_timeframe_minutes=15,
+        ),
+        session_id="test-session",
+    )
+
+    fake_bot.get_positions_by_symbol.assert_called_once()
+    fake_bot.get_open_orders.assert_called_once()
+    flatten_positions.assert_called_once_with({"AMD": position}, set())
+    assert lifecycle_events[-1][0] == "exiting"
 
 
 def test_perform_startup_resync_recovers_recent_fill() -> None:

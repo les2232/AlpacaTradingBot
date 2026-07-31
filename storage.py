@@ -1,6 +1,52 @@
 import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+DECISION_CYCLE_CLAIMED = "claimed"
+DECISION_CYCLE_RUNNING = "running"
+DECISION_CYCLE_COMPLETED = "completed"
+DECISION_CYCLE_FAILED = "failed"
+DECISION_CYCLE_AMBIGUOUS = "ambiguous"
+DECISION_CYCLE_TERMINAL_STATUSES = frozenset(
+    {
+        DECISION_CYCLE_COMPLETED,
+        DECISION_CYCLE_FAILED,
+        DECISION_CYCLE_AMBIGUOUS,
+    }
+)
+DECISION_CYCLE_STATUSES = frozenset(
+    {
+        DECISION_CYCLE_CLAIMED,
+        DECISION_CYCLE_RUNNING,
+        *DECISION_CYCLE_TERMINAL_STATUSES,
+    }
+)
+
+
+@dataclass(frozen=True)
+class DecisionCycleClaim:
+    decision_ts: str
+    claimed: bool
+    reason: str
+    status: str | None
+    owner_id: str | None = None
+    latest_decision_ts: str | None = None
+
+
+def normalize_decision_cycle_id(value: datetime | str) -> str:
+    """Return the canonical UTC identity for one completed-bar cycle."""
+
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("decision cycle timestamp must be timezone-aware")
+    return (
+        parsed.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat(timespec="seconds")
+    )
 
 
 class BotStorage:
@@ -9,8 +55,9 @@ class BotStorage:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 30000")
         return connection
 
     def _init_db(self) -> None:
@@ -67,7 +114,12 @@ class BotStorage:
 
                 CREATE TABLE IF NOT EXISTS processed_decisions (
                     decision_ts TEXT PRIMARY KEY,
-                    claimed_at_utc TEXT NOT NULL
+                    claimed_at_utc TEXT NOT NULL,
+                    owner_id TEXT NOT NULL DEFAULT 'legacy',
+                    status TEXT NOT NULL DEFAULT 'ambiguous',
+                    updated_at_utc TEXT NOT NULL DEFAULT '',
+                    finished_at_utc TEXT,
+                    reason TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS processed_order_fills (
@@ -78,6 +130,10 @@ class BotStorage:
                 );
                 """
             )
+            # Serialize additive schema inspection and migration. Without this
+            # write lock, two first-time owners opening the same legacy
+            # database can both observe a missing column and race the ALTER.
+            connection.execute("BEGIN IMMEDIATE")
             symbol_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(symbol_runs)").fetchall()
@@ -114,16 +170,242 @@ class BotStorage:
             if "filled_at" not in order_columns:
                 connection.execute("ALTER TABLE order_history ADD COLUMN filled_at TEXT")
 
-    def claim_decision_timestamp(self, decision_ts: str, claimed_at_utc: str) -> bool:
+            processed_decision_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(processed_decisions)"
+                ).fetchall()
+            }
+            processed_decision_migrations = {
+                "owner_id": (
+                    "ALTER TABLE processed_decisions "
+                    "ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'"
+                ),
+                "status": (
+                    "ALTER TABLE processed_decisions "
+                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'ambiguous'"
+                ),
+                "updated_at_utc": (
+                    "ALTER TABLE processed_decisions "
+                    "ADD COLUMN updated_at_utc TEXT NOT NULL DEFAULT ''"
+                ),
+                "finished_at_utc": (
+                    "ALTER TABLE processed_decisions "
+                    "ADD COLUMN finished_at_utc TEXT"
+                ),
+                "reason": "ALTER TABLE processed_decisions ADD COLUMN reason TEXT",
+            }
+            for column_name, statement in processed_decision_migrations.items():
+                if column_name not in processed_decision_columns:
+                    connection.execute(statement)
+            connection.execute(
+                """
+                UPDATE processed_decisions
+                SET updated_at_utc = claimed_at_utc
+                WHERE updated_at_utc = ''
+                """
+            )
+            connection.execute(
+                """
+                UPDATE processed_decisions
+                SET finished_at_utc = claimed_at_utc,
+                    reason = COALESCE(reason, 'legacy_claim_outcome_unknown')
+                WHERE owner_id = 'legacy'
+                  AND status = 'ambiguous'
+                  AND finished_at_utc IS NULL
+                """
+            )
+
+    def claim_decision_cycle(
+        self,
+        decision_ts: datetime | str,
+        *,
+        owner_id: str,
+        claimed_at_utc: str,
+    ) -> DecisionCycleClaim:
+        """
+        Atomically claim one global multi-symbol decision cycle.
+
+        The canonical UTC decision timestamp is the cycle identity. Claims are
+        strictly monotonic within one database: an unseen timestamp older than
+        the durable high-water mark is rejected and is never inserted.
+        """
+
+        normalized_decision_ts = normalize_decision_cycle_id(decision_ts)
+        requested_time = datetime.fromisoformat(normalized_decision_ts)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_rows = connection.execute(
+                """
+                SELECT decision_ts, owner_id, status
+                FROM processed_decisions
+                """
+            ).fetchall()
+
+            latest_time: datetime | None = None
+            latest_decision_ts: str | None = None
+            for row in existing_rows:
+                persisted_decision_ts = str(row["decision_ts"])
+                try:
+                    persisted_time = datetime.fromisoformat(
+                        normalize_decision_cycle_id(persisted_decision_ts)
+                    )
+                except (TypeError, ValueError):
+                    return DecisionCycleClaim(
+                        decision_ts=normalized_decision_ts,
+                        claimed=False,
+                        reason="invalid_persisted_cycle",
+                        status=DECISION_CYCLE_AMBIGUOUS,
+                        owner_id=str(row["owner_id"] or "") or None,
+                        latest_decision_ts=persisted_decision_ts,
+                    )
+                if persisted_time == requested_time:
+                    return DecisionCycleClaim(
+                        decision_ts=normalized_decision_ts,
+                        claimed=False,
+                        reason="duplicate_cycle",
+                        status=str(row["status"]),
+                        owner_id=str(row["owner_id"] or "") or None,
+                        latest_decision_ts=persisted_decision_ts,
+                    )
+                if latest_time is None or persisted_time > latest_time:
+                    latest_time = persisted_time
+                    latest_decision_ts = persisted_decision_ts
+
+            if latest_time is not None and requested_time < latest_time:
+                return DecisionCycleClaim(
+                    decision_ts=normalized_decision_ts,
+                    claimed=False,
+                    reason="out_of_order_cycle",
+                    status=None,
+                    latest_decision_ts=latest_decision_ts,
+                )
+
+            connection.execute(
+                """
+                INSERT INTO processed_decisions (
+                    decision_ts,
+                    claimed_at_utc,
+                    owner_id,
+                    status,
+                    updated_at_utc,
+                    finished_at_utc,
+                    reason
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    normalized_decision_ts,
+                    claimed_at_utc,
+                    owner_id,
+                    DECISION_CYCLE_CLAIMED,
+                    claimed_at_utc,
+                    "cycle_claimed",
+                ),
+            )
+            return DecisionCycleClaim(
+                decision_ts=normalized_decision_ts,
+                claimed=True,
+                reason="cycle_claimed",
+                status=DECISION_CYCLE_CLAIMED,
+                owner_id=owner_id,
+                latest_decision_ts=latest_decision_ts,
+            )
+
+    def transition_decision_cycle(
+        self,
+        decision_ts: datetime | str,
+        *,
+        owner_id: str,
+        status: str,
+        updated_at_utc: str,
+        reason: str,
+    ) -> bool:
+        """Compare-and-set a claimed cycle to its next durable lifecycle state."""
+
+        if status not in DECISION_CYCLE_STATUSES:
+            raise ValueError(f"unsupported decision cycle status: {status}")
+        allowed_previous = {
+            DECISION_CYCLE_RUNNING: (DECISION_CYCLE_CLAIMED,),
+            DECISION_CYCLE_COMPLETED: (
+                DECISION_CYCLE_CLAIMED,
+                DECISION_CYCLE_RUNNING,
+            ),
+            DECISION_CYCLE_FAILED: (
+                DECISION_CYCLE_CLAIMED,
+                DECISION_CYCLE_RUNNING,
+            ),
+            DECISION_CYCLE_AMBIGUOUS: (
+                DECISION_CYCLE_CLAIMED,
+                DECISION_CYCLE_RUNNING,
+            ),
+        }.get(status)
+        if allowed_previous is None:
+            raise ValueError(
+                "decision cycles can only transition out of the claimed state"
+            )
+
+        normalized_decision_ts = normalize_decision_cycle_id(decision_ts)
+        placeholders = ", ".join("?" for _ in allowed_previous)
+        finished_at_utc = (
+            updated_at_utc
+            if status in DECISION_CYCLE_TERMINAL_STATUSES
+            else None
+        )
         with self._connect() as connection:
             cursor = connection.execute(
-                """
-                INSERT OR IGNORE INTO processed_decisions (decision_ts, claimed_at_utc)
-                VALUES (?, ?)
+                f"""
+                UPDATE processed_decisions
+                SET status = ?,
+                    updated_at_utc = ?,
+                    finished_at_utc = ?,
+                    reason = ?
+                WHERE decision_ts = ?
+                  AND owner_id = ?
+                  AND status IN ({placeholders})
                 """,
-                (decision_ts, claimed_at_utc),
+                (
+                    status,
+                    updated_at_utc,
+                    finished_at_utc,
+                    reason,
+                    normalized_decision_ts,
+                    owner_id,
+                    *allowed_previous,
+                ),
             )
             return int(cursor.rowcount or 0) == 1
+
+    def get_decision_cycle(
+        self,
+        decision_ts: datetime | str,
+    ) -> dict[str, Any] | None:
+        normalized_decision_ts = normalize_decision_cycle_id(decision_ts)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    decision_ts,
+                    claimed_at_utc,
+                    owner_id,
+                    status,
+                    updated_at_utc,
+                    finished_at_utc,
+                    reason
+                FROM processed_decisions
+                WHERE decision_ts = ?
+                """,
+                (normalized_decision_ts,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def claim_decision_timestamp(self, decision_ts: str, claimed_at_utc: str) -> bool:
+        """Route the legacy method name through durable cycle authority."""
+
+        return self.claim_decision_cycle(
+            decision_ts,
+            owner_id="legacy_api",
+            claimed_at_utc=claimed_at_utc,
+        ).claimed
 
     def claim_order_fill(self, order_id: str, filled_qty: float, claimed_at_utc: str) -> bool:
         normalized_qty = round(float(filled_qty), 6)

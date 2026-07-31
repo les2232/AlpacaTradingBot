@@ -78,6 +78,41 @@ On the first 1-2 bars after the market opens, confirm:
 - there are no duplicate execution attempts for the same bar
 - there are no stale-data failures unless the feed is genuinely delayed
 
+## Durable Decision-Cycle Authority
+
+Normal paper execution uses one canonical, timezone-aware UTC decision timestamp
+as the identity for the entire configured multi-symbol cycle. Before normal
+strategy evaluation, the bot atomically claims that identity in the configured
+SQLite history database and records a `claimed` then `running` lifecycle. A
+normal return becomes `completed`; an exception before an order-capable boundary
+becomes `failed`; an exception after that boundary becomes `ambiguous`.
+
+Every existing identity is fail-closed across restarts, regardless of lifecycle
+status. An unseen timestamp older than the database's durable high-water mark is
+also rejected. Failed, ambiguous, claimed, and running cycles are never
+automatically released or retried. A hard process failure can therefore leave a
+cycle in `claimed` or `running`; operators must treat that outcome as uncertain.
+
+This mechanism provides one local cycle authority when all launchers use the
+same SQLite database. It does not prove broker-level exactly-once order
+execution: a process can fail after the broker accepts an order but before the
+local response or lifecycle update is recorded. Resolving that window requires
+separate broker reconciliation or broker-supported idempotency work.
+
+`BOT_DB_PATH` defaults to the working-directory-relative `bot_history.db`.
+Operators using more than one launcher or working directory must configure the
+same absolute `BOT_DB_PATH` for every automatic process; otherwise each database
+is a separate authority.
+
+Forced EOD and kill-switch exits in an accepted cycle remain part of that
+cycle's lifecycle and make a later failure ambiguous. Separately, a rejected
+normal cycle cannot suppress a forced safety exit: it uses a no-signal snapshot
+and can reach the fallback only after the existing startup resync, market-clock,
+and regular-hours exit gates pass. A fallback exit does not release or mutate
+the rejected cycle. Forced exits rely on broker-observed positions and open
+orders and therefore do not provide broker-level idempotency across an uncertain
+broker response.
+
 ## Current Phase
 
 The project is currently in a late validation and paper-trading hardening phase.

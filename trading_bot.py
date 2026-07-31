@@ -23,7 +23,15 @@ else:
     _ML_PREDICT_IMPORT_ERROR = None
 
 from botlog import BotLogger
-from storage import BotStorage
+from storage import (
+    DECISION_CYCLE_AMBIGUOUS,
+    DECISION_CYCLE_COMPLETED,
+    DECISION_CYCLE_FAILED,
+    DECISION_CYCLE_RUNNING,
+    BotStorage,
+    DecisionCycleClaim,
+    normalize_decision_cycle_id,
+)
 from tradeos.brokers import AlpacaBroker, BrokerBar, BrokerOrder, BrokerPosition
 from symbol_state import (
     format_symbol_list,
@@ -467,6 +475,13 @@ class RunCycleReport:
     hold_signals: int
     error_signals: int
     orders_submitted: int
+
+
+@dataclass
+class ActiveDecisionCycle:
+    decision_ts: str
+    owner_id: str
+    phase: str
 
 
 class ResyncStatus(str, Enum):
@@ -1261,6 +1276,7 @@ class TradeOSBot:
         self._hourly_regime_cache: dict[tuple[str, str], bool | None] = {}
         self._strategy_cache: dict[str, Strategy] = {}
         self._last_run_cycle_report: RunCycleReport | None = None
+        self._active_decision_cycle: ActiveDecisionCycle | None = None
         self._startup_resync_result = ResyncResult(
             status=ResyncStatus.LOCKED,
             started_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -1916,18 +1932,181 @@ class TradeOSBot:
         self._last_processed_decision_timestamp = timestamp
         return True
 
-    def _claim_global_decision_execution(self, timestamp: datetime) -> bool:
-        decision_ts = timestamp.isoformat()
-        claimed = self.storage.claim_decision_timestamp(
-            decision_ts,
-            datetime.now(timezone.utc).isoformat(),
+    def _log_decision_cycle_event(
+        self,
+        *,
+        stage: str,
+        decision_ts: str,
+        owner_id: str,
+        reason: str,
+        status: str | None = None,
+        existing_owner_id: str | None = None,
+        latest_decision_ts: str | None = None,
+    ) -> None:
+        log_method = getattr(
+            getattr(self, "blog", None),
+            "decision_cycle",
+            None,
         )
-        if not claimed:
+        if not callable(log_method):
+            return
+        try:
+            log_method(
+                stage=stage,
+                decision_ts=decision_ts,
+                owner_id=owner_id,
+                reason=reason,
+                status=status,
+                existing_owner_id=existing_owner_id,
+                latest_decision_ts=latest_decision_ts,
+                symbol_fingerprint=getattr(
+                    self,
+                    "_active_symbol_fingerprint",
+                    None,
+                ),
+                symbol_count=len(getattr(self.config, "symbols", ()) or ()),
+            )
+        except Exception:
+            logger.exception("decision cycle structured logging failed")
+
+    def _claim_global_decision_execution(
+        self,
+        timestamp: datetime,
+    ) -> DecisionCycleClaim:
+        decision_ts = normalize_decision_cycle_id(timestamp)
+        owner_id = str(getattr(self, "session_id", "") or "").strip()
+        if not owner_id:
+            raise RuntimeError(
+                "decision cycle owner requires a non-empty session_id"
+            )
+        claimed_at_utc = self._utc_now().isoformat()
+        claim = self.storage.claim_decision_cycle(
+            decision_ts,
+            owner_id=owner_id,
+            claimed_at_utc=claimed_at_utc,
+        )
+        if not claim.claimed:
             self._log_skip(
                 "SKIP_DUPLICATE_BAR_GLOBAL",
-                f"decision_timestamp={decision_ts}",
+                (
+                    f"decision_timestamp={decision_ts} "
+                    f"reason={claim.reason} status={claim.status or 'none'}"
+                ),
             )
-        return claimed
+            self._log_decision_cycle_event(
+                stage="duplicate_skipped",
+                decision_ts=decision_ts,
+                owner_id=owner_id,
+                reason=claim.reason,
+                status=claim.status,
+                existing_owner_id=claim.owner_id,
+                latest_decision_ts=claim.latest_decision_ts,
+            )
+            return claim
+
+        self._active_decision_cycle = ActiveDecisionCycle(
+            decision_ts=decision_ts,
+            owner_id=owner_id,
+            phase="claimed",
+        )
+        self._last_processed_decision_timestamp = datetime.fromisoformat(
+            decision_ts
+        )
+        self._log_decision_cycle_event(
+            stage="claimed",
+            decision_ts=decision_ts,
+            owner_id=owner_id,
+            reason=claim.reason,
+            status=claim.status,
+            latest_decision_ts=claim.latest_decision_ts,
+        )
+        transitioned = self.storage.transition_decision_cycle(
+            decision_ts,
+            owner_id=owner_id,
+            status=DECISION_CYCLE_RUNNING,
+            updated_at_utc=self._utc_now().isoformat(),
+            reason="normal_cycle_running",
+        )
+        if not transitioned:
+            raise RuntimeError(
+                f"decision cycle {decision_ts} could not enter running state"
+            )
+        self._active_decision_cycle.phase = DECISION_CYCLE_RUNNING
+        return claim
+
+    def _mark_active_decision_cycle_order_capable(self) -> None:
+        active_cycle = getattr(self, "_active_decision_cycle", None)
+        if active_cycle is not None:
+            active_cycle.phase = "order_capable"
+
+    def _transition_active_decision_cycle(
+        self,
+        *,
+        status: str,
+        reason: str,
+    ) -> None:
+        active_cycle = getattr(self, "_active_decision_cycle", None)
+        if active_cycle is None:
+            return
+        transitioned = self.storage.transition_decision_cycle(
+            active_cycle.decision_ts,
+            owner_id=active_cycle.owner_id,
+            status=status,
+            updated_at_utc=self._utc_now().isoformat(),
+            reason=reason,
+        )
+        if not transitioned:
+            raise RuntimeError(
+                f"decision cycle {active_cycle.decision_ts} "
+                f"could not transition to {status}"
+            )
+        active_cycle.phase = status
+        self._log_decision_cycle_event(
+            stage=status,
+            decision_ts=active_cycle.decision_ts,
+            owner_id=active_cycle.owner_id,
+            reason=reason,
+            status=status,
+        )
+
+    def _complete_active_decision_cycle(self) -> None:
+        active_cycle = getattr(self, "_active_decision_cycle", None)
+        if active_cycle is None:
+            return
+        cycle_report = getattr(self, "_last_run_cycle_report", None)
+        reason = (
+            cycle_report.skip_reason
+            if cycle_report is not None
+            and cycle_report.decision_timestamp == active_cycle.decision_ts
+            else "cycle_returned"
+        )
+        self._transition_active_decision_cycle(
+            status=DECISION_CYCLE_COMPLETED,
+            reason=reason,
+        )
+
+    def _fail_active_decision_cycle(self, exc: Exception) -> None:
+        active_cycle = getattr(self, "_active_decision_cycle", None)
+        if active_cycle is None:
+            return
+        if active_cycle.phase in {
+            DECISION_CYCLE_COMPLETED,
+            DECISION_CYCLE_FAILED,
+            DECISION_CYCLE_AMBIGUOUS,
+        }:
+            return
+        status = (
+            DECISION_CYCLE_AMBIGUOUS
+            if active_cycle.phase == "order_capable"
+            else DECISION_CYCLE_FAILED
+        )
+        self._transition_active_decision_cycle(
+            status=status,
+            reason=(
+                f"exception:{type(exc).__name__}:"
+                f"phase={active_cycle.phase}"
+            ),
+        )
 
     def _is_regular_hours(self, timestamp: datetime | pd.Timestamp) -> bool:
         stamp = pd.Timestamp(timestamp)
@@ -3151,7 +3330,13 @@ class TradeOSBot:
 
         return previews
 
-    def flatten_positions(self, positions: dict[str, Position], open_order_symbols: set[str], exit_reason: str = "eod_flatten") -> None:
+    def flatten_positions(
+        self,
+        positions: dict[str, Position],
+        open_order_symbols: set[str],
+        exit_reason: str = "eod_flatten",
+    ) -> list[str]:
+        failed_symbols: list[str] = []
         for symbol, position in positions.items():
             if symbol in open_order_symbols:
                 print(f"Skip flatten {symbol}: existing open order in flight")
@@ -3184,6 +3369,8 @@ class TradeOSBot:
                     print(f"Skip flatten {symbol}: qty is 0")
             except Exception as exc:
                 print(f"Flatten {symbol} ERROR: {exc}")
+                failed_symbols.append(symbol)
+        return failed_symbols
 
     def record_state(self, snapshot: BotSnapshot, orders_limit: int = 50) -> list[OrderSnapshot]:
         orders = self.get_recent_orders(limit=orders_limit)
@@ -3455,13 +3642,42 @@ class TradeOSBot:
         t = (now_et or self._et_now()).time()
         return t >= _SESSION_FLATTEN_AT
 
-    def run_once(self, execute_orders: bool = True, force_process: bool = False) -> BotSnapshot:
+    def run_once(
+        self,
+        execute_orders: bool = True,
+        force_process: bool = False,
+    ) -> BotSnapshot:
+        self._active_decision_cycle = None
+        try:
+            snapshot = self._run_once_impl(
+                execute_orders=execute_orders,
+                force_process=force_process,
+            )
+            self._complete_active_decision_cycle()
+            return snapshot
+        except Exception as exc:
+            self._fail_active_decision_cycle(exc)
+            raise
+        finally:
+            self._active_decision_cycle = None
+
+    def _run_once_impl(
+        self,
+        execute_orders: bool = True,
+        force_process: bool = False,
+    ) -> BotSnapshot:
         print("\n=== BOT TICK ===")
         self._bars_cache.clear()
         self._hourly_regime_cache.clear()
         now_et = self._et_now()
-        decision_timestamp = self.get_decision_timestamp()
-        should_process = True if force_process else self._should_process_decision_timestamp(decision_timestamp)
+        decision_timestamp = datetime.fromisoformat(
+            normalize_decision_cycle_id(self.get_decision_timestamp())
+        )
+        should_process = (
+            True
+            if execute_orders or force_process
+            else self._should_process_decision_timestamp(decision_timestamp)
+        )
         buy_signals = 0
         sell_signals = 0
         hold_signals = 0
@@ -3517,16 +3733,119 @@ class TradeOSBot:
                 print(f"[CYCLE] {skip_reason}: {exc}")
                 _set_cycle_report(processed_bar=False, skip_reason=skip_reason)
                 raise
+            self._mark_active_decision_cycle_order_capable()
 
-        if execute_orders and should_process and not self._claim_global_decision_execution(decision_timestamp):
-            snapshot = self.build_snapshot(
-                decision_timestamp=decision_timestamp,
-                evaluate_signals=False,
+        def _submit_forced_exits(
+            snapshot: BotSnapshot,
+            *,
+            exit_reason: str,
+            open_order_symbols: set[str] | None = None,
+        ) -> None:
+            if open_order_symbols is None:
+                open_orders = self.get_open_orders()
+                open_order_symbols = {
+                    str(getattr(order, "symbol", ""))
+                    for order in open_orders
+                    if getattr(order, "symbol", None)
+                }
+            if snapshot.positions:
+                self._mark_active_decision_cycle_order_capable()
+            failed_symbols = self.flatten_positions(
+                snapshot.positions,
+                open_order_symbols,
+                exit_reason=exit_reason,
             )
-            print("[CYCLE] Skipping globally claimed bar before execution branch")
-            _set_cycle_report(processed_bar=False, skip_reason="duplicate_bar")
-            self.record_state(snapshot)
-            return snapshot
+            if failed_symbols:
+                raise RuntimeError(
+                    f"forced_exit_submission_failed:{len(failed_symbols)}"
+                )
+
+        def _forced_exit_for_rejected_cycle(
+            snapshot: BotSnapshot,
+        ) -> tuple[BotSnapshot, str] | None:
+            if not snapshot.positions:
+                return None
+            resync_result = self.get_startup_resync_result()
+            if not resync_result.gate_allows_exits:
+                return None
+            try:
+                market_open = self._is_market_open()
+            except Exception as exc:
+                self._log_skip("SKIP_MARKET_CLOSED", str(exc))
+                return None
+            if not market_open or not self._is_regular_hours(now_et):
+                return None
+
+            if self._is_past_flatten_deadline(now_et):
+                self._log_skip(
+                    "SKIP_EOD_FLATTEN_WINDOW",
+                    (
+                        f"{now_et.strftime('%H:%M:%S')} ET >= 15:55, "
+                        "closing all positions after normal cycle rejection"
+                    ),
+                )
+                _submit_forced_exits(
+                    snapshot,
+                    exit_reason="eod_flatten",
+                )
+                return (
+                    self.build_snapshot(
+                        decision_timestamp=decision_timestamp,
+                        evaluate_signals=False,
+                    ),
+                    "eod_flatten_window",
+                )
+
+            if snapshot.kill_switch_triggered:
+                print("Kill switch triggered.")
+                self.blog.kill_switch(
+                    daily_pnl=snapshot.daily_pnl,
+                    daily_limit=self.config.max_daily_loss_usd,
+                    trigger=True,
+                )
+                _submit_forced_exits(
+                    snapshot,
+                    exit_reason="kill_switch",
+                )
+                return (
+                    self.build_snapshot(
+                        decision_timestamp=decision_timestamp,
+                        evaluate_signals=False,
+                    ),
+                    "kill_switch_active",
+                )
+            return None
+
+        if execute_orders:
+            claim = self._claim_global_decision_execution(decision_timestamp)
+            claim_succeeded = (
+                claim if isinstance(claim, bool) else claim.claimed
+            )
+            if not claim_succeeded:
+                snapshot = self.build_snapshot(
+                    decision_timestamp=decision_timestamp,
+                    evaluate_signals=False,
+                )
+                forced_exit = _forced_exit_for_rejected_cycle(snapshot)
+                if forced_exit is not None:
+                    snapshot, skip_reason = forced_exit
+                    print(
+                        "[CYCLE] Normal decision cycle rejected; "
+                        f"forced safety exit handled ({skip_reason})"
+                    )
+                    _set_cycle_report(
+                        processed_bar=False,
+                        skip_reason=skip_reason,
+                    )
+                    self.record_state(snapshot)
+                    return snapshot
+                print("[CYCLE] Skipping durably claimed decision cycle")
+                _set_cycle_report(
+                    processed_bar=False,
+                    skip_reason="duplicate_bar",
+                )
+                self.record_state(snapshot)
+                return snapshot
 
         try:
             if execute_orders and should_process and self._is_regular_hours(decision_timestamp):
@@ -3604,13 +3923,10 @@ class TradeOSBot:
                 "SKIP_EOD_FLATTEN_WINDOW",
                 f"{now_et.strftime('%H:%M:%S')} ET >= 15:55, closing all positions",
             )
-            open_orders = self.get_open_orders()
-            open_order_symbols = {
-                str(getattr(order, "symbol", ""))
-                for order in open_orders
-                if getattr(order, "symbol", None)
-            }
-            self.flatten_positions(snapshot.positions, open_order_symbols)
+            _submit_forced_exits(
+                snapshot,
+                exit_reason="eod_flatten",
+            )
             snapshot = self.build_snapshot(decision_timestamp=decision_timestamp, evaluate_signals=False)
             _set_cycle_report(processed_bar=True, skip_reason="eod_flatten_window")
             self.record_state(snapshot)
@@ -3637,13 +3953,10 @@ class TradeOSBot:
                 trigger=True,
             )
             if execute_orders:
-                open_orders = self.get_open_orders()
-                open_order_symbols = {
-                    str(getattr(order, "symbol", ""))
-                    for order in open_orders
-                    if getattr(order, "symbol", None)
-                }
-                self.flatten_positions(snapshot.positions, open_order_symbols, exit_reason="kill_switch")
+                _submit_forced_exits(
+                    snapshot,
+                    exit_reason="kill_switch",
+                )
                 snapshot = self.build_snapshot(decision_timestamp=decision_timestamp, evaluate_signals=False)
             _set_cycle_report(processed_bar=True, skip_reason="kill_switch_active")
             self.record_state(snapshot)
@@ -3698,7 +4011,11 @@ class TradeOSBot:
                     "SKIP_EOD_FLATTEN_WINDOW",
                     f"mid-cycle at {self._et_now().strftime('%H:%M:%S')} ET",
                 )
-                self.flatten_positions(snapshot.positions, open_order_symbols)
+                _submit_forced_exits(
+                    snapshot,
+                    exit_reason="eod_flatten",
+                    open_order_symbols=open_order_symbols,
+                )
                 break
 
             symbol = item.symbol
@@ -4141,6 +4458,11 @@ class TradeOSBot:
                     )
                 except Exception:
                     pass
+                _set_cycle_report(
+                    processed_bar=False,
+                    skip_reason="execution_error",
+                )
+                raise
 
         final_reason = "execution_completed"
         if orders_submitted == 0:
@@ -4190,21 +4512,7 @@ def main(config: BotConfig | None = None, session_id: str | None = None) -> None
         data_parity=bot.data_parity_summary(),
     )
 
-    def _eod_flatten_worker() -> None:
-        now_et = bot._et_now()
-        target_et = now_et.replace(hour=15, minute=55, second=0, microsecond=0)
-        delay = (target_et - now_et).total_seconds()
-        if delay <= 0:
-            print("EOD flatten thread: already past 15:55 ET, signalling shutdown")
-            shutdown_event.set()
-            return
-        print(f"EOD flatten thread: scheduled in {delay:.0f}s at 15:55 ET")
-        # Wait until 15:55, but wake up early if the main loop shuts down first
-        shutdown_event.wait(timeout=delay)
-        if shutdown_event.is_set():
-            # Kill switch or other early exit already handled the flatten
-            return
-        print(f"EOD flatten thread firing at {bot._et_now().strftime('%H:%M:%S')} ET")
+    def _submit_eod_fail_safe() -> None:
         if execute_orders:
             try:
                 positions = bot.get_positions_by_symbol()
@@ -4214,11 +4522,43 @@ def main(config: BotConfig | None = None, session_id: str | None = None) -> None
                     for order in open_orders
                     if getattr(order, "symbol", None)
                 }
-                bot.flatten_positions(positions, open_order_symbols)
+                failed_symbols = bot.flatten_positions(
+                    positions,
+                    open_order_symbols,
+                )
+                if failed_symbols:
+                    # The broker may have accepted an order before returning an
+                    # error, so this independent fail-safe reports uncertainty
+                    # but never retries it automatically.
+                    print(
+                        "EOD flatten thread ERROR: "
+                        f"forced_exit_submission_failed:{len(failed_symbols)}"
+                    )
             except Exception as exc:
                 print(f"EOD flatten thread ERROR: {exc}")
         else:
             print("EOD flatten thread: execute_orders=False, skipping flatten")
+
+    def _eod_flatten_worker() -> None:
+        now_et = bot._et_now()
+        target_et = now_et.replace(hour=15, minute=55, second=0, microsecond=0)
+        delay = (target_et - now_et).total_seconds()
+        if delay <= 0:
+            print(
+                "EOD flatten thread: already past 15:55 ET, "
+                "flattening immediately"
+            )
+            _submit_eod_fail_safe()
+            shutdown_event.set()
+            return
+        print(f"EOD flatten thread: scheduled in {delay:.0f}s at 15:55 ET")
+        # Wait until 15:55, but wake up early if the main loop shuts down first
+        shutdown_event.wait(timeout=delay)
+        if shutdown_event.is_set():
+            # Kill switch or other early exit already handled the flatten
+            return
+        print(f"EOD flatten thread firing at {bot._et_now().strftime('%H:%M:%S')} ET")
+        _submit_eod_fail_safe()
         shutdown_event.set()
 
     # Keep this thread even though run_once() also enforces the flatten window.

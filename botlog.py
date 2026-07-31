@@ -108,6 +108,33 @@ class BotLogger:
     def lifecycle(self, stage: str, **fields) -> None:
         self._emit(self._lifecycle, "process.lifecycle", stage=stage, **fields)
 
+    def decision_cycle(
+        self,
+        *,
+        stage: str,
+        decision_ts: str,
+        owner_id: str,
+        reason: str,
+        status: str | None = None,
+        existing_owner_id: str | None = None,
+        latest_decision_ts: str | None = None,
+        symbol_fingerprint: str | None = None,
+        symbol_count: int | None = None,
+    ) -> None:
+        self._emit(
+            self._lifecycle,
+            f"decision_cycle.{stage}",
+            trace=_trace_id("CYCLE", decision_ts),
+            decision_ts=decision_ts,
+            owner_id=owner_id,
+            reason=reason,
+            status=status,
+            existing_owner_id=existing_owner_id,
+            latest_decision_ts=latest_decision_ts,
+            symbol_fingerprint=symbol_fingerprint,
+            symbol_count=symbol_count,
+        )
+
     # ------------------------------------------------------------------
     # 1. Bar received / timing
     # ------------------------------------------------------------------
