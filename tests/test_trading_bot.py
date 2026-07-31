@@ -206,6 +206,37 @@ def test_run_once_duplicate_global_claim_sets_cycle_report_without_hold_reasons(
     )
 
 
+def test_recent_symbol_order_detects_same_side_active_order() -> None:
+    bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    bot.get_recent_orders = lambda limit=100: [
+        SimpleNamespace(
+            symbol="COP",
+            side="sell",
+            status="filled",
+            submitted_at=submitted_at,
+        )
+    ]
+
+    assert bot._has_recent_symbol_order("COP", "sell", window_seconds=120) is True
+    assert bot._has_recent_symbol_order("COP", "buy", window_seconds=120) is False
+
+
+def test_recent_symbol_order_ignores_canceled_order() -> None:
+    bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    bot.get_recent_orders = lambda limit=100: [
+        SimpleNamespace(
+            symbol="COP",
+            side="sell",
+            status="canceled",
+            submitted_at=submitted_at,
+        )
+    ]
+
+    assert bot._has_recent_symbol_order("COP", "sell", window_seconds=120) is False
+
+
 def test_update_position_holding_state_restores_open_position_from_logs() -> None:
     bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
     bot._position_entry_price = {}

@@ -147,7 +147,7 @@ function Get-LatestStartupSessionInfo {
     }
 }
 
-function Get-LatestLifecycleEventForSession {
+function Get-StartupLifecycleStatusForSession {
     param(
         [string]$SessionId
     )
@@ -163,7 +163,9 @@ function Get-LatestLifecycleEventForSession {
         return $null
     }
 
-    $matched = $null
+    $sawStartupReady = $false
+    $sawStartupFailed = $false
+    $latestMatchedEvent = $null
     foreach ($line in Get-Content -LiteralPath $lifecyclePath.FullName -Tail 400 -ErrorAction SilentlyContinue) {
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
@@ -179,10 +181,20 @@ function Get-LatestLifecycleEventForSession {
         if ("$($event.event)" -ne "process.lifecycle") {
             continue
         }
-        $matched = $event
+        $latestMatchedEvent = $event
+        $stage = "$($event.stage)"
+        if ($stage -eq "startup.ready") {
+            $sawStartupReady = $true
+        } elseif ($stage -eq "startup.failed") {
+            $sawStartupFailed = $true
+        }
     }
 
-    return $matched
+    [pscustomobject]@{
+        saw_startup_ready = $sawStartupReady
+        saw_startup_failed = $sawStartupFailed
+        latest_event = $latestMatchedEvent
+    }
 }
 
 function Test-LiveRuntimeApproval {
@@ -433,15 +445,15 @@ function Wait-LiveBotReady {
             Start-Sleep -Milliseconds 250
             continue
         }
-        $lifecycleEvent = Get-LatestLifecycleEventForSession -SessionId $sessionInfo.session_id
-        if ($null -eq $lifecycleEvent) {
+        $lifecycleStatus = Get-StartupLifecycleStatusForSession -SessionId $sessionInfo.session_id
+        if ($null -eq $lifecycleStatus -or $null -eq $lifecycleStatus.latest_event) {
             Start-Sleep -Milliseconds 250
             continue
         }
-        if ("$($lifecycleEvent.stage)" -eq "startup.ready") {
+        if ($lifecycleStatus.saw_startup_ready) {
             return $true
         }
-        if ("$($lifecycleEvent.stage)" -eq "startup.failed") {
+        if ($lifecycleStatus.saw_startup_failed) {
             return $false
         }
         Start-Sleep -Milliseconds 250

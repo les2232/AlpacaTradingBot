@@ -2555,6 +2555,25 @@ class TradeOSBot:
                 count += 1
         return count
 
+    def _has_recent_symbol_order(self, symbol: str, side: str, window_seconds: int = 120) -> bool:
+        orders = self.get_recent_orders(limit=100)
+        now = datetime.now(timezone.utc)
+        ignored_statuses = {"canceled", "cancelled", "expired", "rejected"}
+        for order in orders:
+            order_symbol = str(getattr(order, "symbol", "") or "").upper()
+            order_side = str(getattr(order, "side", "") or "").lower()
+            order_status = str(getattr(order, "status", "") or "").lower()
+            if order_symbol != symbol.upper() or order_side != side.lower():
+                continue
+            if order_status in ignored_statuses:
+                continue
+            submitted_at = _parse_iso_timestamp(getattr(order, "submitted_at", None))
+            if submitted_at is None:
+                continue
+            if (now - submitted_at).total_seconds() <= window_seconds:
+                return True
+        return False
+
     def _is_price_collar_breached(self, decision_price: float, live_price: float) -> bool:
         if decision_price <= 0:
             return True
@@ -3618,6 +3637,47 @@ class TradeOSBot:
 
                 elif action == "SELL" and symbol in positions:
                     _dec_ts = decision_timestamp.isoformat() if decision_timestamp else ""
+                    if self._has_recent_symbol_order(symbol, "sell", window_seconds=120):
+                        print(f"Skip {symbol} SELL: recent sell order already submitted")
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="SELL",
+                            allowed=False,
+                            block_reason="recent_sell_order_in_flight",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            signal_price=item.price or None,
+                            detail="sell suppressed because a same-symbol sell was submitted recently",
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            recent_order_count=recent_order_count,
+                        )
+                        continue
+                    try:
+                        refreshed_positions = self.get_positions_by_symbol()
+                    except Exception:
+                        refreshed_positions = positions
+                    refreshed_position = refreshed_positions.get(symbol)
+                    if not _has_long_position(refreshed_position):
+                        print(f"Skip {symbol} SELL: broker no longer reports a long position")
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="SELL",
+                            allowed=False,
+                            block_reason="no_long_position_to_exit",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            signal_price=item.price or None,
+                            detail="fresh broker position check prevented a sell that could create or deepen a short",
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            recent_order_count=recent_order_count,
+                        )
+                        positions.pop(symbol, None)
+                        continue
+                    positions[symbol] = refreshed_position
                     live_price, live_price_age = self.get_latest_price_with_age(symbol)
                     _signal_price = item.price or 0.0
                     _dev_bps = abs((live_price / _signal_price) - 1.0) * 10_000 if _signal_price > 0 else None
@@ -3694,6 +3754,7 @@ class TradeOSBot:
                         orders_submitted += 1
                         open_positions = max(0, open_positions - 1)
                         recent_order_count += 1
+                        positions.pop(symbol, None)
                 elif action == "SELL":
                     print(f"Skip {symbol} SELL: not currently holding")
                     self._log_risk_check(
