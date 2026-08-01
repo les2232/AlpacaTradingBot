@@ -572,24 +572,42 @@ function Start-LiveBot {
     }
 }
 
-function Start-Dashboard {
+function Assert-DashboardPortAvailable {
     if (Test-TcpPortOpen -TargetPort $Port) {
-        Write-Host "Reusing existing dashboard at $dashboardUrl"
-        return
+        throw (
+            "Refusing to reuse the process already listening at $dashboardUrl because its " +
+            "TradeOS workspace and database authority cannot be verified. Stop that process " +
+            "or choose another -Port, then retry."
+        )
     }
+}
+
+function Start-Dashboard {
+    Assert-DashboardPortAvailable
 
     Write-Host "Starting dashboard via 'python -m tradeos dashboard' on $dashboardUrl"
-    Start-Process `
+    $dashboardProcess = Start-Process `
         -FilePath $python `
         -ArgumentList @("-m", "tradeos", "dashboard", "--port", "$Port") `
-        -WorkingDirectory $projectRoot
+        -WorkingDirectory $projectRoot `
+        -PassThru
 
     if (-not (Wait-TcpPortReady -TargetPort $Port)) {
         throw "Dashboard did not become ready within the timeout window."
     }
+    Start-Sleep -Milliseconds 250
+    $dashboardProcess.Refresh()
+    if ($dashboardProcess.HasExited) {
+        throw (
+            "Dashboard launcher exited after the port became ready. Refusing to trust an " +
+            "unverified process on $dashboardUrl."
+        )
+    }
 }
 
 $python = Resolve-PythonExecutable -RequestedPython $PythonExe
+
+Assert-DashboardPortAvailable
 
 if (-not $DashboardOnly) {
     Start-LiveBot

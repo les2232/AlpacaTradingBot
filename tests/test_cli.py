@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from dotenv import load_dotenv
 
 from alpaca_trading_bot import cli
 from trading_bot import BotConfig, RuntimeConfigDetails
@@ -61,12 +60,14 @@ def test_run_dashboard_starts_streamlit_headless_and_reports_url(
         def wait(self) -> int:
             return 0
 
-    def fake_popen(command, cwd=None):
+    def fake_popen(command, cwd=None, env=None):
         captured["command"] = command
         captured["cwd"] = cwd
+        captured["env"] = env
         return FakeProcess()
 
     monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli, "_dashboard_port_is_open", lambda port: False)
     monkeypatch.setattr(cli, "_wait_for_dashboard_server", lambda port, process: True)
 
     exit_code = cli._run_dashboard(port=None)
@@ -83,6 +84,7 @@ def test_run_dashboard_starts_streamlit_headless_and_reports_url(
         "true",
     ]
     assert captured["cwd"] == str(cli.PROJECT_ROOT)
+    assert captured["env"] is None
     assert "Dashboard available at http://localhost:8501" in output
 
 
@@ -96,11 +98,12 @@ def test_run_dashboard_honors_custom_port(monkeypatch: pytest.MonkeyPatch) -> No
         def wait(self) -> int:
             return 0
 
-    def fake_popen(command, cwd=None):
+    def fake_popen(command, cwd=None, env=None):
         captured["command"] = command
         return FakeProcess()
 
     monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli, "_dashboard_port_is_open", lambda port: False)
     monkeypatch.setattr(cli, "_wait_for_dashboard_server", lambda port, process: False)
 
     exit_code = cli._run_dashboard(port=9123)
@@ -117,6 +120,22 @@ def test_run_dashboard_honors_custom_port(monkeypatch: pytest.MonkeyPatch) -> No
         "--server.port",
         "9123",
     ]
+
+
+def test_run_dashboard_refuses_unverified_occupied_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "_dashboard_port_is_open", lambda port: True)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("dashboard process must not start")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="database authority cannot be verified"):
+        cli._run_dashboard(port=8501)
 
 
 def test_run_live_refuses_non_paper_execution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -387,7 +406,7 @@ def test_run_live_loads_dotenv_before_resolving_config(monkeypatch: pytest.Monke
 
     def fake_load_dotenv(path):
         called.append("load_dotenv")
-        return load_dotenv(path)
+        return False
 
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.setattr(cli, "load_dotenv", fake_load_dotenv)
@@ -649,6 +668,7 @@ def test_run_live_refuses_baseline_mismatch(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_run_live_allows_baseline_mismatch_with_explicit_override(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     called: dict[str, bool] = {"main": False}
     config = SimpleNamespace(
@@ -688,6 +708,7 @@ def test_run_live_allows_baseline_mismatch_with_explicit_override(
     monkeypatch.setenv(cli.ALLOW_BASELINE_MISMATCH_ENV, "true")
     monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
     monkeypatch.setattr(cli, "_live_instance_lock", cli.contextlib.nullcontext)
+    monkeypatch.setattr(cli, "LOG_ROOT", tmp_path / "logs")
 
     exit_code = cli._run_live(preview=False)
 
@@ -789,8 +810,11 @@ def test_run_live_recovers_reused_pid_lock(monkeypatch: pytest.MonkeyPatch, caps
         _cleanup_tree(log_root)
 
 
-def test_persist_startup_config_writes_live_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
-    log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
+def test_persist_startup_config_writes_live_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    log_root = tmp_path / "logs"
     details = SimpleNamespace(
         config=SimpleNamespace(
             paper=True,
@@ -861,6 +885,7 @@ def test_persist_startup_config_writes_live_artifact(monkeypatch: pytest.MonkeyP
         assert payload["mean_reversion_trend_filter"] is False
         assert payload["mean_reversion_trend_slope_filter"] is False
         assert payload["mean_reversion_stop_pct"] == 0.0
+        assert payload["db_path"] == str((cli.PROJECT_ROOT / "bot_history.db").resolve())
         assert latest_payload == payload
     finally:
         if log_root.exists():

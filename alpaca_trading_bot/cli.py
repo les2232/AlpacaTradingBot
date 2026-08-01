@@ -16,9 +16,14 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from daily_report import load_backtest_baseline
+from tradeos.runtime_paths import (
+    DATABASE_PATH_ENV,
+    TRADEOS_REPOSITORY_ROOT,
+    resolve_database_path,
+)
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = TRADEOS_REPOSITORY_ROOT
 LIVE_BOT_LOCK_PATH = PROJECT_ROOT / ".live_bot.lock"
 LOG_ROOT = PROJECT_ROOT / "logs"
 DEFAULT_DASHBOARD_PORT = 8501
@@ -357,8 +362,15 @@ def _render_runtime_summary(config: object, preview: bool) -> None:
         print(f"Runtime symbols preview: {symbols_preview}")
 
 
-def _persist_startup_config(details: object, preview: bool, *, session_id: str) -> Path:
+def _persist_startup_config(
+    details: object,
+    preview: bool,
+    *,
+    session_id: str,
+    database_path: Path | None = None,
+) -> Path:
     config = getattr(details, "config")
+    resolved_database_path = resolve_database_path(database_path)
     started_at_utc = _utcnow_iso()
     payload = {
         "session_id": session_id,
@@ -395,7 +407,7 @@ def _persist_startup_config(details: object, preview: bool, *, session_id: str) 
         "mean_reversion_trend_filter": bool(getattr(config, "mean_reversion_trend_filter", False)),
         "mean_reversion_trend_slope_filter": bool(getattr(config, "mean_reversion_trend_slope_filter", False)),
         "mean_reversion_stop_pct": float(getattr(config, "mean_reversion_stop_pct", 0.0) or 0.0),
-        "db_path": os.getenv("BOT_DB_PATH", "bot_history.db"),
+        "db_path": str(resolved_database_path),
         "historical_feed": str(getattr(config, "historical_feed", "") or ""),
         "live_feed": str(getattr(config, "live_feed", "") or ""),
         "latest_bar_feed": str(getattr(config, "latest_bar_feed", "") or ""),
@@ -503,6 +515,8 @@ def _validate_runtime_baseline(details: object, preview: bool) -> None:
 
 def _run_live(preview: bool) -> int:
     load_dotenv(PROJECT_ROOT / ".env")
+    database_path = resolve_database_path()
+    print(f"Database authority: {database_path}")
     live_lock = contextlib.nullcontext()
     if not preview:
         live_lock = _live_instance_lock()
@@ -519,16 +533,30 @@ def _run_live(preview: bool) -> int:
         env_value = "false" if preview else "true"
         startup_artifact_path: Path | None = None
         if not preview:
-            startup_artifact_path = _persist_startup_config(details, preview=preview, session_id=session_id)
+            startup_artifact_path = _persist_startup_config(
+                details,
+                preview=preview,
+                session_id=session_id,
+                database_path=database_path,
+            )
         startup_artifact_env = str(startup_artifact_path) if startup_artifact_path is not None else ""
-        with _temporary_env("EXECUTE_ORDERS", env_value):
-            with _temporary_env(STARTUP_ARTIFACT_PATH_ENV, startup_artifact_env):
-                trading_bot.main(config=config, session_id=session_id)
+        with _temporary_env(DATABASE_PATH_ENV, str(database_path)):
+            with _temporary_env("EXECUTE_ORDERS", env_value):
+                with _temporary_env(STARTUP_ARTIFACT_PATH_ENV, startup_artifact_env):
+                    trading_bot.main(config=config, session_id=session_id)
     return 0
 
 
 def _dashboard_url(port: int) -> str:
     return f"http://localhost:{port}"
+
+
+def _dashboard_port_is_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            return True
+    except OSError:
+        return False
 
 
 def _wait_for_dashboard_server(
@@ -550,12 +578,20 @@ def _wait_for_dashboard_server(
 
 
 def _run_dashboard(port: int | None) -> int:
+    effective_port = port or DEFAULT_DASHBOARD_PORT
+    if _dashboard_port_is_open(effective_port):
+        raise RuntimeError(
+            f"Refusing to reuse http://localhost:{effective_port} because the listening "
+            "process's TradeOS workspace and database authority cannot be verified."
+        )
     command = [sys.executable, "-m", "streamlit", "run", "dashboard.py"]
     command.extend(["--server.headless", "true"])
     if port is not None:
         command.extend(["--server.port", str(port)])
-    effective_port = port or DEFAULT_DASHBOARD_PORT
-    process = subprocess.Popen(command, cwd=str(PROJECT_ROOT))
+    process = subprocess.Popen(
+        command,
+        cwd=str(PROJECT_ROOT),
+    )
     url = _dashboard_url(effective_port)
     if _wait_for_dashboard_server(effective_port, process):
         print(f"Dashboard available at {url}")

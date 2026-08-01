@@ -22,7 +22,7 @@ Read these first:
 - `tradeos preview`
   Runs the same runtime path with execution disabled.
 - `.\start_dashboard.ps1`
-  Preferred operator launcher. Starts or reuses the live bot and dashboard together.
+  Preferred operator launcher. Starts or safely reuses the live bot, then starts a dashboard on a verified free port.
 
 ### Monitoring
 

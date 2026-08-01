@@ -36,14 +36,15 @@ def _cleanup_dashboard_test_artifacts(logs_dir: str | Path, db_path: str | Path)
                 pass
 
 
-def test_load_dashboard_state_reads_persisted_startup_config(monkeypatch) -> None:
+def test_load_dashboard_state_reads_persisted_startup_config(monkeypatch, tmp_path: Path) -> None:
     unique = uuid4().hex
-    logs_dir = f"test_dashboard_logs_{unique}"
-    db_path = f"test_dashboard_state_{unique}.db"
+    logs_dir = tmp_path / f"test_dashboard_logs_{unique}"
+    db_path = tmp_path / f"test_dashboard_state_{unique}.db"
 
-    monkeypatch.setenv("BOT_LOG_ROOT", logs_dir)
+    monkeypatch.setenv("BOT_LOG_ROOT", str(logs_dir))
+    monkeypatch.delenv("BOT_DB_PATH", raising=False)
     try:
-        BotStorage(Path(db_path))
+        BotStorage(db_path)
         day_dir = Path(logs_dir) / "2026-04-12"
         day_dir.mkdir(parents=True, exist_ok=True)
         (day_dir / "startup_config.20260412T133000Z.json").write_text(
@@ -70,7 +71,7 @@ def test_load_dashboard_state_reads_persisted_startup_config(monkeypatch) -> Non
                     "max_price_deviation_bps": 75.0,
                     "max_live_price_age_seconds": 60,
                     "max_data_delay_seconds": 300,
-                    "db_path": db_path,
+                    "db_path": str(db_path),
                 }
             ),
             encoding="utf-8",
@@ -85,17 +86,17 @@ def test_load_dashboard_state_reads_persisted_startup_config(monkeypatch) -> Non
         assert state.startup_config.mean_reversion_trend_filter is False
         assert state.startup_config.mean_reversion_stop_pct == 0.0
         assert state.symbol_state_status == "cleared_runtime_symbol_state"
-        assert str(state.storage.db_path).endswith(db_path)
+        assert state.storage.db_path == db_path.resolve()
     finally:
         _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
-def test_load_dashboard_state_reports_missing_startup_config(monkeypatch) -> None:
+def test_load_dashboard_state_reports_missing_startup_config(monkeypatch, tmp_path: Path) -> None:
     unique = uuid4().hex
-    logs_dir = f"test_dashboard_logs_{unique}"
-    db_path = f"test_dashboard_state_{unique}.db"
-    monkeypatch.setenv("BOT_LOG_ROOT", logs_dir)
-    monkeypatch.setenv("BOT_DB_PATH", db_path)
+    logs_dir = tmp_path / f"test_dashboard_logs_{unique}"
+    db_path = tmp_path / f"test_dashboard_state_{unique}.db"
+    monkeypatch.setenv("BOT_LOG_ROOT", str(logs_dir))
+    monkeypatch.setenv("BOT_DB_PATH", str(db_path))
 
     try:
         state = load_dashboard_state()
@@ -106,14 +107,15 @@ def test_load_dashboard_state_reports_missing_startup_config(monkeypatch) -> Non
         _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
-def test_load_dashboard_state_ignores_launches_directory(monkeypatch) -> None:
+def test_load_dashboard_state_ignores_launches_directory(monkeypatch, tmp_path: Path) -> None:
     unique = uuid4().hex
-    logs_dir = f"test_dashboard_logs_{unique}"
-    db_path = f"test_dashboard_state_{unique}.db"
-    monkeypatch.setenv("BOT_LOG_ROOT", logs_dir)
+    logs_dir = tmp_path / f"test_dashboard_logs_{unique}"
+    db_path = tmp_path / f"test_dashboard_state_{unique}.db"
+    monkeypatch.setenv("BOT_LOG_ROOT", str(logs_dir))
+    monkeypatch.delenv("BOT_DB_PATH", raising=False)
 
     try:
-        BotStorage(Path(db_path))
+        BotStorage(db_path)
         session_dir = Path(logs_dir) / "2026-04-13"
         session_dir.mkdir(parents=True, exist_ok=True)
         (session_dir / "startup_config.20260413T133000Z.json").write_text(
@@ -140,7 +142,7 @@ def test_load_dashboard_state_ignores_launches_directory(monkeypatch) -> None:
                     "max_price_deviation_bps": 75.0,
                     "max_live_price_age_seconds": 60,
                     "max_data_delay_seconds": 300,
-                    "db_path": db_path,
+                    "db_path": str(db_path),
                 }
             ),
             encoding="utf-8",
@@ -157,15 +159,15 @@ def test_load_dashboard_state_ignores_launches_directory(monkeypatch) -> None:
         _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
-def test_load_dashboard_state_reports_unmatched_startup_artifact(monkeypatch) -> None:
+def test_load_dashboard_state_reports_unmatched_startup_artifact(monkeypatch, tmp_path: Path) -> None:
     unique = uuid4().hex
-    logs_dir = f"test_dashboard_logs_{unique}"
-    db_path = f"test_dashboard_state_{unique}.db"
-    monkeypatch.setenv("BOT_LOG_ROOT", logs_dir)
-    monkeypatch.setenv("BOT_DB_PATH", db_path)
+    logs_dir = tmp_path / f"test_dashboard_logs_{unique}"
+    db_path = tmp_path / f"test_dashboard_state_{unique}.db"
+    monkeypatch.setenv("BOT_LOG_ROOT", str(logs_dir))
+    monkeypatch.setenv("BOT_DB_PATH", str(db_path))
 
     try:
-        storage = BotStorage(Path(db_path))
+        storage = BotStorage(db_path)
         day_dir = Path(logs_dir) / "2026-04-13"
         day_dir.mkdir(parents=True, exist_ok=True)
         (day_dir / "startup_config.20260413T143426Z.json").write_text(
@@ -192,7 +194,7 @@ def test_load_dashboard_state_reports_unmatched_startup_artifact(monkeypatch) ->
                     "max_price_deviation_bps": 75.0,
                     "max_live_price_age_seconds": 60,
                     "max_data_delay_seconds": 300,
-                    "db_path": db_path,
+                    "db_path": str(db_path),
                 }
             ),
             encoding="utf-8",
@@ -614,14 +616,15 @@ def test_select_startup_config_prefers_latest_run_session_id() -> None:
     assert selected.session_id == "session-current"
 
 
-def test_load_dashboard_state_ignores_snapshot_from_different_symbol_session(monkeypatch) -> None:
+def test_load_dashboard_state_ignores_snapshot_from_different_symbol_session(monkeypatch, tmp_path: Path) -> None:
     unique = uuid4().hex
-    logs_dir = f"test_dashboard_logs_{unique}"
-    db_path = f"test_dashboard_state_{unique}.db"
-    monkeypatch.setenv("BOT_LOG_ROOT", logs_dir)
+    logs_dir = tmp_path / f"test_dashboard_logs_{unique}"
+    db_path = tmp_path / f"test_dashboard_state_{unique}.db"
+    monkeypatch.setenv("BOT_LOG_ROOT", str(logs_dir))
+    monkeypatch.delenv("BOT_DB_PATH", raising=False)
 
     try:
-        storage = BotStorage(Path(db_path))
+        storage = BotStorage(db_path)
         day_dir = Path(logs_dir) / "2026-04-13"
         day_dir.mkdir(parents=True, exist_ok=True)
         (day_dir / "startup_config.20260413T170000Z.json").write_text(
@@ -648,7 +651,7 @@ def test_load_dashboard_state_ignores_snapshot_from_different_symbol_session(mon
                     "max_price_deviation_bps": 75.0,
                     "max_live_price_age_seconds": 60,
                     "max_data_delay_seconds": 300,
-                    "db_path": db_path,
+                    "db_path": str(db_path),
                 }
             ),
             encoding="utf-8",
@@ -681,8 +684,8 @@ def test_load_dashboard_state_ignores_snapshot_from_different_symbol_session(mon
         _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
-def test_load_dashboard_state_includes_session_block_reason_counts() -> None:
-    temp_root = Path.cwd()
+def test_load_dashboard_state_includes_session_block_reason_counts(tmp_path: Path) -> None:
+    temp_root = tmp_path
     logs_dir = temp_root / f"test_logs_{uuid4().hex}"
     day_dir = logs_dir / "2026-04-13"
     day_dir.mkdir(parents=True, exist_ok=True)
@@ -818,8 +821,8 @@ def test_load_dashboard_state_includes_session_block_reason_counts() -> None:
         _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
-def test_load_dashboard_state_filters_day_logs_to_selected_session(monkeypatch) -> None:
-    temp_root = Path.cwd()
+def test_load_dashboard_state_filters_day_logs_to_selected_session(monkeypatch, tmp_path: Path) -> None:
+    temp_root = tmp_path
     logs_dir = temp_root / f"test_logs_{uuid4().hex}"
     day_dir = logs_dir / "2026-04-13"
     day_dir.mkdir(parents=True, exist_ok=True)

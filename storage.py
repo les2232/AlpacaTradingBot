@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tradeos.runtime_paths import require_canonical_database_path
+
 
 DECISION_CYCLE_CLAIMED = "claimed"
 DECISION_CYCLE_RUNNING = "running"
@@ -50,8 +52,8 @@ def normalize_decision_cycle_id(value: datetime | str) -> str:
 
 
 class BotStorage:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = require_canonical_database_path(db_path)
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:

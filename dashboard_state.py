@@ -11,6 +11,13 @@ from avatar import generate_near_miss_narration, generate_trade_narration
 from drift_monitor import BaselineProfile, DriftAlert, DriftReport, LiveMetrics, build_drift_report
 from storage import BotStorage
 from symbol_state import format_symbol_list, normalize_symbols, symbols_match
+from tradeos.runtime_paths import (
+    DATABASE_PATH_ENV,
+    DEFAULT_DATABASE_FILENAME,
+    resolve_database_path,
+    resolve_explicit_database_path,
+    resolve_log_root,
+)
 
 
 @dataclass(frozen=True)
@@ -268,7 +275,7 @@ class DashboardState:
 
 
 def _log_root() -> Path:
-    return Path(os.getenv("BOT_LOG_ROOT", "logs"))
+    return resolve_log_root()
 
 
 def _is_session_log_dir(path: Path) -> bool:
@@ -293,6 +300,8 @@ def _startup_config_from_payload(payload: dict[str, object], artifact_path: Path
     if not isinstance(payload, dict):
         return None
     symbols = normalize_symbols(payload.get("symbols", []))
+    raw_db_path = payload.get("db_path", DEFAULT_DATABASE_FILENAME)
+    db_path = "" if raw_db_path is None else str(raw_db_path)
     return PersistedStartupConfig(
         session_id=str(payload.get("session_id", "")) or None,
         started_at_utc=str(payload.get("started_at_utc", "")) or None,
@@ -323,7 +332,7 @@ def _startup_config_from_payload(payload: dict[str, object], artifact_path: Path
         mean_reversion_trend_filter=bool(payload.get("mean_reversion_trend_filter", False)),
         mean_reversion_trend_slope_filter=bool(payload.get("mean_reversion_trend_slope_filter", False)),
         mean_reversion_stop_pct=float(payload.get("mean_reversion_stop_pct", 0.0) or 0.0),
-        db_path=str(payload.get("db_path", "bot_history.db") or "bot_history.db"),
+        db_path=db_path,
         historical_feed=str(payload.get("historical_feed", "") or ""),
         live_feed=str(payload.get("live_feed", "") or ""),
         latest_bar_feed=str(payload.get("latest_bar_feed", "") or ""),
@@ -1480,10 +1489,33 @@ def _load_recent_activity(
     return tuple(items)
 
 
+def _resolve_dashboard_database_path(
+    latest_startup_config: PersistedStartupConfig | None,
+) -> Path:
+    configured_path = resolve_explicit_database_path()
+
+    if latest_startup_config is None:
+        return configured_path or resolve_database_path()
+
+    artifact_path = resolve_database_path(latest_startup_config.db_path)
+    authorities_conflict = (
+        configured_path is not None
+        and os.path.normcase(str(configured_path))
+        != os.path.normcase(str(artifact_path))
+    )
+    if authorities_conflict:
+        raise RuntimeError(
+            "Conflicting database authorities: startup metadata resolves to "
+            f"{artifact_path}, but {DATABASE_PATH_ENV} resolves to {configured_path}. "
+            "Refusing to initialize dashboard storage."
+        )
+    return artifact_path
+
+
 def load_dashboard_state() -> DashboardState:
     startup_configs = _load_startup_configs()
     latest_startup_config = startup_configs[-1] if startup_configs else None
-    db_path = Path(latest_startup_config.db_path if latest_startup_config is not None else os.getenv("BOT_DB_PATH", "bot_history.db"))
+    db_path = _resolve_dashboard_database_path(latest_startup_config)
     storage = BotStorage(db_path)
     latest_run = storage.get_latest_run()
     latest_snapshot, has_latest_snapshot = _build_snapshot(storage)

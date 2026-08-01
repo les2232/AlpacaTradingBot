@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 
@@ -9,8 +8,8 @@ from storage import BotStorage
 from trading_bot import AlpacaTradingBot, StaleMarketDataError
 
 
-def test_storage_claim_decision_timestamp_is_global_and_single_use() -> None:
-    db_path = Path.cwd() / f"test_decision_claim_{uuid4().hex}.db"
+def test_storage_claim_decision_timestamp_is_global_and_single_use(tmp_path: Path) -> None:
+    db_path = tmp_path / "decision_claim.db"
     storage = BotStorage(db_path)
 
     first_claim = storage.claim_decision_timestamp(
@@ -26,8 +25,8 @@ def test_storage_claim_decision_timestamp_is_global_and_single_use() -> None:
     assert second_claim is False
 
 
-def test_storage_claim_order_fill_is_global_and_single_use() -> None:
-    db_path = Path.cwd() / f"test_order_fill_claim_{uuid4().hex}.db"
+def test_storage_claim_order_fill_is_global_and_single_use(tmp_path: Path) -> None:
+    db_path = tmp_path / "order_fill_claim.db"
     storage = BotStorage(db_path)
 
     first_claim = storage.claim_order_fill(

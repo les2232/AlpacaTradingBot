@@ -32,6 +32,7 @@ from storage import (
     DecisionCycleClaim,
     normalize_decision_cycle_id,
 )
+from tradeos.runtime_paths import TRADEOS_REPOSITORY_ROOT, resolve_database_path
 from tradeos.brokers import AlpacaBroker, BrokerBar, BrokerOrder, BrokerPosition
 from symbol_state import (
     format_symbol_list,
@@ -1211,7 +1212,7 @@ def _load_base_config() -> BotConfig:
 
 
 def load_config_details() -> RuntimeConfigDetails:
-    load_dotenv(Path.cwd() / ".env")
+    load_dotenv(TRADEOS_REPOSITORY_ROOT / ".env")
     base_config = _load_base_config()
     runtime_path, runtime, payload = _load_runtime_config_payload()
     config, changed_fields = _apply_runtime_config(base_config, runtime_path, runtime)
@@ -1245,13 +1246,13 @@ def load_config() -> BotConfig:
 
 class TradeOSBot:
     def __init__(self, config: BotConfig, session_id: str | None = None) -> None:
-        load_dotenv(Path.cwd() / ".env")
+        load_dotenv(TRADEOS_REPOSITORY_ROOT / ".env")
         self._session_started_at = datetime.now(timezone.utc)
 
+        database_path = resolve_database_path()
         self.config = config
         self.broker = self._build_broker()
-        db_path = Path(os.getenv("BOT_DB_PATH", "bot_history.db"))
-        self.storage = BotStorage(db_path)
+        self.storage = BotStorage(database_path)
         self.session_id = session_id or f"session-{int(datetime.now(timezone.utc).timestamp())}"
         self.blog = BotLogger(log_root="logs", session_id=self.session_id)
         self.active_symbols = normalize_symbols(config.symbols)
@@ -4484,7 +4485,7 @@ AlpacaTradingBot = TradeOSBot
 
 
 def main(config: BotConfig | None = None, session_id: str | None = None) -> None:
-    load_dotenv(Path.cwd() / ".env")
+    load_dotenv(TRADEOS_REPOSITORY_ROOT / ".env")
     if config is None:
         config = load_config()
     bot = TradeOSBot(config, session_id=session_id)

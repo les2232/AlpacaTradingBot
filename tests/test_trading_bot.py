@@ -97,8 +97,8 @@ def test_log_fills_records_current_session_fill_once() -> None:
     assert bot._position_entry_branch["AMD"] == "bollinger_breakout"
 
 
-def test_log_fills_skips_duplicate_sell_fill_after_restart() -> None:
-    db_path = Path.cwd() / f"test_botlog_{uuid4().hex}.db"
+def test_log_fills_skips_duplicate_sell_fill_after_restart(tmp_path: Path) -> None:
+    db_path = tmp_path / "botlog.db"
     storage = BotStorage(db_path)
     claimed = storage.claim_order_fill(
         "sell-order",

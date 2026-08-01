@@ -34,7 +34,11 @@ Use exactly one execution process and one monitoring process.
 .\start_dashboard.ps1
 ```
 
-This is the preferred launcher. By default it starts `tradeos live`, then starts or reuses the dashboard, and opens the browser when the dashboard is ready. It also keeps the live approval gate on by default.
+This is the preferred launcher. By default it starts or safely reuses `tradeos
+live`, then starts the dashboard and opens the browser when the dashboard is
+ready. It refuses an already-occupied dashboard port because the existing
+process's workspace and database authority cannot be verified. It also keeps
+the live approval gate on by default.
 
 If you are deliberately testing an unapproved research config, use the explicit override:
 
@@ -99,10 +103,26 @@ execution: a process can fail after the broker accepts an order but before the
 local response or lifecycle update is recorded. Resolving that window requires
 separate broker reconciliation or broker-supported idempotency work.
 
-`BOT_DB_PATH` defaults to the working-directory-relative `bot_history.db`.
-Operators using more than one launcher or working directory must configure the
-same absolute `BOT_DB_PATH` for every automatic process; otherwise each database
-is a separate authority.
+`BOT_DB_PATH` defaults to the absolute, normalized `bot_history.db` at the
+TradeOS repository root. Relative values are also anchored to that repository
+root, regardless of the launcher's working directory. Relative paths that
+escape the repository through `..` and blank values fail closed; use an
+explicitly absolute path when an external database authority is intentional.
+The live and preview CLI report the resolved authority; a live launch persists
+that exact absolute path in startup metadata, and the dashboard displays the
+exact path it opened. The dashboard refuses to initialize storage when an
+explicit `BOT_DB_PATH` conflicts with the latest startup metadata.
+
+Path precedence is an inherited `BOT_DB_PATH`, then the `BOT_DB_PATH` key from
+the repository-root `.env`, then the repository-root default. The dashboard
+prefers the latest startup artifact, but the explicit process/repository value
+must match it. Dashboard code uses only `BOT_DB_PATH` from parsed repository
+dotenv values and does not export other dotenv values into the process
+environment; the normal inherited process environment remains unchanged.
+
+Dashboard startup-artifact discovery is also launcher-invariant:
+`BOT_LOG_ROOT` defaults to the repository `logs` directory, and relative values
+are repository-anchored with the same blank/escape safeguards.
 
 Forced EOD and kill-switch exits in an accepted cycle remain part of that
 cycle's lifecycle and make a later failure ambiguous. Separately, a rejected
