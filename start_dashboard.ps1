@@ -2,6 +2,7 @@ param(
     [int]$Port = 8501,
     [switch]$NoBrowser,
     [switch]$DashboardOnly,
+    [switch]$PaperShadow,
     [switch]$AllowUnapprovedRuntime,
     [string]$PythonExe = ""
 )
@@ -198,7 +199,7 @@ function Get-StartupLifecycleStatusForSession {
 }
 
 function Test-LiveRuntimeApproval {
-    $runtimePath = Join-Path $projectRoot "config\live_config.json"
+    $runtimePath = Join-Path $projectRoot "config\paper_shadow_config.json"
     if (-not (Test-Path $runtimePath)) {
         return
     }
@@ -485,12 +486,7 @@ function Start-LiveBot {
         }
     }
 
-    if (Test-PastSessionFlattenDeadline) {
-        Write-Host "Skipping live bot start because the session is past the 3:55 PM ET flatten deadline."
-        return
-    }
-
-    Write-Host "Starting live bot via 'python -m tradeos live'"
+    Write-Host "Starting paper shadow via 'python -m tradeos paper-shadow'"
     if ($AllowUnapprovedRuntime) {
         Write-Host "WARNING: allowing unapproved runtime config for this launch only."
     }
@@ -509,7 +505,7 @@ function Start-LiveBot {
         try {
             $process = Start-Process `
                 -FilePath $python `
-                -ArgumentList @("-m", "tradeos", "live") `
+                -ArgumentList @("-m", "tradeos", "paper-shadow") `
                 -WorkingDirectory $projectRoot `
                 -RedirectStandardOutput $stdoutPath `
                 -RedirectStandardError $stderrPath `
@@ -526,7 +522,7 @@ function Start-LiveBot {
             )
             $process = Start-Process `
                 -FilePath $python `
-                -ArgumentList @("-m", "tradeos", "live") `
+                -ArgumentList @("-m", "tradeos", "paper-shadow") `
                 -WorkingDirectory $projectRoot `
                 -PassThru `
                 -ErrorAction Stop
@@ -609,7 +605,14 @@ $python = Resolve-PythonExecutable -RequestedPython $PythonExe
 
 Assert-DashboardPortAvailable
 
-if (-not $DashboardOnly) {
+if ($PaperShadow -and $DashboardOnly) {
+    throw "Choose either -PaperShadow or -DashboardOnly, not both."
+}
+if ($PaperShadow -and $AllowUnapprovedRuntime) {
+    throw "Paper shadow does not permit an unapproved-runtime override."
+}
+
+if ($PaperShadow) {
     Start-LiveBot
 }
 
@@ -619,10 +622,10 @@ if (-not $NoBrowser) {
     Start-Process $dashboardUrl
 }
 
-if ($DashboardOnly) {
+if (-not $PaperShadow) {
     Write-Host "Dashboard ready at $dashboardUrl"
 } else {
-    Write-Host "TradeOS live session and dashboard ready."
+    Write-Host "TradeOS paper-shadow session and read-only dashboard ready."
     Write-Host "Dashboard: $dashboardUrl"
     if ($AllowUnapprovedRuntime) {
         Write-Host "Runtime approval override was enabled for this launch."

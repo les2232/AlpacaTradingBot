@@ -5990,6 +5990,69 @@ def _render_config_v2(state: DashboardState, snapshot) -> None:
             )
 
 
+def _broker_safety_panel_html(panel) -> str:
+    """Render a compact projection of redacted, persisted broker safety state."""
+
+    def count_text(value) -> str:
+        return "unknown" if value is None else str(value)
+
+    readiness = str(getattr(panel, "automation_readiness", "blocked") or "blocked").upper()
+    readiness_color = "#3FB950" if readiness == "READY" else "#F85149"
+    reasons = tuple(getattr(panel, "blocking_reasons", ()) or ())
+    reason_text = "<br>".join(_escape_html(reason) for reason in reasons) if reasons else "None"
+    reason_level = "err" if reasons else "info"
+    result = _escape_html(getattr(panel, "result", "BLOCKED_RECONCILIATION_FAILURE"))
+    metrics = "".join(
+        (
+            _detail_info_cell("Environment", _escape_html(getattr(panel, "environment", "unknown"))),
+            _detail_info_cell("Masked Account", _escape_html(getattr(panel, "account_id_masked", "unknown"))),
+            _detail_info_cell("Trading Lock", _escape_html(getattr(panel, "lock_status", "unknown"))),
+            _detail_info_cell("Reconciled At", _escape_html(getattr(panel, "reconciliation_time", "unknown"))),
+            _detail_info_cell("Managed Positions", count_text(getattr(panel, "managed_position_count", None))),
+            _detail_info_cell("Unmanaged Positions", count_text(getattr(panel, "unmanaged_position_count", None))),
+            _detail_info_cell("Managed Open Orders", count_text(getattr(panel, "managed_order_count", None))),
+            _detail_info_cell("Unmanaged Open Orders", count_text(getattr(panel, "unmanaged_order_count", None))),
+            _detail_info_cell("Local vs Broker", _escape_html(getattr(panel, "mismatch_status", "unknown"))),
+            _detail_info_cell(
+                "Automation Readiness",
+                f"<span style='color:{readiness_color}'>{_escape_html(readiness)}</span>",
+            ),
+        )
+    )
+    return (
+        "<section class='detail-history-card' aria-label='Broker safety'>"
+        "<div class='sec-head'>Broker Safety (read only)</div>"
+        f"<div class='subtle-copy' style='margin-bottom:0.85rem'>Persisted result: {result}. "
+        "This panel reads the redacted reconciliation artifact and lock status only.</div>"
+        f"<div class='detail-info-grid'>{metrics}</div>"
+        + _status_card_html(reason_level, "Exact Blocking Reasons", reason_text)
+        + "</section>"
+    )
+
+
+def _render_broker_safety_panel() -> None:
+    try:
+        from dashboard_state import load_broker_safety_panel_state
+
+        panel = load_broker_safety_panel_state()
+    except Exception:
+        panel = SimpleNamespace(
+            environment="unknown",
+            account_id_masked="unknown",
+            lock_status="unknown",
+            reconciliation_time="unknown",
+            managed_position_count=None,
+            unmanaged_position_count=None,
+            managed_order_count=None,
+            unmanaged_order_count=None,
+            mismatch_status="unknown",
+            automation_readiness="blocked",
+            blocking_reasons=("dashboard_safety_projection_failure",),
+            result="BLOCKED_RECONCILIATION_FAILURE",
+        )
+    st.markdown(_broker_safety_panel_html(panel), unsafe_allow_html=True)
+
+
 def main() -> None:
     _inject_css()
 
@@ -6038,6 +6101,8 @@ def main() -> None:
         except Exception as exc:
             render_startup_error(exc)
             return
+
+    _render_broker_safety_panel()
 
     status_cards: list[str] = []
     for message in state.session_warnings:

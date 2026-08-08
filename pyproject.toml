@@ -25,6 +25,8 @@ alpaca-bot = "alpaca_trading_bot.cli:main"
 
 [tool.setuptools]
 py-modules = [
+    "audit_dataset_spacing",
+    "automation_safety",
     "avatar",
     "backtest_runner",
     "botlog",
@@ -34,9 +36,35 @@ py-modules = [
     "daily_report",
     "dashboard",
     "dashboard_state",
+    "dataset_integrity",
     "dataset_snapshotter",
+    "drift_monitor",
+    "inspect_dataset_and_run",
+    "investigate_missing_bars",
+    "local_state_repair",
+    "rebuild_research_dataset_sip",
+    "rebuild_research_dataset_sip_clean",
     "run_backtest_experiments",
+    "run_canonical_cross_sectional_rank_audit",
+    "run_canonical_rank_pullback_validation",
+    "run_cross_sectional_edge_audit",
+    "run_edge_audit",
+    "run_edge_diagnostics",
+    "run_feed_comparison_validation",
+    "run_hybrid_bb_mr_research",
+    "run_live_mismatch_report",
+    "run_long_horizon_validation",
+    "run_mean_reversion_exit_comparison",
+    "run_momentum_breakout_validation",
     "run_research",
+    "run_trade_path_diagnostics",
+    "run_trend_pullback_clean_dataset_comparison",
+    "run_trend_pullback_exit_capture_clean",
+    "run_trend_pullback_exit_comparison",
+    "run_trend_pullback_oos_validation",
+    "run_trend_pullback_robustness",
+    "run_trend_pullback_robustness_clean",
+    "run_volatility_expansion_validation",
     "storage",
     "strategy",
     "symbol_state",
@@ -51,4 +79,4 @@ py-modules = [
 include = ["alpaca_trading_bot", "tradeos", "tradeos.*", "ml", "research", "research.*"]
 
 [tool.setuptools.package-data]
-ml = ["models/*.pkl"]
+ml = ["models/*.pkl", "models/*.sha256"]

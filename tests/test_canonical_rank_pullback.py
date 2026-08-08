@@ -15,6 +15,7 @@ from research.canonical_rank_pullback import (
     select_best_variant,
     summarize_bucket_forward_returns,
     summarize_spread,
+    summarize_strategy_run,
 )
 
 
@@ -39,6 +40,35 @@ def _sample_panel() -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows)
+
+
+def _single_trade_ranked_panel(*, exit_open: float = 100.0) -> pd.DataFrame:
+    timestamps = pd.date_range("2026-01-05T15:30:00Z", periods=3, freq="15min", tz="UTC")
+    opens = [100.0, 100.0, exit_open]
+    return pd.DataFrame(
+        [
+            {
+                "symbol": "AAA",
+                "timestamp": timestamp,
+                "open": opens[idx],
+                "high": opens[idx] + 0.5,
+                "low": opens[idx] - 0.5,
+                "close": opens[idx],
+                "bar_index": idx,
+                "eligible_long": idx == 0,
+                "in_uptrend": True,
+                "next_open": opens[idx + 1] if idx + 1 < len(opens) else pd.NA,
+                "next_timestamp": timestamps[idx + 1] if idx + 1 < len(timestamps) else pd.NaT,
+                "prev_pullback_distance_atr": 0.6,
+                "pullback_distance_atr": 0.6,
+                "prev_high": 99.0,
+                "score_return": 1.0,
+                "cross_section_rank": 1,
+                "cross_section_size": 1,
+            }
+            for idx, timestamp in enumerate(timestamps)
+        ]
+    )
 
 
 def test_prepare_panel_features_adds_core_columns() -> None:
@@ -346,6 +376,64 @@ def test_run_strategy_backtest_applies_early_no_follow_through_exit() -> None:
     assert pd.Timestamp(trade["exit_ts"]) == timestamps[5]
     assert int(trade["hold_bars"]) == 4
     assert bool(trade["use_early_no_follow_through_exit"]) is True
+
+
+def test_run_strategy_backtest_nets_both_commissions_once() -> None:
+    variant = StrategyVariant(
+        family="ranking_only",
+        score_mode="return_20",
+        rank_lookback_bars=20,
+        eligible_percent=0.2,
+        hold_bars=1,
+    )
+
+    trades_df, equity_df, _ = run_strategy_backtest(
+        _single_trade_ranked_panel(),
+        variant=variant,
+        max_positions=1,
+        position_size=1000.0,
+        commission_per_order=1.25,
+        slippage_per_share=0.0,
+    )
+
+    assert len(trades_df) == 1
+    assert float(trades_df.iloc[0]["realized_pnl"]) == pytest.approx(-2.5)
+    assert float(trades_df.iloc[0]["return_pct"]) == pytest.approx(-0.25)
+    assert float(equity_df.iloc[0]["equity"]) == pytest.approx(1000.0)
+    assert float(equity_df.iloc[-1]["equity"]) == pytest.approx(997.5)
+    assert float(equity_df.iloc[-1]["equity"] - equity_df.iloc[0]["equity"]) == pytest.approx(
+        float(trades_df.iloc[0]["realized_pnl"])
+    )
+
+    summary = summarize_strategy_run(trades_df, equity_df, variant=variant)
+    assert float(summary["expectancy"]) == pytest.approx(-2.5)
+    assert float(summary["total_pnl"]) == pytest.approx(-2.5)
+    assert float(summary["max_drawdown_pct"]) == pytest.approx(0.25)
+
+
+def test_summarize_strategy_run_counts_first_trade_loss_in_drawdown() -> None:
+    variant = StrategyVariant(
+        family="ranking_only",
+        score_mode="return_20",
+        rank_lookback_bars=20,
+        eligible_percent=0.2,
+        hold_bars=1,
+    )
+    trades_df = pd.DataFrame(
+        [
+            {
+                "symbol": "AAA",
+                "exit_ts": pd.Timestamp("2026-01-05T16:00:00Z"),
+                "hold_bars": 1,
+                "realized_pnl": -100.0,
+                "return_pct": -10.0,
+            }
+        ]
+    )
+
+    summary = summarize_strategy_run(trades_df, pd.DataFrame(), variant=variant)
+
+    assert float(summary["max_drawdown_pct"]) == pytest.approx(2.0)
 
 
 def test_select_best_variant_prefers_positive_expectancy_with_trade_count() -> None:

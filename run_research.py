@@ -36,6 +36,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
+from dataset_integrity import load_verified_manifest
 from daily_report import DEFAULT_BACKTEST, WARN
 from research.experiment_log import log_experiment_run
 import strategy_report
@@ -560,13 +561,8 @@ def step_save_best_config(
 
 
 def _load_dataset_manifest_and_bars(dataset_path: Path) -> tuple[dict, pd.DataFrame]:
-    manifest_path = dataset_path / "manifest.json"
     bars_path = dataset_path / "bars.parquet"
-    manifest: dict = {}
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not bars_path.exists():
-        raise RuntimeError(f"Dataset bars file not found: {bars_path}")
+    manifest = load_verified_manifest(dataset_path)
     df = pd.read_parquet(bars_path, columns=["symbol"])
     return manifest, df
 
@@ -775,6 +771,7 @@ def step_detect_regime(dataset_path: Path) -> dict:
     if not bars_path.exists():
         raise RuntimeError(f"Cannot detect regime — bars file not found: {bars_path}")
 
+    load_verified_manifest(dataset_path)
     df = pd.read_parquet(bars_path)
     required = {"symbol", "timestamp", "close"}
     missing  = required - set(df.columns)

@@ -24,6 +24,18 @@ import logging.handlers
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+_TRADING_TIMEZONE = ZoneInfo("America/New_York")
+_LOGGER_FILES = {
+    "_signals": ("bot.signals", "signals.jsonl"),
+    "_exec": ("bot.exec", "execution.jsonl"),
+    "_pos": ("bot.positions", "positions.jsonl"),
+    "_risk": ("bot.risk", "risk.jsonl"),
+    "_bars": ("bot.bars", "bars.jsonl"),
+    "_lifecycle": ("bot.lifecycle", "lifecycle.jsonl"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +44,12 @@ from pathlib import Path
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _trading_date() -> str:
+    """Return the Eastern trading date used for runtime log partitioning."""
+
+    return datetime.now(_TRADING_TIMEZONE).date().isoformat()
 
 
 def _trace_id(symbol: str, decision_ts: str) -> str:
@@ -80,21 +98,33 @@ class BotLogger:
 
     def __init__(self, log_root: str | Path = "logs", session_id: str | None = None) -> None:
         self.log_root = Path(log_root)
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        day_dir = self.log_root / date_str
-
-        self._signals  = _make_file_logger("bot.signals",  day_dir / "signals.jsonl")
-        self._exec     = _make_file_logger("bot.exec",     day_dir / "execution.jsonl")
-        self._pos      = _make_file_logger("bot.positions",day_dir / "positions.jsonl")
-        self._risk     = _make_file_logger("bot.risk",     day_dir / "risk.jsonl")
-        self._bars     = _make_file_logger("bot.bars",     day_dir / "bars.jsonl")
-        self._lifecycle = _make_file_logger("bot.lifecycle", day_dir / "lifecycle.jsonl")
+        self._date_str = ""
+        self._configure_day(_trading_date())
         self._session_id = session_id
 
         # Track signal bar prices for slippage calculation at fill time
         self._signal_bar_prices: dict[str, float] = {}
 
+    def _configure_day(self, date_str: str) -> None:
+        day_dir = self.log_root / date_str
+        for attribute, (logger_name, filename) in _LOGGER_FILES.items():
+            setattr(self, attribute, _make_file_logger(logger_name, day_dir / filename))
+        self._date_str = date_str
+
     def _emit(self, logger: logging.Logger, event: str, **fields) -> None:
+        logger_attribute = next(
+            (
+                attribute
+                for attribute in _LOGGER_FILES
+                if getattr(self, attribute, None) is logger
+            ),
+            None,
+        )
+        current_date = _trading_date()
+        if current_date != self._date_str:
+            self._configure_day(current_date)
+            if logger_attribute is not None:
+                logger = getattr(self, logger_attribute)
         if self._session_id and "session_id" not in fields:
             fields["session_id"] = self._session_id
         fields["event"] = event

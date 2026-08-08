@@ -122,8 +122,8 @@ def load_dataset_context(dataset_path: str | Path | None) -> dict[str, Any]:
     feed = manifest.get("feed")
     if feed:
         context["dataset_feed"] = str(feed)
-    start = manifest.get("start")
-    end = manifest.get("end")
+    start = manifest.get("start_utc", manifest.get("start"))
+    end = manifest.get("end_utc", manifest.get("end"))
     if start:
         context["dataset_start"] = str(start)
     if end:

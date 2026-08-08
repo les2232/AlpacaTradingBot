@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from backtest_runner import load_dataset
+from dataset_snapshotter import write_dataset
 from rebuild_research_dataset_sip import (
     build_snapshotter_command,
     extract_rebuild_parameters,
@@ -111,11 +111,14 @@ def main() -> None:
     )
     shared_df, shared_manifest = load_dataset(shared_sip_dataset)
     clean_df = filter_regular_session(shared_df)
-    clean_dir = build_clean_dataset_dir(shared_sip_dataset, output_root)
-    clean_dir.mkdir(parents=True, exist_ok=True)
-    clean_df.to_parquet(clean_dir / "bars.parquet", index=False)
     clean_manifest = build_clean_manifest(shared_manifest if isinstance(shared_manifest, dict) else {}, clean_df, shared_sip_dataset)
-    (clean_dir / "manifest.json").write_text(json.dumps(clean_manifest, indent=2), encoding="utf-8")
+    parquet_path, _ = write_dataset(
+        clean_df,
+        clean_manifest,
+        output_root,
+        str(clean_manifest["dataset_id"]),
+    )
+    clean_dir = parquet_path.parent
     print(f"shared_sip_dataset={shared_sip_dataset}")
     print(f"clean_sip_dataset={clean_dir}")
     print(f"rows={len(clean_df)}")

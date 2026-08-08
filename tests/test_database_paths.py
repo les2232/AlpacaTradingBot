@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,46 @@ from tradeos.runtime_paths import (
     _resolve_database_path_from_root,
     resolve_database_path,
     resolve_explicit_database_path,
+    resolve_log_root,
 )
+
+
+def test_dashboard_storage_is_sqlite_query_only_and_does_not_change_database(
+    tmp_path: Path,
+) -> None:
+    database_path = (tmp_path / "dashboard-read-only.db").resolve()
+    BotStorage(database_path)
+    before_bytes = database_path.read_bytes()
+    before_tables = sqlite3.connect(database_path).execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+
+    storage = BotStorage(database_path, read_only=True)
+    assert storage.get_latest_run() is None
+    with pytest.raises(sqlite3.OperationalError, match="write"):
+        storage.bind_runtime_state_scope(
+            environment="paper",
+            account_fingerprint="f" * 64,
+            provenance="must-not-write",
+            history_cutoff_utc="2026-08-06T00:00:00+00:00",
+            bound_at_utc="2026-08-06T00:00:00+00:00",
+        )
+
+    after_tables = sqlite3.connect(database_path).execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+    assert database_path.read_bytes() == before_bytes
+    assert after_tables == before_tables
+
+
+def test_dashboard_launcher_defaults_to_dashboard_only_and_never_invokes_live() -> None:
+    launcher = (TRADEOS_REPOSITORY_ROOT / "start_dashboard.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'if ($PaperShadow) {' in launcher
+    assert '-ArgumentList @("-m", "tradeos", "paper-shadow")' in launcher
+    assert '-ArgumentList @("-m", "tradeos", "live")' not in launcher
 
 
 def test_default_database_path_is_launcher_invariant(
@@ -39,6 +79,38 @@ def test_default_database_path_is_launcher_invariant(
     assert from_repository == expected
     assert from_unrelated_directory == expected
     assert from_repository.is_absolute()
+
+
+def test_runtime_config_and_log_root_are_launcher_invariant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("BOT_RUNTIME_CONFIG_PATH", raising=False)
+    monkeypatch.delenv(runtime_paths.LOG_ROOT_ENV, raising=False)
+
+    monkeypatch.chdir(tmp_path)
+    runtime_path, _, _ = trading_bot._load_runtime_config_payload()
+
+    assert runtime_path == (
+        TRADEOS_REPOSITORY_ROOT / "config" / "live_config.json"
+    ).resolve()
+    assert resolve_log_root() == (TRADEOS_REPOSITORY_ROOT / "logs").resolve()
+
+
+def test_relative_runtime_config_path_is_repository_anchored(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BOT_RUNTIME_CONFIG_PATH", "config/live_config.json")
+
+    runtime_path, runtime, payload = trading_bot._load_runtime_config_payload()
+
+    assert runtime_path == (
+        TRADEOS_REPOSITORY_ROOT / "config" / "live_config.json"
+    ).resolve()
+    assert isinstance(runtime, dict)
+    assert isinstance(payload, dict)
 
 
 def test_relative_database_path_is_repository_anchored_from_every_cwd(
@@ -306,7 +378,8 @@ def test_powershell_launcher_delegates_database_authority_to_tradeos() -> None:
         encoding="utf-8"
     )
 
-    assert '@("-m", "tradeos", "live")' in launcher_text
+    assert '@("-m", "tradeos", "paper-shadow")' in launcher_text
+    assert '@("-m", "tradeos", "live")' not in launcher_text
     assert '@("-m", "tradeos", "dashboard", "--port", "$Port")' in launcher_text
     assert launcher_text.count("-WorkingDirectory $projectRoot") >= 3
     assert DATABASE_PATH_ENV not in launcher_text
@@ -318,6 +391,7 @@ def test_powershell_launcher_delegates_database_authority_to_tradeos() -> None:
         "$python = Resolve-PythonExecutable -RequestedPython $PythonExe",
         maxsplit=1,
     )[1]
+    assert 'if ($PaperShadow) {' in startup_sequence
     assert startup_sequence.index("Assert-DashboardPortAvailable") < startup_sequence.index(
         "Start-LiveBot"
     )

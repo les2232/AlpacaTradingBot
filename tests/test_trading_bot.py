@@ -11,6 +11,32 @@ import trading_bot
 from storage import BotStorage
 
 
+def test_bot_constructor_refuses_nonpaper_before_broker_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker_initializations: list[bool] = []
+    config = trading_bot.BotConfig(
+        symbols=["AMD"],
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        sma_bars=20,
+        bar_timeframe_minutes=15,
+        paper=False,
+    )
+    monkeypatch.setattr(
+        trading_bot.TradeOSBot,
+        "_build_broker",
+        lambda self: broker_initializations.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="paper-only"):
+        trading_bot.TradeOSBot(config)
+
+    assert broker_initializations == []
+
+
 def test_log_fills_skips_orders_filled_before_current_session() -> None:
     bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
     bot._session_started_at = datetime(2026, 4, 13, 18, 0, tzinfo=timezone.utc)
@@ -238,7 +264,9 @@ def test_recent_symbol_order_ignores_canceled_order() -> None:
     assert bot._has_recent_symbol_order("COP", "sell", window_seconds=120) is False
 
 
-def test_update_position_holding_state_restores_open_position_from_logs() -> None:
+def test_update_position_holding_state_ignores_unbound_logs_and_uses_broker_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
     bot._position_entry_price = {}
     bot._position_entry_ts = {}
@@ -248,36 +276,31 @@ def test_update_position_holding_state_restores_open_position_from_logs() -> Non
     bot._breakout_stored_stop = {}
     bot.blog = SimpleNamespace(log_root="logs")
 
-    original_loader = trading_bot._load_open_position_state_from_logs
-    trading_bot._load_open_position_state_from_logs = lambda log_root: {
-        "BAC": {
-            "entry_price": 53.81,
-            "qty": 18.0,
-            "decision_ts": "2026-04-16T16:30:00+00:00",
-            "entry_branch": "mean_reversion",
-        }
+    monkeypatch.setattr(
+        trading_bot,
+        "_load_open_position_state_from_logs",
+        lambda log_root: (_ for _ in ()).throw(
+            AssertionError("unbound JSONL state must not be loaded")
+        ),
+    )
+    positions = {
+        "BAC": trading_bot.Position(
+            symbol="BAC",
+            qty=18.0,
+            market_value=975.0,
+            avg_entry_price=54.15,
+            current_price=54.15,
+        )
     }
-    try:
-        positions = {
-            "BAC": trading_bot.Position(
-                symbol="BAC",
-                qty=18.0,
-                market_value=975.0,
-                avg_entry_price=54.15,
-                current_price=54.15,
-            )
-        }
-        observed_at = datetime(2026, 4, 17, 13, 45, tzinfo=timezone.utc)
+    observed_at = datetime(2026, 4, 17, 13, 45, tzinfo=timezone.utc)
 
-        bot._update_position_holding_state(positions, observed_at)
-    finally:
-        trading_bot._load_open_position_state_from_logs = original_loader
+    bot._update_position_holding_state(positions, observed_at)
 
-    assert bot._position_entry_price["BAC"] == 53.81
+    assert bot._position_entry_price["BAC"] == 54.15
     assert bot._position_qty["BAC"] == 18.0
-    assert bot._position_entry_ts["BAC"] == "2026-04-16T16:30:00+00:00"
-    assert bot._position_entry_branch["BAC"] == "mean_reversion"
-    assert bot._position_first_seen_utc["BAC"] == datetime(2026, 4, 16, 16, 30, tzinfo=timezone.utc)
+    assert "BAC" not in bot._position_entry_ts
+    assert "BAC" not in bot._position_entry_branch
+    assert bot._position_first_seen_utc["BAC"] == observed_at
 
 
 def test_parse_iso_timestamp_handles_z_suffix() -> None:
@@ -386,13 +409,66 @@ def test_active_symbol_event_blackout_matches_window() -> None:
 
 
 def _build_resync_bot(*, latest_run: dict | None, latest_symbols: list[dict], order_history: list[dict], lifecycle_events: list[tuple[str, dict]]) -> trading_bot.AlpacaTradingBot:
+    environment = "paper"
+    fingerprint = "test-account-fingerprint"
+
+    def require_test_scope(
+        *,
+        environment: str,
+        account_fingerprint: str,
+    ) -> dict[str, str]:
+        assert environment == "paper"
+        assert account_fingerprint == fingerprint
+        return {
+            "environment": environment,
+            "account_fingerprint": account_fingerprint,
+        }
+
+    def get_latest_run(
+        *,
+        environment: str,
+        account_fingerprint: str,
+    ) -> dict | None:
+        require_test_scope(
+            environment=environment,
+            account_fingerprint=account_fingerprint,
+        )
+        return latest_run
+
+    def get_latest_symbols(
+        *,
+        environment: str,
+        account_fingerprint: str,
+    ) -> list[dict]:
+        require_test_scope(
+            environment=environment,
+            account_fingerprint=account_fingerprint,
+        )
+        return latest_symbols
+
+    def get_order_history(
+        limit: int = 200,
+        *,
+        environment: str,
+        account_fingerprint: str,
+    ) -> list[dict]:
+        assert limit == 200
+        require_test_scope(
+            environment=environment,
+            account_fingerprint=account_fingerprint,
+        )
+        return order_history
+
     bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
     bot.config = SimpleNamespace(block_trading_until_resync=True)
     bot.session_id = "session-test"
+    bot._runtime_environment = environment
+    bot._runtime_account_fingerprint = fingerprint
     bot.storage = SimpleNamespace(
-        get_latest_run=lambda: latest_run,
-        get_latest_symbol_snapshot=lambda: latest_symbols,
-        get_order_history=lambda limit=200: order_history,
+        get_runtime_state_binding=require_test_scope,
+        get_latest_run=get_latest_run,
+        get_latest_symbol_snapshot=get_latest_symbols,
+        get_order_history=get_order_history,
     )
     bot.blog = SimpleNamespace(
         lifecycle=lambda stage, **fields: lifecycle_events.append((stage, fields)),
@@ -513,16 +589,34 @@ def test_perform_startup_resync_marks_broker_query_failure_as_failed() -> None:
     assert result.gate_allows_entries is False
 
 
-def test_perform_startup_preflight_logs_ready() -> None:
+def test_perform_startup_preflight_logs_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     lifecycle_events: list[tuple[str, dict]] = []
     bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
     bot.blog = SimpleNamespace(lifecycle=lambda stage, **fields: lifecycle_events.append((stage, fields)))
+    bot.storage = SimpleNamespace(
+        get_runtime_state_binding=lambda *, environment, account_fingerprint: {
+            "environment": environment,
+            "account_fingerprint": account_fingerprint,
+        },
+        get_latest_run=lambda *, environment, account_fingerprint: None,
+    )
     bot.get_account = lambda: SimpleNamespace(cash=1000.0, buying_power=1500.0, equity=1100.0)
     bot.get_positions_by_symbol = lambda: {
         "AMD": SimpleNamespace(symbol="AMD", qty=1.0, market_value=100.0, avg_entry_price=100.0, current_price=100.0)
     }
     bot._is_market_open = lambda: True
     bot.get_price_feed_status = lambda: "live stream active"
+    bot.safety_reconciler = object()
+    bot.reconcile_broker_safety = lambda: SimpleNamespace(
+        ready=True,
+        result="SAFE_FOR_PAPER_AUTOMATION",
+        blocking_reasons=(),
+        environment="paper",
+        account_fingerprint="test-account-fingerprint",
+    )
+    monkeypatch.setattr(
+        "tradeos.execution_lock.current_process_holds_lock", lambda: True
+    )
 
     summary = bot.perform_startup_preflight(execute_orders=True)
 
@@ -551,11 +645,30 @@ def test_perform_startup_preflight_logs_ready() -> None:
     ]
 
 
+def test_order_capable_preflight_blocks_before_broker_reads_without_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
+    bot.safety_reconciler = object()
+    bot.reconcile_broker_safety = lambda: (_ for _ in ()).throw(
+        AssertionError("reconciliation must not run without instance authority")
+    )
+    bot.get_account = lambda: (_ for _ in ()).throw(
+        AssertionError("broker must not be read by order-capable preflight without the lock")
+    )
+    monkeypatch.setattr(
+        "tradeos.execution_lock.current_process_holds_lock", lambda: False
+    )
+
+    with pytest.raises(RuntimeError, match="execution lock is not held"):
+        bot.perform_startup_preflight(execute_orders=True)
+
+
 def test_main_logs_startup_failed_when_preflight_raises(monkeypatch) -> None:
     lifecycle_events: list[tuple[str, dict]] = []
     fake_bot = SimpleNamespace(
         perform_startup_resync=lambda: None,
-        perform_startup_preflight=lambda *, execute_orders: (_ for _ in ()).throw(RuntimeError("broker unavailable")),
+        perform_startup_preflight=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("broker unavailable")),
         blog=SimpleNamespace(lifecycle=lambda stage, **fields: lifecycle_events.append((stage, fields))),
         build_snapshot=lambda evaluate_signals=False: SimpleNamespace(),
         record_state=lambda snapshot: None,
@@ -565,7 +678,7 @@ def test_main_logs_startup_failed_when_preflight_raises(monkeypatch) -> None:
     monkeypatch.setattr(
         trading_bot,
         "TradeOSBot",
-        lambda config, session_id=None: fake_bot,
+        lambda config, session_id=None, **kwargs: fake_bot,
     )
 
     with pytest.raises(RuntimeError, match="broker unavailable"):
@@ -580,6 +693,7 @@ def test_main_logs_startup_failed_when_preflight_raises(monkeypatch) -> None:
                 bar_timeframe_minutes=15,
             ),
             session_id="test-session",
+            execute_orders=True,
         )
 
     assert lifecycle_events == [
@@ -602,7 +716,7 @@ def test_main_started_after_flatten_deadline_flattens_before_shutdown(
     lifecycle_events: list[tuple[str, dict]] = []
     fake_bot = SimpleNamespace(
         perform_startup_resync=lambda: None,
-        perform_startup_preflight=lambda *, execute_orders: None,
+        perform_startup_preflight=lambda **kwargs: None,
         blog=SimpleNamespace(
             lifecycle=lambda stage, **fields: lifecycle_events.append(
                 (stage, fields)
@@ -636,7 +750,7 @@ def test_main_started_after_flatten_deadline_flattens_before_shutdown(
     monkeypatch.setattr(
         trading_bot,
         "TradeOSBot",
-        lambda config, session_id=None: fake_bot,
+        lambda config, session_id=None, **kwargs: fake_bot,
     )
     monkeypatch.setattr(trading_bot.threading, "Thread", ImmediateThread)
     monkeypatch.setenv("EXECUTE_ORDERS", "true")
@@ -971,7 +1085,9 @@ def test_apply_runtime_config_accepts_live_safety_controls() -> None:
     assert "max_live_price_age_seconds" in changed
 
 
-def test_update_position_holding_state_restores_recovered_short_position() -> None:
+def test_update_position_holding_state_ignores_unbound_short_log_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
     bot._position_entry_price = {}
     bot._position_entry_ts = {}
@@ -981,37 +1097,33 @@ def test_update_position_holding_state_restores_recovered_short_position() -> No
     bot._breakout_stored_stop = {}
     bot.blog = SimpleNamespace(log_root="logs")
 
-    original_loader = trading_bot._load_open_position_state_from_logs
-    trading_bot._load_open_position_state_from_logs = lambda log_root: {
-        "COP": {
-            "entry_price": 119.13,
-            "qty": -8.0,
-            "decision_ts": "2026-04-22T14:15:00+00:00",
-            "entry_branch": None,
-        }
+    monkeypatch.setattr(
+        trading_bot,
+        "_load_open_position_state_from_logs",
+        lambda log_root: (_ for _ in ()).throw(
+            AssertionError("unbound JSONL state must not be loaded")
+        ),
+    )
+    positions = {
+        "COP": trading_bot.Position(
+            symbol="COP",
+            qty=-8.0,
+            market_value=-980.4,
+            avg_entry_price=119.13,
+            current_price=122.55,
+        )
     }
-    try:
-        positions = {
-            "COP": trading_bot.Position(
-                symbol="COP",
-                qty=-8.0,
-                market_value=-980.4,
-                avg_entry_price=119.13,
-                current_price=122.55,
-            )
-        }
-        observed_at = datetime(2026, 4, 22, 16, 7, tzinfo=timezone.utc)
+    observed_at = datetime(2026, 4, 22, 16, 7, tzinfo=timezone.utc)
 
-        bot._update_position_holding_state(positions, observed_at)
-    finally:
-        trading_bot._load_open_position_state_from_logs = original_loader
+    bot._update_position_holding_state(positions, observed_at)
 
     assert bot._position_entry_price["COP"] == 119.13
     assert bot._position_qty["COP"] == -8.0
-    assert bot._position_entry_ts["COP"] == "2026-04-22T14:15:00+00:00"
+    assert "COP" not in bot._position_entry_ts
+    assert bot._position_first_seen_utc["COP"] == observed_at
 
 
-def test_log_fills_treats_buy_against_recovered_short_as_cover_not_new_long() -> None:
+def test_log_fills_closes_recovered_short_with_directional_realized_pnl() -> None:
     bot = trading_bot.AlpacaTradingBot.__new__(trading_bot.AlpacaTradingBot)
     bot._session_started_at = datetime(2026, 4, 22, 16, 0, tzinfo=timezone.utc)
     bot._logged_fills = set()
@@ -1050,7 +1162,15 @@ def test_log_fills_treats_buy_against_recovered_short_as_cover_not_new_long() ->
 
     bot._log_fills_from_orders([cover_order])
 
-    assert [event for event, _ in recorded] == ["filled"]
+    assert [event for event, _ in recorded] == ["filled", "closed"]
+    close = recorded[-1][1]
+    assert close["entry_price"] == 119.13
+    assert close["exit_price"] == 122.7
+    assert close["qty"] == -8.0
+    assert close["exit_reason"] == "eod_flatten"
+    assert (close["exit_price"] - close["entry_price"]) * close["qty"] == pytest.approx(
+        -28.56
+    )
     assert "COP" not in bot._position_qty
     assert "COP" not in bot._position_entry_price
 

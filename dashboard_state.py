@@ -274,6 +274,25 @@ class DashboardState:
     drift_report: DriftReport | None = None
 
 
+@dataclass(frozen=True)
+class BrokerSafetyPanelState:
+    """Read-only, credential-free automation safety status for the dashboard."""
+
+    environment: str
+    account_id_masked: str
+    lock_status: str
+    reconciliation_time: str
+    managed_position_count: int | None
+    unmanaged_position_count: int | None
+    managed_order_count: int | None
+    unmanaged_order_count: int | None
+    mismatch_status: str
+    automation_readiness: str
+    blocking_reasons: tuple[str, ...]
+    result: str
+    stale: bool
+
+
 def _log_root() -> Path:
     return resolve_log_root()
 
@@ -605,6 +624,181 @@ def _parse_iso_utc(value: str | None) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _build_broker_safety_panel_state(
+    payload: dict[str, object] | None,
+    lock_status: object | None,
+    *,
+    now_utc: datetime | None = None,
+    max_age_seconds: float = 300.0,
+    artifact_failure_reason: str | None = None,
+) -> BrokerSafetyPanelState:
+    """Project persisted reconciliation and lock data into a fail-closed view."""
+
+    observed_lock_state = getattr(getattr(lock_status, "state", None), "value", None)
+    if observed_lock_state not in {"held", "unlocked", "unknown"}:
+        observed_lock_state = "unknown"
+    if observed_lock_state == "held":
+        if bool(getattr(lock_status, "held_by_current_process", False)):
+            lock_label = "held by this process"
+        elif bool(getattr(lock_status, "metadata_valid", False)):
+            lock_label = "held by another process"
+        else:
+            lock_label = "held (holder metadata unavailable)"
+    else:
+        lock_label = str(observed_lock_state)
+
+    lock_reasons = ["trading_lock_status_unknown"] if observed_lock_state == "unknown" else []
+
+    def blocked_unknown(reason: str) -> BrokerSafetyPanelState:
+        reasons = tuple(dict.fromkeys([reason, *lock_reasons]))
+        return BrokerSafetyPanelState(
+            environment="unknown",
+            account_id_masked="unknown",
+            lock_status=lock_label,
+            reconciliation_time="unknown",
+            managed_position_count=None,
+            unmanaged_position_count=None,
+            managed_order_count=None,
+            unmanaged_order_count=None,
+            mismatch_status="unknown",
+            automation_readiness="blocked",
+            blocking_reasons=reasons,
+            result="BLOCKED_RECONCILIATION_FAILURE",
+            stale=True,
+        )
+
+    if payload is None:
+        return blocked_unknown(
+            artifact_failure_reason or "reconciliation_artifact_missing_or_malformed"
+        )
+
+    required_text = (
+        "environment",
+        "account_id_masked",
+        "checked_at_utc",
+        "automation_readiness",
+        "result",
+    )
+    required_lists = (
+        "managed_positions",
+        "unmanaged_positions",
+        "managed_orders",
+        "unmanaged_orders",
+        "state_mismatches",
+        "blocking_reasons",
+    )
+    malformed = any(
+        not isinstance(payload.get(key), str) or not str(payload.get(key)).strip()
+        for key in required_text
+    ) or any(not isinstance(payload.get(key), list) for key in required_lists)
+    raw_reasons = payload.get("blocking_reasons")
+    raw_mismatches = payload.get("state_mismatches")
+    if isinstance(raw_reasons, list) and any(
+        not isinstance(item, str) or not item.strip() for item in raw_reasons
+    ):
+        malformed = True
+    if isinstance(raw_mismatches, list) and any(not isinstance(item, str) for item in raw_mismatches):
+        malformed = True
+    if malformed:
+        return blocked_unknown("reconciliation_artifact_malformed")
+
+    checked_at = _parse_iso_utc(str(payload["checked_at_utc"]))
+    if checked_at is None or checked_at.tzinfo is None:
+        return blocked_unknown("reconciliation_timestamp_missing_or_invalid")
+
+    current_time = now_utc or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    age_seconds = (current_time.astimezone(timezone.utc) - checked_at.astimezone(timezone.utc)).total_seconds()
+
+    environment = str(payload["environment"]).strip().lower()
+    account_id_masked = str(payload["account_id_masked"]).strip()
+    readiness = str(payload["automation_readiness"]).strip().lower()
+    result = str(payload["result"]).strip()
+    managed_positions = payload["managed_positions"]
+    unmanaged_positions = payload["unmanaged_positions"]
+    managed_orders = payload["managed_orders"]
+    unmanaged_orders = payload["unmanaged_orders"]
+    state_mismatches = payload["state_mismatches"]
+
+    reasons = [str(item).strip() for item in raw_reasons]
+    reasons.extend(lock_reasons)
+    stale = age_seconds > max_age_seconds
+    if age_seconds < -30.0:
+        stale = True
+        reasons.append("reconciliation_timestamp_in_future")
+    elif stale:
+        reasons.append("reconciliation_stale_over_5_minutes")
+    if environment != "paper":
+        reasons.append("environment_not_positively_paper")
+    if account_id_masked.lower() in {"", "unknown", "none", "n/a"}:
+        reasons.append("account_identity_unknown")
+    if unmanaged_positions:
+        reasons.append("unmanaged_positions_present")
+    if unmanaged_orders:
+        reasons.append("unmanaged_orders_present")
+    if state_mismatches:
+        reasons.append("broker_local_state_mismatch")
+    if readiness != "ready":
+        reasons.append("persisted_reconciliation_not_ready")
+    if result != "SAFE_FOR_PAPER_AUTOMATION":
+        reasons.append("persisted_result_not_safe_for_paper_automation")
+    if payload.get("reconciliation_succeeded") is not True:
+        reasons.append("reconciliation_not_successful")
+
+    unique_reasons = tuple(dict.fromkeys(reasons))
+    positively_ready = not unique_reasons
+    return BrokerSafetyPanelState(
+        environment=environment if environment in {"paper", "live"} else "unknown",
+        account_id_masked=account_id_masked,
+        lock_status=lock_label,
+        reconciliation_time=checked_at.astimezone(timezone.utc).isoformat(),
+        managed_position_count=len(managed_positions),
+        unmanaged_position_count=len(unmanaged_positions),
+        managed_order_count=len(managed_orders),
+        unmanaged_order_count=len(unmanaged_orders),
+        mismatch_status="clear" if not state_mismatches else f"mismatch ({len(state_mismatches)})",
+        automation_readiness="ready" if positively_ready else "blocked",
+        blocking_reasons=unique_reasons,
+        result=result if positively_ready else result or "BLOCKED_RECONCILIATION_FAILURE",
+        stale=stale,
+    )
+
+
+def load_broker_safety_panel_state(
+    reconciliation_path: Path | None = None,
+    *,
+    now_utc: datetime | None = None,
+    max_age_seconds: float = 300.0,
+) -> BrokerSafetyPanelState:
+    """Load only persisted/redacted safety state; never create a broker client."""
+
+    payload: dict[str, object] | None = None
+    artifact_failure_reason: str | None = None
+    try:
+        from automation_safety import DEFAULT_RECONCILIATION_PATH, load_redacted_reconciliation
+
+        artifact_path = reconciliation_path or DEFAULT_RECONCILIATION_PATH
+        payload = load_redacted_reconciliation(artifact_path)
+    except Exception:
+        artifact_failure_reason = "reconciliation_artifact_read_failure"
+
+    try:
+        from tradeos.execution_lock import inspect_lock
+
+        lock_status = inspect_lock()
+    except Exception:
+        lock_status = None
+
+    return _build_broker_safety_panel_state(
+        payload,
+        lock_status,
+        now_utc=now_utc,
+        max_age_seconds=max_age_seconds,
+        artifact_failure_reason=artifact_failure_reason,
+    )
 
 
 def _decision_timestamp_from_trace(trace: object) -> str | None:
@@ -1516,7 +1710,7 @@ def load_dashboard_state() -> DashboardState:
     startup_configs = _load_startup_configs()
     latest_startup_config = startup_configs[-1] if startup_configs else None
     db_path = _resolve_dashboard_database_path(latest_startup_config)
-    storage = BotStorage(db_path)
+    storage = BotStorage(db_path, read_only=True)
     latest_run = storage.get_latest_run()
     latest_snapshot, has_latest_snapshot = _build_snapshot(storage)
     startup_config = _select_startup_config_for_session(

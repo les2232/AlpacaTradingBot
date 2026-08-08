@@ -3,8 +3,11 @@ from .base import (
     BrokerAccount,
     BrokerBar,
     BrokerClient,
+    BrokerEnvironment,
+    BrokerFillActivity,
     BrokerOrder,
     BrokerPosition,
+    QuantityInput,
 )
 
 __all__ = [
@@ -12,6 +15,9 @@ __all__ = [
     "BrokerAccount",
     "BrokerBar",
     "BrokerClient",
+    "BrokerEnvironment",
+    "BrokerFillActivity",
     "BrokerOrder",
     "BrokerPosition",
+    "QuantityInput",
 ]

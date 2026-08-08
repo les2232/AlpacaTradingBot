@@ -761,6 +761,7 @@ def run_strategy_backtest(
     }
     open_positions: dict[str, dict[str, Any]] = {}
     pending_entries: dict[pd.Timestamp, list[dict[str, Any]]] = {}
+    starting_capital = max(float(position_size), 0.0) * max(int(max_positions), 0)
     realized_pnl = 0.0
     trades: list[dict[str, Any]] = []
     equity_rows: list[dict[str, Any]] = []
@@ -778,8 +779,9 @@ def run_strategy_backtest(
             row = current_rows.loc[symbol]
             position = open_positions.pop(symbol)
             exit_fill = max(float(row["open"]) - slippage_per_share, 0.0)
-            realized = (exit_fill - position["entry_fill"]) * position["shares"] - commission_per_order
-            realized_pnl += realized
+            exit_net_pnl = (exit_fill - position["entry_fill"]) * position["shares"] - commission_per_order
+            realized = exit_net_pnl - position["entry_commission"]
+            realized_pnl += exit_net_pnl
             trades.append(
                 {
                     "symbol": symbol,
@@ -839,6 +841,7 @@ def run_strategy_backtest(
                 open_positions[symbol] = {
                     "entry_ts": timestamp,
                     "entry_fill": entry_fill,
+                    "entry_commission": commission_per_order,
                     "shares": shares,
                     "entry_bar_index": entry_bar_index,
                     "exit_ts": exit_ts,
@@ -892,16 +895,24 @@ def run_strategy_backtest(
                 continue
             mark_price = float(current_rows.loc[symbol]["close"])
             unrealized += (mark_price - position["entry_fill"]) * position["shares"]
-        equity_rows.append({"timestamp": timestamp, "equity": realized_pnl + unrealized})
+        equity_rows.append(
+            {
+                "timestamp": timestamp,
+                "equity": starting_capital + realized_pnl + unrealized,
+            }
+        )
 
     trades_df = pd.DataFrame(trades)
     equity_df = pd.DataFrame(equity_rows)
     signals_df = pd.DataFrame(signal_rows)
     if not equity_df.empty:
-        running_max = equity_df["equity"].cummax()
+        running_max = equity_df["equity"].cummax().clip(lower=starting_capital)
         drawdown = equity_df["equity"] - running_max
         equity_df["drawdown"] = drawdown
-        equity_df["drawdown_pct"] = drawdown / running_max.replace(0.0, pd.NA) * 100.0
+        if starting_capital > 0.0:
+            equity_df["drawdown_pct"] = drawdown / running_max * 100.0
+        else:
+            equity_df["drawdown_pct"] = 0.0
     return trades_df, equity_df, signals_df
 
 
@@ -914,16 +925,17 @@ def summarize_strategy_run(
     metrics = _compute_trade_metrics(trades_df)
     max_drawdown_pct = 0.0
     if not equity_df.empty and "drawdown_pct" in equity_df.columns:
-        max_drawdown_pct = float(equity_df["drawdown_pct"].min() or 0.0)
+        minimum_drawdown_pct = equity_df["drawdown_pct"].min()
+        max_drawdown_pct = float(minimum_drawdown_pct) if pd.notna(minimum_drawdown_pct) else 0.0
     elif not trades_df.empty and "realized_pnl" in trades_df.columns:
         path = trades_df.copy()
         if "exit_ts" in path.columns:
             path = path.sort_values("exit_ts").reset_index(drop=True)
-        path["equity"] = path["realized_pnl"].cumsum()
-        running_max = path["equity"].cummax()
-        drawdown = path["equity"] - running_max
         capital_base = float(DEFAULT_POSITION_SIZE * max(1, DEFAULT_MAX_POSITIONS))
-        max_drawdown_pct = float((drawdown.min() / capital_base) * 100.0 if capital_base > 0 else 0.0)
+        path["equity"] = capital_base + path["realized_pnl"].cumsum()
+        running_max = path["equity"].cummax().clip(lower=capital_base)
+        drawdown = path["equity"] - running_max
+        max_drawdown_pct = float((drawdown / running_max).min() * 100.0)
     return {
         "variant_id": variant.variant_id,
         "family": variant.family,

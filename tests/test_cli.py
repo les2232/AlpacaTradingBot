@@ -25,6 +25,147 @@ def test_cli_parser_accepts_preview() -> None:
     assert args.command == "preview"
 
 
+def test_cli_parser_accepts_paper_shadow_and_unambiguous_repair_digests() -> None:
+    shadow = cli.build_parser().parse_args(["paper-shadow"])
+    repair = cli.build_parser().parse_args(
+        [
+            "repair-local-state",
+            "--symbol",
+            "COP",
+            "--apply",
+            "--repair-id",
+            "20260806T000000Z-123456789abc",
+            "--approved-db-raw-sha256",
+            "a" * 64,
+            "--approved-db-state-sha256",
+            "b" * 64,
+            "--approved-plan-sha256",
+            "c" * 64,
+            "--approved-evidence-sha256",
+            "d" * 64,
+        ]
+    )
+
+    assert shadow.command == "paper-shadow"
+    assert repair.approved_db_raw_sha256 == "a" * 64
+    assert repair.approved_db_state_sha256 == "b" * 64
+    assert repair.approved_plan_sha256 == "c" * 64
+
+
+def test_paper_shadow_uses_named_profile_writer_locks_and_explicit_deny(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from automation_safety import account_fingerprint
+
+    expected_account = "paper-account-test"
+    calls: dict[str, object] = {"locks": []}
+    config = SimpleNamespace(
+        paper=True,
+        broker_backend="alpaca",
+        strategy_mode="mean_reversion",
+        bar_timeframe_minutes=15,
+        symbols=["AMD"],
+        historical_feed="iex",
+        live_feed="iex",
+        latest_bar_feed="iex",
+        bar_build_mode="stream_minute_aggregate",
+    )
+    details = SimpleNamespace(
+        config=config,
+        runtime_config_path=str(cli.PAPER_SHADOW_CONFIG_PATH),
+        overridden_fields=("symbols",),
+        runtime_config_approved=True,
+        runtime_config_rejection_reasons=(),
+        baseline_valid_for_comparison=True,
+        baseline_validation_errors=(),
+        launch_profile="paper_shadow",
+        broker_environment="paper",
+        submission_policy="deny",
+        expected_account_fingerprint=account_fingerprint(expected_account),
+        dashboard_mode="read_only",
+    )
+
+    class TrackingLock:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __enter__(self):
+            calls["locks"].append(f"enter:{self.name}")  # type: ignore[union-attr]
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            calls["locks"].append(f"exit:{self.name}")  # type: ignore[union-attr]
+
+    def fake_main(**kwargs: object) -> None:
+        calls["main"] = kwargs
+        calls["runtime_path"] = cli.os.environ.get("BOT_RUNTIME_CONFIG_PATH")
+        calls["execute_env"] = cli.os.environ.get("EXECUTE_ORDERS")
+
+    fake_module = SimpleNamespace(
+        load_config_details=lambda: details,
+        main=fake_main,
+    )
+    artifact = tmp_path / "shadow-startup.json"
+    artifact.write_text("{}", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda value: value)
+    monkeypatch.setattr(cli, "ExecutionLock", lambda: TrackingLock("kernel"))
+    monkeypatch.setattr(cli, "_live_instance_lock", lambda: TrackingLock("legacy"))
+    monkeypatch.setattr(
+        cli,
+        "_persist_startup_config",
+        lambda *args, **kwargs: artifact,
+    )
+    monkeypatch.setenv("ALPACA_EXPECTED_ACCOUNT_ID", expected_account)
+    monkeypatch.setenv("ALPACA_PAPER", "true")
+    monkeypatch.setenv("BOT_RUNTIME_CONFIG_PATH", "ambient-wrong-config.json")
+
+    assert cli._run_live(preview=True, paper_shadow=True) == 0
+
+    assert calls["runtime_path"] == str(cli.PAPER_SHADOW_CONFIG_PATH)
+    assert calls["execute_env"] == "false"
+    assert calls["locks"] == [
+        "enter:kernel",
+        "enter:legacy",
+        "exit:legacy",
+        "exit:kernel",
+    ]
+    main_call = calls["main"]
+    assert isinstance(main_call, dict)
+    assert main_call["execute_orders"] is False
+    assert main_call["require_reconciliation_ready"] is True
+    assert main_call["durable_decision_cycles"] is True
+    assert cli.os.environ["BOT_RUNTIME_CONFIG_PATH"] == "ambient-wrong-config.json"
+
+
+def test_paper_shadow_account_binding_mismatch_fails_before_bot_main(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(paper=True, broker_backend="alpaca")
+    details = SimpleNamespace(
+        config=config,
+        runtime_config_path=str(cli.PAPER_SHADOW_CONFIG_PATH),
+        launch_profile="paper_shadow",
+        broker_environment="paper",
+        submission_policy="deny",
+        expected_account_fingerprint="0" * 64,
+        dashboard_mode="read_only",
+    )
+    called = False
+
+    def fake_main(**kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setenv("ALPACA_EXPECTED_ACCOUNT_ID", "different-account")
+    with pytest.raises(RuntimeError, match="binding does not match"):
+        cli._validate_paper_shadow_runtime(details)
+
+    assert called is False
+
+
 def test_cli_parser_rejects_retired_control_panel() -> None:
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["control-panel"])
@@ -162,7 +303,7 @@ def test_run_live_refuses_non_paper_execution(monkeypatch: pytest.MonkeyPatch) -
         cli._run_live(preview=False)
 
 
-def test_run_preview_allows_non_paper_but_disables_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_preview_refuses_non_paper_without_starting_bot(monkeypatch: pytest.MonkeyPatch) -> None:
     called: dict[str, bool] = {"main": False}
     config = SimpleNamespace(
         paper=False,
@@ -171,9 +312,18 @@ def test_run_preview_allows_non_paper_but_disables_execution(monkeypatch: pytest
         symbols=["AMD"],
     )
 
-    def fake_main(*, config=None, session_id=None) -> None:
+    def fake_main(
+        *,
+        config=None,
+        session_id=None,
+        execute_orders=None,
+        require_reconciliation_ready=None,
+        durable_decision_cycles=None,
+    ) -> None:
         called["main"] = True
         assert cli.os.environ["EXECUTE_ORDERS"] == "false"
+        assert execute_orders is False
+        assert require_reconciliation_ready is False
         assert config is not None
         assert session_id is not None
 
@@ -189,10 +339,10 @@ def test_run_preview_allows_non_paper_but_disables_execution(monkeypatch: pytest
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
 
-    exit_code = cli._run_live(preview=True)
+    with pytest.raises(RuntimeError, match="ALPACA_PAPER=false"):
+        cli._run_live(preview=True)
 
-    assert exit_code == 0
-    assert called["main"] is True
+    assert called["main"] is False
 
 
 def test_run_live_refuses_second_live_instance(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -273,7 +423,14 @@ def test_run_live_replaces_stale_lock_and_cleans_up(
         max_data_delay_seconds=300,
     )
 
-    def fake_main(*, config=None, session_id=None) -> None:
+    def fake_main(
+        *,
+        config=None,
+        session_id=None,
+        execute_orders=None,
+        require_reconciliation_ready=None,
+        durable_decision_cycles=None,
+    ) -> None:
         called["main"] = True
         assert lock_path.exists()
         assert config is not None
@@ -371,6 +528,21 @@ def test_run_live_reports_lock_acquired(monkeypatch: pytest.MonkeyPatch, capsys:
         _cleanup_tree(log_root)
 
 
+def test_live_instance_lock_never_suppresses_body_error_when_metadata_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "live.lock"
+    monkeypatch.setattr(cli, "LIVE_BOT_LOCK_PATH", lock_path)
+
+    with pytest.raises(RuntimeError, match="runtime failed"):
+        with cli._live_instance_lock():
+            lock_path.write_text('{"pid": 999999}', encoding="utf-8")
+            raise RuntimeError("runtime failed")
+
+    assert lock_path.exists()
+
+
 def test_run_live_loads_dotenv_before_resolving_config(monkeypatch: pytest.MonkeyPatch) -> None:
     called: list[str] = []
     config = SimpleNamespace(
@@ -456,7 +628,14 @@ def test_run_live_acquires_lock_before_loading_config(monkeypatch: pytest.Monkey
             runtime_config_rejection_reasons=(),
         )
 
-    def fake_main(*, config=None, session_id=None) -> None:
+    def fake_main(
+        *,
+        config=None,
+        session_id=None,
+        execute_orders=None,
+        require_reconciliation_ready=None,
+        durable_decision_cycles=None,
+    ) -> None:
         observed["lock_seen_during_main"] = lock_path.exists()
         assert config is not None
         assert session_id is not None
@@ -573,6 +752,20 @@ def test_run_live_refuses_unapproved_runtime_config(monkeypatch: pytest.MonkeyPa
         cli._run_live(preview=False)
 
 
+def test_live_runtime_requires_explicit_approval_when_config_file_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(cli.ALLOW_UNAPPROVED_RUNTIME_ENV, raising=False)
+    details = SimpleNamespace(
+        runtime_config_path="config/live_config.json",
+        runtime_config_approved=None,
+        runtime_config_rejection_reasons=(),
+    )
+
+    with pytest.raises(RuntimeError, match="not explicitly approved"):
+        cli._validate_runtime_config_approval(details, preview=False)
+
+
 def test_run_live_allows_unapproved_runtime_with_explicit_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -595,7 +788,14 @@ def test_run_live_allows_unapproved_runtime_with_explicit_override(
         max_data_delay_seconds=300,
     )
 
-    def fake_main(*, config=None, session_id=None) -> None:
+    def fake_main(
+        *,
+        config=None,
+        session_id=None,
+        execute_orders=None,
+        require_reconciliation_ready=None,
+        durable_decision_cycles=None,
+    ) -> None:
         called["main"] = True
         assert config is not None
         assert session_id is not None
@@ -687,7 +887,14 @@ def test_run_live_allows_baseline_mismatch_with_explicit_override(
         max_data_delay_seconds=300,
     )
 
-    def fake_main(*, config=None, session_id=None) -> None:
+    def fake_main(
+        *,
+        config=None,
+        session_id=None,
+        execute_orders=None,
+        require_reconciliation_ready=None,
+        durable_decision_cycles=None,
+    ) -> None:
         called["main"] = True
         assert config is not None
         assert session_id is not None
@@ -902,3 +1109,221 @@ def test_pid_is_running_uses_process_identity_on_windows(monkeypatch: pytest.Mon
 
     assert cli._pid_is_running(15592) is True
     assert cli._pid_is_running(0) is False
+def test_parser_exposes_read_only_reconcile_command():
+    from alpaca_trading_bot import cli
+
+    args = cli.build_parser().parse_args(["reconcile"])
+
+    assert args.command == "reconcile"
+
+
+def test_live_command_rejects_non_paper_config_before_main_or_bot_construction(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    import pytest
+
+    import trading_bot
+    from alpaca_trading_bot import cli
+
+    class NoopContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail("non-paper configuration reached an order-capable entrypoint")
+
+    config = SimpleNamespace(
+        paper=False,
+        base_url="https://api.alpaca.markets",
+    )
+    monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args: tmp_path / "bot.db")
+    monkeypatch.setattr(cli, "ExecutionLock", NoopContext)
+    monkeypatch.setattr(cli, "_live_instance_lock", NoopContext)
+    monkeypatch.setattr(
+        trading_bot,
+        "load_config_details",
+        lambda: SimpleNamespace(config=config),
+    )
+    monkeypatch.setattr(trading_bot, "main", unexpected_call)
+    monkeypatch.setattr(trading_bot, "TradeOSBot", unexpected_call)
+
+    with pytest.raises(RuntimeError, match="ALPACA_PAPER=false"):
+        cli.main(["live"])
+
+
+def test_reconcile_live_config_reports_block_without_constructing_bot(
+    monkeypatch, tmp_path, capsys
+):
+    from types import SimpleNamespace
+
+    import pytest
+
+    import automation_safety
+    import storage
+    import trading_bot
+    from alpaca_trading_bot import cli
+
+    report = SimpleNamespace(
+        ready=False,
+        final_code="BLOCKED_LIVE_CONFIGURATION",
+    )
+
+    class FakeStorage:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class FakeSafetyReconciler:
+        def __init__(self, *, broker, storage, configured_paper):
+            assert broker is None
+            assert isinstance(storage, FakeStorage)
+            assert configured_paper is False
+
+        def reconcile(self):
+            return report
+
+    def unexpected_bot(*args, **kwargs):
+        pytest.fail("live reconciliation constructed TradeOSBot")
+
+    config = SimpleNamespace(
+        paper=False,
+        base_url="https://api.alpaca.markets",
+    )
+    monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda: tmp_path / "bot.db")
+    monkeypatch.setattr(
+        trading_bot,
+        "load_config_details",
+        lambda: SimpleNamespace(config=config),
+    )
+    monkeypatch.setattr(trading_bot, "TradeOSBot", unexpected_bot)
+    monkeypatch.setattr(storage, "BotStorage", FakeStorage)
+    monkeypatch.setattr(automation_safety, "SafetyReconciler", FakeSafetyReconciler)
+    monkeypatch.setattr(
+        automation_safety,
+        "format_reconciliation",
+        lambda value: value.final_code,
+    )
+
+    assert cli.main(["reconcile"]) == 2
+    assert capsys.readouterr().out.strip() == "BLOCKED_LIVE_CONFIGURATION"
+
+
+def test_paper_reconcile_prints_safe_final_code_from_bot_report(
+    monkeypatch, tmp_path, capsys
+):
+    from types import SimpleNamespace
+
+    import automation_safety
+    import trading_bot
+    from alpaca_trading_bot import cli
+
+    report = SimpleNamespace(
+        ready=True,
+        final_code="SAFE_FOR_PAPER_AUTOMATION",
+    )
+    constructed = []
+
+    class FakeTradeOSBot:
+        def __init__(self, *args, **kwargs):
+            constructed.append((args, kwargs))
+
+        def reconcile_broker_safety(self):
+            return report
+
+    config = SimpleNamespace(
+        paper=True,
+        base_url="https://paper-api.alpaca.markets",
+    )
+    monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda: tmp_path / "bot.db")
+    monkeypatch.setattr(
+        trading_bot,
+        "load_config_details",
+        lambda: SimpleNamespace(config=config),
+    )
+    monkeypatch.setattr(trading_bot, "TradeOSBot", FakeTradeOSBot)
+    monkeypatch.setattr(
+        automation_safety,
+        "format_reconciliation",
+        lambda value: value.final_code,
+    )
+
+    assert cli.main(["reconcile"]) == 0
+    assert constructed
+    assert capsys.readouterr().out.strip() == "SAFE_FOR_PAPER_AUTOMATION"
+
+
+def test_live_run_holds_execution_lock_while_trading_main_executes(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    import trading_bot
+    from alpaca_trading_bot import cli
+
+    state = {"execution_lock_held": False, "live_lock_held": False}
+    events = []
+
+    class FakeExecutionLock:
+        def __enter__(self):
+            assert state["execution_lock_held"] is False
+            state["execution_lock_held"] = True
+            events.append("execution-enter")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            assert state["execution_lock_held"] is True
+            state["execution_lock_held"] = False
+            events.append("execution-exit")
+            return False
+
+    class FakeLiveLock:
+        def __enter__(self):
+            assert state["execution_lock_held"] is True
+            state["live_lock_held"] = True
+            events.append("live-enter")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            assert state["live_lock_held"] is True
+            state["live_lock_held"] = False
+            events.append("live-exit")
+            return False
+
+    def fake_main(*args, **kwargs):
+        assert state == {"execution_lock_held": True, "live_lock_held": True}
+        events.append("main")
+
+    config = SimpleNamespace(
+        paper=True,
+        base_url="https://paper-api.alpaca.markets",
+    )
+    monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli, "resolve_database_path", lambda *_args: tmp_path / "bot.db"
+    )
+    monkeypatch.setattr(cli, "ExecutionLock", FakeExecutionLock)
+    monkeypatch.setattr(cli, "_live_instance_lock", FakeLiveLock)
+    monkeypatch.setattr(cli, "LOG_ROOT", tmp_path / "logs")
+    monkeypatch.setattr(
+        trading_bot,
+        "load_config_details",
+        lambda: SimpleNamespace(config=config),
+    )
+    monkeypatch.setattr(trading_bot, "main", fake_main)
+
+    assert cli.main(["live"]) == 0
+    assert events == [
+        "execution-enter",
+        "live-enter",
+        "main",
+        "live-exit",
+        "execution-exit",
+    ]
+    assert state == {"execution_lock_held": False, "live_lock_held": False}

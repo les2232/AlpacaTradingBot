@@ -109,8 +109,11 @@ class ReplayRunner:
             if current.qty == 0 or (current.qty > 0 and signed_qty > 0) or (current.qty < 0 and signed_qty < 0):
                 total_abs_qty = abs(current.qty) + abs(signed_qty)
                 avg_price = (
-                    ((abs(current.qty) * (current.avg_entry_price or fill_price)) + (abs(signed_qty) * fill_price))
-                    / max(total_abs_qty, 1)
+                    (
+                        (float(abs(current.qty)) * (current.avg_entry_price or fill_price))
+                        + (float(abs(signed_qty)) * fill_price)
+                    )
+                    / float(total_abs_qty)
                 )
                 current = PositionState(symbol=symbol, qty=new_qty, avg_entry_price=avg_price, current_price=fill_price)
                 continue

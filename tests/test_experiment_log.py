@@ -19,8 +19,8 @@ def _make_dataset(base_dir: Path, name: str = "sample_dataset") -> Path:
                 "symbols": ["AMD", "MSFT"],
                 "timeframe": "15Min",
                 "feed": "iex",
-                "start": "2026-01-01T00:00:00Z",
-                "end": "2026-02-01T00:00:00Z",
+                "start_utc": "2026-01-01T00:00:00Z",
+                "end_utc": "2026-02-01T00:00:00Z",
             }
         ),
         encoding="utf-8",
@@ -74,6 +74,8 @@ def test_log_experiment_run_appends_and_marks_improved_vs_prior() -> None:
 
         assert first["auto_summary"]["label"] == "insufficient evidence"
         assert second["auto_summary"]["label"] == "improved vs prior"
+        assert first["dataset_start"] == "2026-01-01T00:00:00Z"
+        assert first["dataset_end"] == "2026-02-01T00:00:00Z"
 
         entries = load_experiment_log(log_path)
         assert len(entries) == 2

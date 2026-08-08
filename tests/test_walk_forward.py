@@ -1,6 +1,14 @@
 """Tests for walk-forward validation window generation and summary logic."""
+from pathlib import Path
+
 import pytest
-from backtest_runner import _generate_walk_forward_windows, _compute_wf_summary, _validate_wf_args
+import backtest_runner
+from backtest_runner import (
+    _compute_wf_summary,
+    _generate_walk_forward_windows,
+    _validate_wf_args,
+    run_walk_forward,
+)
 
 
 def _make_trading_days(n: int) -> list[str]:
@@ -186,3 +194,71 @@ def test_validate_rejects_sweep_list_conflict():
     with pytest.raises(ValueError, match="sweep"):
         _validate_wf_args(train_days=60, test_days=20, step_days=20,
                           has_regime_specs=False, has_sweep_lists=True)
+
+
+@pytest.mark.parametrize(
+    "backtest_kwargs",
+    [
+        {},
+        {"strategy_mode": "ml"},
+        {"strategy_mode": "hybrid"},
+        {"strategy_mode": "sma", "symbol_strategy_modes": {"AAPL": "ml"}},
+    ],
+)
+def test_walk_forward_rejects_prefit_ml_before_loading_data(backtest_kwargs):
+    with pytest.raises(
+        RuntimeError,
+        match=r"logistic_latest\.pkl.*Fold-local model training.*out-of-sample",
+    ):
+        run_walk_forward(
+            dataset_path=Path("unused"),
+            train_days=60,
+            test_days=20,
+            step_days=20,
+            symbols=["AAPL"],
+            output_csv=None,
+            **backtest_kwargs,
+        )
+
+
+def test_walk_forward_non_ml_strategy_still_reaches_dataset_loading(monkeypatch):
+    class DatasetLoadingReached(Exception):
+        pass
+
+    def _stop_after_guard(dataset_path):
+        raise DatasetLoadingReached(dataset_path)
+
+    monkeypatch.setattr(backtest_runner, "_get_trading_days", _stop_after_guard)
+
+    with pytest.raises(DatasetLoadingReached):
+        run_walk_forward(
+            dataset_path=Path("unused"),
+            train_days=60,
+            test_days=20,
+            step_days=20,
+            symbols=["AAPL"],
+            output_csv=None,
+            strategy_mode="sma",
+        )
+
+
+def test_walk_forward_allows_non_ml_override_for_every_requested_symbol(monkeypatch):
+    class DatasetLoadingReached(Exception):
+        pass
+
+    def _stop_after_guard(dataset_path):
+        raise DatasetLoadingReached(dataset_path)
+
+    monkeypatch.setattr(backtest_runner, "_get_trading_days", _stop_after_guard)
+
+    with pytest.raises(DatasetLoadingReached):
+        run_walk_forward(
+            dataset_path=Path("unused"),
+            train_days=60,
+            test_days=20,
+            step_days=20,
+            symbols=["aapl"],
+            output_csv=None,
+            strategy_mode="hybrid",
+            symbol_strategy_modes={"AAPL": "sma", "MSFT": "ml"},
+        )

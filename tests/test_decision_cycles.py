@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from automation_safety import AmbiguousSubmissionError
 import trading_bot
 from storage import (
     DECISION_CYCLE_AMBIGUOUS,
@@ -189,6 +190,32 @@ def test_first_claim_and_duplicate_survive_storage_reopen(
     assert duplicate.reason == "duplicate_cycle"
     assert duplicate.status == "claimed"
     assert duplicate.owner_id == "owner-a"
+
+
+def test_paper_shadow_durably_claims_cycle_across_clean_restart(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "paper-shadow-cycles.db"
+    first = _make_cycle_bot(db_path, session_id="shadow-a")
+    restarted = _make_cycle_bot(db_path, session_id="shadow-b")
+
+    first.run_once(
+        execute_orders=False,
+        durable_decision_cycle=True,
+    )
+    restarted.run_once(
+        execute_orders=False,
+        durable_decision_cycle=True,
+    )
+
+    first.evaluate_symbol.assert_called_once()
+    restarted.evaluate_symbol.assert_not_called()
+    restarted.place_market_buy.assert_not_called()
+    restarted.place_market_sell.assert_not_called()
+    restarted.broker.submit_market_order.assert_not_called()
+    persisted = BotStorage(db_path).get_decision_cycle(CYCLE_TIME)
+    assert persisted is not None
+    assert persisted["status"] == DECISION_CYCLE_COMPLETED
 
 
 def test_two_owners_cannot_both_claim_same_cycle(tmp_path: Path) -> None:
@@ -524,8 +551,10 @@ def test_submission_exception_is_ambiguous_and_not_retried(
         action="BUY",
     )
     del ambiguous.place_market_buy
-    ambiguous.broker.submit_market_order.side_effect = RuntimeError(
-        "mocked uncertain broker response"
+    ambiguous.submission_gate = SimpleNamespace(
+        submit=Mock(
+            side_effect=AmbiguousSubmissionError("mocked uncertain broker response")
+        )
     )
 
     with pytest.raises(RuntimeError, match="mocked uncertain broker response"):
@@ -535,9 +564,10 @@ def test_submission_exception_is_ambiguous_and_not_retried(
     assert persisted is not None
     assert persisted["status"] == DECISION_CYCLE_AMBIGUOUS
     assert persisted["reason"] == (
-        "exception:RuntimeError:phase=order_capable"
+        "exception:AmbiguousSubmissionError:phase=order_capable"
     )
-    assert ambiguous.broker.submit_market_order.call_count == 1
+    assert ambiguous.submission_gate.submit.call_count == 1
+    ambiguous.broker.submit_market_order.assert_not_called()
     assert [event["stage"] for event in ambiguous.decision_cycle_events] == [
         "claimed",
         "ambiguous",
@@ -595,6 +625,69 @@ def test_partial_multi_symbol_submission_failure_blocks_cycle_replay(
     restarted.place_market_buy.assert_not_called()
     restarted.place_market_sell.assert_not_called()
     restarted.broker.submit_market_order.assert_not_called()
+
+
+def test_accepted_unfilled_exit_does_not_release_position_slot(
+    tmp_path: Path,
+) -> None:
+    bot = _make_cycle_bot(
+        tmp_path / "pending-exit-exposure.db",
+        session_id="owner-a",
+        symbols=("AMD", "MSFT"),
+    )
+    position = trading_bot.Position(
+        symbol="AMD",
+        qty=1.0,
+        market_value=100.0,
+        current_price=100.0,
+        avg_entry_price=99.0,
+    )
+    snapshot = trading_bot.BotSnapshot(
+        timestamp_utc=normalize_decision_cycle_id(CYCLE_TIME),
+        cash=1_000.0,
+        buying_power=1_000.0,
+        equity=1_100.0,
+        last_equity=1_100.0,
+        daily_pnl=0.0,
+        kill_switch_triggered=False,
+        positions={"AMD": position},
+        symbols=[
+            trading_bot.SymbolSnapshot(
+                symbol="AMD",
+                price=100.0,
+                sma=99.0,
+                action="SELL",
+                holding=True,
+                quantity=1.0,
+                market_value=100.0,
+            ),
+            trading_bot.SymbolSnapshot(
+                symbol="MSFT",
+                price=100.0,
+                sma=99.0,
+                action="BUY",
+                holding=False,
+                quantity=0.0,
+                market_value=0.0,
+            ),
+        ],
+    )
+    bot.config.max_open_positions = 1
+    bot.build_snapshot = Mock(return_value=snapshot)
+    bot._has_recent_symbol_order = Mock(return_value=False)
+    bot.get_positions_by_symbol = Mock(return_value={"AMD": position})
+    bot.place_market_sell.return_value = SimpleNamespace(order_id="pending-exit")
+    bot.place_market_buy.return_value = SimpleNamespace(order_id="new-entry")
+
+    bot.run_once(execute_orders=True)
+
+    bot.place_market_sell.assert_called_once()
+    bot.place_market_buy.assert_not_called()
+    assert any(
+        call.kwargs.get("symbol") == "MSFT"
+        and call.kwargs.get("block_reason") == "max_open_positions_reached"
+        for call in bot._log_risk_check.call_args_list
+    )
 
 
 def test_eod_flatten_exit_remains_available_inside_claimed_cycle(

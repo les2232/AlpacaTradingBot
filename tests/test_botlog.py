@@ -1,9 +1,9 @@
 import json
 import shutil
 import uuid
-from datetime import datetime
 from pathlib import Path
 
+import botlog
 from botlog import BotLogger
 
 
@@ -48,7 +48,7 @@ def test_botlogger_uses_distinct_file_handlers_per_log_root() -> None:
             rejection=None,
         )
 
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = botlog._trading_date()
         signals_a = log_root_a / date_str / "signals.jsonl"
         signals_b = log_root_b / date_str / "signals.jsonl"
 
@@ -90,7 +90,7 @@ def test_botlogger_signal_persists_extra_explainability_fields() -> None:
             },
         )
 
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = botlog._trading_date()
         signals = base_dir / date_str / "signals.jsonl"
         rows = [json.loads(line) for line in signals.read_text(encoding="utf-8").splitlines() if line.strip()]
 
@@ -107,7 +107,7 @@ def test_botlogger_lifecycle_persists_process_stage() -> None:
         logger = BotLogger(log_root=base_dir, session_id="session-a")
         logger.lifecycle("started", strategy_mode="mean_reversion", symbol_count=15)
 
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = botlog._trading_date()
         lifecycle = base_dir / date_str / "lifecycle.jsonl"
         rows = [json.loads(line) for line in lifecycle.read_text(encoding="utf-8").splitlines() if line.strip()]
 
@@ -135,7 +135,7 @@ def test_botlogger_persists_structured_decision_cycle_event(
         symbol_count=2,
     )
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = botlog._trading_date()
     lifecycle = tmp_path / date_str / "lifecycle.jsonl"
     rows = [
         json.loads(line)
@@ -172,3 +172,24 @@ def test_botlogger_persists_structured_decision_cycle_event(
         for handler in list(file_logger.handlers):
             handler.close()
             file_logger.removeHandler(handler)
+
+
+def test_botlogger_rotates_files_when_eastern_trading_date_changes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    current_day = {"value": "2026-08-06"}
+    monkeypatch.setattr(botlog, "_trading_date", lambda: current_day["value"])
+    logger = BotLogger(log_root=tmp_path, session_id="overnight-session")
+
+    logger.lifecycle("started")
+    current_day["value"] = "2026-08-07"
+    logger.lifecycle("heartbeat")
+
+    first_day = tmp_path / "2026-08-06" / "lifecycle.jsonl"
+    second_day = tmp_path / "2026-08-07" / "lifecycle.jsonl"
+    first_rows = [json.loads(line) for line in first_day.read_text(encoding="utf-8").splitlines()]
+    second_rows = [json.loads(line) for line in second_day.read_text(encoding="utf-8").splitlines()]
+
+    assert [row["stage"] for row in first_rows] == ["started"]
+    assert [row["stage"] for row in second_rows] == ["heartbeat"]

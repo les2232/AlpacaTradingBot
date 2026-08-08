@@ -4,6 +4,7 @@ import math
 import threading
 import time
 import json
+from decimal import Decimal
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
@@ -23,6 +24,17 @@ else:
     _ML_PREDICT_IMPORT_ERROR = None
 
 from botlog import BotLogger
+from automation_safety import (
+    ENTRY_INTENT,
+    FORCED_LONG_EXIT_INTENT,
+    LONG_EXIT_INTENT,
+    SHORT_COVER_INTENT,
+    OrderRequest,
+    ReconciliationReport,
+    SafetyReconciler,
+    SubmissionGate,
+    decimal_text,
+)
 from storage import (
     DECISION_CYCLE_AMBIGUOUS,
     DECISION_CYCLE_COMPLETED,
@@ -32,7 +44,11 @@ from storage import (
     DecisionCycleClaim,
     normalize_decision_cycle_id,
 )
-from tradeos.runtime_paths import TRADEOS_REPOSITORY_ROOT, resolve_database_path
+from tradeos.runtime_paths import (
+    TRADEOS_REPOSITORY_ROOT,
+    resolve_database_path,
+    resolve_log_root,
+)
 from tradeos.brokers import AlpacaBroker, BrokerBar, BrokerOrder, BrokerPosition
 from symbol_state import (
     format_symbol_list,
@@ -392,6 +408,11 @@ class RuntimeConfigDetails:
     runtime_config_rejection_reasons: tuple[str, ...]
     baseline_valid_for_comparison: bool | None = None
     baseline_validation_errors: tuple[str, ...] = ()
+    launch_profile: str | None = None
+    broker_environment: str | None = None
+    submission_policy: str | None = None
+    expected_account_fingerprint: str | None = None
+    dashboard_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -517,7 +538,7 @@ _ET = pytz.timezone("America/New_York")
 _SESSION_ENTRY_START = dt_time(9, 45)   # no new entries before this
 _SESSION_ENTRY_END   = dt_time(15, 45)  # no new entries after this
 _SESSION_FLATTEN_AT  = dt_time(15, 55)  # forced EOD flatten deadline
-DEFAULT_RUNTIME_CONFIG_PATH = Path("config") / "live_config.json"
+DEFAULT_RUNTIME_CONFIG_PATH = TRADEOS_REPOSITORY_ROOT / "config" / "live_config.json"
 STARTUP_ARTIFACT_PATH_ENV = "TRADEOS_STARTUP_ARTIFACT_PATH"
 
 
@@ -842,7 +863,12 @@ def _coerce_runtime_bool(runtime: dict[str, Any], key: str) -> bool:
 
 
 def _load_runtime_config_payload() -> tuple[Path | None, dict[str, Any] | None, dict[str, Any] | None]:
-    runtime_path = Path(os.getenv("BOT_RUNTIME_CONFIG_PATH", str(DEFAULT_RUNTIME_CONFIG_PATH)))
+    runtime_path = Path(
+        os.getenv("BOT_RUNTIME_CONFIG_PATH", str(DEFAULT_RUNTIME_CONFIG_PATH))
+    ).expanduser()
+    if not runtime_path.is_absolute():
+        runtime_path = TRADEOS_REPOSITORY_ROOT / runtime_path
+    runtime_path = runtime_path.resolve(strict=False)
     if not runtime_path.exists():
         return None, None, None
 
@@ -1121,7 +1147,10 @@ def _load_base_config() -> BotConfig:
         block_trading_until_resync=os.getenv("BLOCK_TRADING_UNTIL_RESYNC", "true").lower() != "false",
         assert_feed_on_startup=os.getenv("ASSERT_FEED_ON_STARTUP", "true").lower() != "false",
         log_bar_components=os.getenv("LOG_BAR_COMPONENTS", "true").lower() != "false",
-        paper=os.getenv("ALPACA_PAPER", "true").lower() != "false",
+        # Submission-capable mode requires an explicit positive paper setting.
+        # Missing or malformed values fail closed and are rejected by the CLI
+        # and the centralized reconciliation gate before any broker connection.
+        paper=os.getenv("ALPACA_PAPER", "").strip().lower() == "true",
         strategy_mode=normalize_strategy_mode(os.getenv("STRATEGY_MODE", "hybrid")),
         symbol_strategy_modes=_parse_symbol_strategy_map(os.getenv("SYMBOL_STRATEGY_MAP")),
         ml_lookback_bars=int(os.getenv("ML_LOOKBACK_BARS", "320")),
@@ -1218,6 +1247,11 @@ def load_config_details() -> RuntimeConfigDetails:
     config, changed_fields = _apply_runtime_config(base_config, runtime_path, runtime)
     runtime_config_approved: bool | None = None
     runtime_config_rejection_reasons: tuple[str, ...] = ()
+    launch_profile: str | None = None
+    broker_environment: str | None = None
+    submission_policy: str | None = None
+    expected_account_fingerprint: str | None = None
+    dashboard_mode: str | None = None
     if isinstance(payload, dict):
         source = payload.get("source")
         if isinstance(source, dict):
@@ -1229,12 +1263,42 @@ def load_config_details() -> RuntimeConfigDetails:
                 runtime_config_rejection_reasons = tuple(
                     str(reason) for reason in rejection_reasons if str(reason).strip()
                 )
+        launch = payload.get("launch")
+        if launch is not None and not isinstance(launch, dict):
+            raise RuntimeError("Runtime config field 'launch' must be a JSON object.")
+        if isinstance(launch, dict):
+            launch_values: dict[str, str | None] = {}
+            for key in (
+                "profile",
+                "broker_environment",
+                "submission_policy",
+                "expected_account_fingerprint",
+                "dashboard_mode",
+            ):
+                value = launch.get(key)
+                if value is not None and not isinstance(value, str):
+                    raise RuntimeError(
+                        f"Runtime config launch field {key!r} must be a string."
+                    )
+                launch_values[key] = value.strip().lower() if value else None
+            launch_profile = launch_values["profile"]
+            broker_environment = launch_values["broker_environment"]
+            submission_policy = launch_values["submission_policy"]
+            expected_account_fingerprint = launch_values[
+                "expected_account_fingerprint"
+            ]
+            dashboard_mode = launch_values["dashboard_mode"]
     return RuntimeConfigDetails(
         config=config,
         runtime_config_path=str(runtime_path) if runtime_path is not None else None,
         overridden_fields=changed_fields,
         runtime_config_approved=runtime_config_approved,
         runtime_config_rejection_reasons=runtime_config_rejection_reasons,
+        launch_profile=launch_profile,
+        broker_environment=broker_environment,
+        submission_policy=submission_policy,
+        expected_account_fingerprint=expected_account_fingerprint,
+        dashboard_mode=dashboard_mode,
     )
 
 
@@ -1245,16 +1309,41 @@ def load_config() -> BotConfig:
 
 
 class TradeOSBot:
-    def __init__(self, config: BotConfig, session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        config: BotConfig,
+        session_id: str | None = None,
+        *,
+        submission_enabled: bool = False,
+    ) -> None:
+        if config.paper is not True:
+            raise RuntimeError(
+                "Automation V1 is paper-only; refusing to initialize a live broker client."
+            )
         load_dotenv(TRADEOS_REPOSITORY_ROOT / ".env")
         self._session_started_at = datetime.now(timezone.utc)
+        self._submission_enabled = submission_enabled is True
 
         database_path = resolve_database_path()
         self.config = config
         self.broker = self._build_broker()
         self.storage = BotStorage(database_path)
+        self.safety_reconciler = SafetyReconciler(
+            broker=self.broker,
+            storage=self.storage,
+            configured_paper=bool(config.paper),
+        )
+        self.submission_gate = SubmissionGate(
+            broker=self.broker,
+            storage=self.storage,
+            reconciler=self.safety_reconciler,
+            submission_enabled=submission_enabled,
+        )
         self.session_id = session_id or f"session-{int(datetime.now(timezone.utc).timestamp())}"
-        self.blog = BotLogger(log_root="logs", session_id=self.session_id)
+        self.blog = BotLogger(
+            log_root=resolve_log_root(),
+            session_id=self.session_id,
+        )
         self.active_symbols = normalize_symbols(config.symbols)
         self._active_symbol_fingerprint = symbol_fingerprint(self.active_symbols)
         # Fill-tracking state (keyed by order_id)
@@ -1286,6 +1375,8 @@ class TradeOSBot:
             gate_allows_exits=False,
         )
         self._startup_market_data_validated_for_et_date: str | None = None
+        self._runtime_environment: str | None = None
+        self._runtime_account_fingerprint: str | None = None
         self._validate_persisted_symbol_state()
         self.strategy = Strategy(
             StrategyConfig(
@@ -1438,6 +1529,7 @@ class TradeOSBot:
             api_secret=api_secret,
             paper=self.config.paper,
             symbols=self.config.symbols,
+            submission_enabled=self._submission_enabled,
             price_stream_feed=self.config.live_feed,
             latest_data_feed=self.config.latest_bar_feed,
         )
@@ -1457,6 +1549,75 @@ class TradeOSBot:
 
     def get_startup_resync_result(self) -> ResyncResult:
         return self._startup_resync_result
+
+    def _adopt_authenticated_runtime_scope(
+        self,
+        report: ReconciliationReport,
+    ) -> bool:
+        identity_blocked = any(
+            reason.startswith("broker_account")
+            or reason.startswith("expected_account")
+            or reason == "broker_environment_not_verified_as_paper"
+            or reason.startswith("runtime_state_scope")
+            or reason.startswith("unbound_legacy")
+            for reason in report.blocking_reasons
+        )
+        environment = str(report.environment or "").strip().lower()
+        fingerprint = str(report.account_fingerprint or "").strip()
+        if identity_blocked or environment != "paper" or not fingerprint:
+            return False
+        try:
+            binding = self.storage.get_runtime_state_binding(
+                environment=environment,
+                account_fingerprint=fingerprint,
+            )
+        except Exception:
+            return False
+        if binding is None:
+            return False
+        self._runtime_environment = environment
+        self._runtime_account_fingerprint = fingerprint
+        return True
+
+    def _require_authenticated_runtime_scope(self) -> tuple[str, str]:
+        environment = str(
+            getattr(self, "_runtime_environment", None) or ""
+        ).strip().lower()
+        fingerprint = str(
+            getattr(self, "_runtime_account_fingerprint", None) or ""
+        ).strip()
+        if environment != "paper" or not fingerprint:
+            raise RuntimeError(
+                "Authenticated paper runtime scope is unavailable; scoped state access is blocked."
+            )
+        binding = self.storage.get_runtime_state_binding(
+            environment=environment,
+            account_fingerprint=fingerprint,
+        )
+        if binding is None:
+            raise RuntimeError(
+                "Authenticated paper runtime scope is not durably bound; scoped state access is blocked."
+            )
+        return environment, fingerprint
+
+    def reconcile_broker_safety(self) -> ReconciliationReport:
+        """Run the dedicated fail-closed, broker-read-only safety reconciliation."""
+
+        report = self.safety_reconciler.reconcile()
+        self._adopt_authenticated_runtime_scope(report)
+        self.blog.lifecycle(
+            "safety.reconciled",
+            result=report.result,
+            ready=report.ready,
+            environment=report.environment,
+            account_id_masked=report.account_id_masked,
+            blocking_reasons=list(report.blocking_reasons),
+            managed_position_count=len(report.managed_positions),
+            unmanaged_position_count=len(report.unmanaged_positions),
+            managed_order_count=len(report.managed_orders),
+            unmanaged_order_count=len(report.unmanaged_orders),
+        )
+        return report
 
     def _set_startup_resync_result(self, result: ResyncResult) -> ResyncResult:
         self._startup_resync_result = result
@@ -1499,15 +1660,28 @@ class TradeOSBot:
         latest_path.write_text(artifact_text, encoding="utf-8")
 
     def _local_resync_context(self) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-        latest_run = self.storage.get_latest_run()
+        environment, account_fingerprint_value = (
+            self._require_authenticated_runtime_scope()
+        )
+        latest_run = self.storage.get_latest_run(
+            environment=environment,
+            account_fingerprint=account_fingerprint_value,
+        )
         latest_symbols = {
             str(row.get("symbol", "")).strip().upper(): row
-            for row in self.storage.get_latest_symbol_snapshot()
+            for row in self.storage.get_latest_symbol_snapshot(
+                environment=environment,
+                account_fingerprint=account_fingerprint_value,
+            )
             if str(row.get("symbol", "")).strip()
         }
         order_history = {
             str(row.get("order_id", "")).strip(): row
-            for row in self.storage.get_order_history(limit=200)
+            for row in self.storage.get_order_history(
+                limit=200,
+                environment=environment,
+                account_fingerprint=account_fingerprint_value,
+            )
             if str(row.get("order_id", "")).strip()
         }
         return latest_run, latest_symbols, order_history
@@ -1548,6 +1722,30 @@ class TradeOSBot:
 
         now_utc = current_time_utc or datetime.now(timezone.utc)
         started_at = now_utc.isoformat()
+        try:
+            self._require_authenticated_runtime_scope()
+        except Exception as exc:
+            result = ResyncResult(
+                status=ResyncStatus.FAILED,
+                started_at_utc=started_at,
+                completed_at_utc=datetime.now(timezone.utc).isoformat(),
+                discrepancies=(
+                    ResyncDiscrepancy(
+                        symbol=None,
+                        kind="runtime_scope_unavailable",
+                        detail=str(exc),
+                    ),
+                ),
+                reason_codes=("RESYNC_RUNTIME_SCOPE_UNAVAILABLE",),
+                gate_allows_entries=False,
+                gate_allows_exits=False,
+            )
+            self.blog.lifecycle(
+                "resync.failed",
+                status=result.status.value,
+                reason_codes=list(result.reason_codes),
+            )
+            return self._set_startup_resync_result(result)
         lookback_cutoff = now_utc - timedelta(minutes=lookback_minutes)
         self.blog.lifecycle(
             "resync.started",
@@ -1739,10 +1937,24 @@ class TradeOSBot:
         return self._set_startup_resync_result(result)
 
     def _validate_persisted_symbol_state(self) -> None:
-        latest_run = self.storage.get_latest_run()
+        try:
+            environment, account_fingerprint_value = (
+                self._require_authenticated_runtime_scope()
+            )
+        except RuntimeError:
+            return
+        latest_run = self.storage.get_latest_run(
+            environment=environment,
+            account_fingerprint=account_fingerprint_value,
+        )
         if latest_run is None:
             return
-        persisted_symbols = normalize_symbols(self.storage.get_latest_snapshot_symbols())
+        persisted_symbols = normalize_symbols(
+            self.storage.get_latest_snapshot_symbols(
+                environment=environment,
+                account_fingerprint=account_fingerprint_value,
+            )
+        )
         if not persisted_symbols or symbols_match(self.active_symbols, persisted_symbols):
             return
         latest_ts = str(latest_run.get("timestamp_utc", "") or "")
@@ -1849,7 +2061,41 @@ class TradeOSBot:
     def get_account(self) -> Any:
         return self.broker.get_account()
 
-    def perform_startup_preflight(self, *, execute_orders: bool) -> dict[str, object]:
+    def perform_startup_preflight(
+        self,
+        *,
+        execute_orders: bool,
+        require_reconciliation_ready: bool = False,
+    ) -> dict[str, object]:
+        if execute_orders:
+            try:
+                from tradeos.execution_lock import current_process_holds_lock
+
+                lock_held = current_process_holds_lock()
+            except Exception:
+                lock_held = False
+            if not lock_held:
+                raise RuntimeError(
+                    "Automation execution lock is not held; order-capable startup remains blocked."
+                )
+        if not hasattr(self, "safety_reconciler"):
+            raise RuntimeError(
+                "Submission safety controller is unavailable; scoped startup remains blocked."
+            )
+        safety_report = self.reconcile_broker_safety()
+        if not self._adopt_authenticated_runtime_scope(safety_report):
+            reasons = ", ".join(safety_report.blocking_reasons) or safety_report.result
+            raise RuntimeError(
+                "Authenticated runtime scope could not be established "
+                f"({safety_report.result}: {reasons})."
+            )
+        self._require_authenticated_runtime_scope()
+        self._validate_persisted_symbol_state()
+        if (execute_orders or require_reconciliation_ready) and not safety_report.ready:
+            reasons = ", ".join(safety_report.blocking_reasons) or safety_report.result
+            raise RuntimeError(
+                f"Automation safety reconciliation blocked startup: {safety_report.result} ({reasons})"
+            )
         account = self.get_account()
         positions = self.get_positions_by_symbol()
         market_open: bool | None = None
@@ -1878,32 +2124,54 @@ class TradeOSBot:
         return max(0.0, (now_utc - first_seen).total_seconds() / 60.0)
 
     def _hydrate_open_position_state(self, positions: dict[str, Position]) -> None:
-        persisted_positions = _load_open_position_state_from_logs(getattr(self.blog, "log_root", "logs"))
+        persisted_positions: dict[str, dict[str, Any]] = {}
+        latest_run: dict[str, Any] | None = None
+        if hasattr(self, "storage"):
+            environment, account_fingerprint_value = (
+                self._require_authenticated_runtime_scope()
+            )
+            latest_run = self.storage.get_latest_run(
+                environment=environment,
+                account_fingerprint=account_fingerprint_value,
+            )
+            persisted_positions = {
+                str(row.get("symbol", "")).strip().upper(): row
+                for row in self.storage.get_latest_symbol_snapshot(
+                    environment=environment,
+                    account_fingerprint=account_fingerprint_value,
+                )
+                if str(row.get("symbol", "")).strip()
+            }
         for symbol, position in positions.items():
             if not _has_open_position(position):
                 continue
             persisted = persisted_positions.get(symbol)
             if symbol not in self._position_entry_price:
                 persisted_entry_price = _optional_float(
-                    persisted.get("entry_price") if persisted is not None else None
+                    persisted.get("avg_entry_price") if persisted is not None else None
                 )
                 broker_entry_price = _optional_float(getattr(position, "avg_entry_price", None))
-                entry_price = persisted_entry_price if persisted_entry_price is not None else broker_entry_price
+                entry_price = broker_entry_price if broker_entry_price is not None else persisted_entry_price
                 if entry_price is not None:
                     self._position_entry_price[symbol] = entry_price
             if symbol not in self._position_qty:
-                persisted_qty = _optional_float(persisted.get("qty") if persisted is not None else None)
-                quantity = persisted_qty if persisted_qty is not None else _position_qty_value(position)
+                quantity = _position_qty_value(position)
                 if quantity != 0:
                     self._position_qty[symbol] = quantity
             if symbol not in self._position_entry_ts:
-                persisted_decision_ts = persisted.get("decision_ts") if persisted is not None else None
-                if isinstance(persisted_decision_ts, str) and persisted_decision_ts:
-                    self._position_entry_ts[symbol] = persisted_decision_ts
-            if symbol not in self._position_entry_branch:
-                persisted_entry_branch = persisted.get("entry_branch") if persisted is not None else None
-                if isinstance(persisted_entry_branch, str) and persisted_entry_branch:
-                    self._position_entry_branch[symbol] = persisted_entry_branch
+                persisted_qty = _optional_float(
+                    persisted.get("quantity") if persisted is not None else None
+                )
+                persisted_timestamp = (
+                    str(latest_run.get("timestamp_utc", "") or "")
+                    if latest_run is not None
+                    else ""
+                )
+                if (
+                    persisted_qty == _position_qty_value(position)
+                    and persisted_timestamp
+                ):
+                    self._position_entry_ts[symbol] = persisted_timestamp
 
     def _update_position_holding_state(
         self,
@@ -3336,6 +3604,7 @@ class TradeOSBot:
         positions: dict[str, Position],
         open_order_symbols: set[str],
         exit_reason: str = "eod_flatten",
+        decision_ts: str | None = None,
     ) -> list[str]:
         failed_symbols: list[str] = []
         for symbol, position in positions.items():
@@ -3343,29 +3612,27 @@ class TradeOSBot:
                 print(f"Skip flatten {symbol}: existing open order in flight")
                 continue
             try:
-                qty = int(float(position.qty))
+                qty = Decimal(str(position.qty))
                 if qty > 0:
-                    self.place_market_sell(symbol, position, exit_reason=exit_reason)
-                elif qty < 0:
-                    # Short position — buy to cover
-                    cover_qty = abs(qty)
-                    order = self.broker.submit_market_order(symbol=symbol, qty=cover_qty, side="buy")
-                    print(f"Submitted BUY-TO-COVER {symbol} qty={cover_qty} (flatten)")
-                    order_id = order.order_id
-                    dec_ts = self.get_decision_timestamp().isoformat()
-                    if order_id:
-                        self._order_submission_ts[order_id] = dec_ts
-                        self._order_submission_side[order_id] = "buy"
-                        self._order_exit_reason[order_id] = exit_reason
-                    self.blog.order_submitted(
-                        symbol=symbol,
-                        decision_ts=dec_ts,
-                        side="buy",
-                        qty=cover_qty,
-                        live_price=_float_or_default(getattr(position, "current_price", None) or getattr(position, "avg_entry_price", None)),
-                        order_id=order_id,
-                        signal_bar_close=None,
+                    forced_decision_id = decision_ts or (
+                        f"{self._et_now().date().isoformat()}:{symbol}:forced:{exit_reason}"
                     )
+                    order = self.place_market_sell(
+                        symbol,
+                        position,
+                        exit_reason=exit_reason,
+                        decision_ts=forced_decision_id,
+                        intent_kind=FORCED_LONG_EXIT_INTENT,
+                    )
+                    if order is None:
+                        failed_symbols.append(symbol)
+                elif qty < 0:
+                    # Automatic flattening must never cover a short position.
+                    print(
+                        f"Skip flatten {symbol}: short covering requires an explicit, "
+                        "separately authorized recovery action"
+                    )
+                    failed_symbols.append(symbol)
                 else:
                     print(f"Skip flatten {symbol}: qty is 0")
             except Exception as exc:
@@ -3374,15 +3641,52 @@ class TradeOSBot:
         return failed_symbols
 
     def record_state(self, snapshot: BotSnapshot, orders_limit: int = 50) -> list[OrderSnapshot]:
+        environment, account_fingerprint_value = (
+            self._require_authenticated_runtime_scope()
+        )
         orders = self.get_recent_orders(limit=orders_limit)
         self.storage.save_snapshot(
             snapshot,
             orders,
             session_id=self.session_id,
             symbol_fingerprint=self._active_symbol_fingerprint,
+            environment=environment,
+            account_fingerprint=account_fingerprint_value,
         )
         self._log_fills_from_orders(orders)
         return orders
+
+    def _log_position_close(
+        self,
+        *,
+        symbol: str,
+        decision_ts: str,
+        entry_price: float,
+        exit_price: float,
+        signed_qty: float,
+        exit_reason: str,
+    ) -> None:
+        """Log a completed long exit or short cover with direction-aware P&L."""
+
+        holding_minutes = (
+            self._position_holding_minutes(symbol, datetime.now(timezone.utc)) or 0.0
+        )
+        holding_bars = max(
+            1,
+            round(holding_minutes / self.config.bar_timeframe_minutes),
+        )
+        self.blog.position_closed(
+            symbol=symbol,
+            decision_ts=decision_ts,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            # BotLogger derives realized dollars as (exit - entry) * qty.
+            # A negative signed quantity therefore preserves short P&L direction.
+            qty=signed_qty,
+            holding_bars=holding_bars,
+            holding_minutes=holding_minutes,
+            exit_reason=exit_reason,
+        )
 
     def _log_fills_from_orders(self, orders: list[OrderSnapshot]) -> None:
         """
@@ -3394,6 +3698,28 @@ class TradeOSBot:
         for order in orders:
             status = _normalize_enum_text(order.status)
             side = _normalize_enum_text(order.side)
+            client_order_id = str(getattr(order, "client_order_id", "") or "").strip()
+            storage = getattr(self, "storage", None)
+            if client_order_id and storage is not None and hasattr(storage, "reconcile_order_intent"):
+                try:
+                    environment, account_fingerprint_value = (
+                        self._require_authenticated_runtime_scope()
+                    )
+                    storage.reconcile_order_intent(
+                        client_order_id,
+                        broker_order_id=str(order.order_id or ""),
+                        broker_status=status,
+                        filled_qty=decimal_text(order.filled_qty or Decimal("0")),
+                        updated_at_utc=datetime.now(timezone.utc).isoformat(),
+                        environment=environment,
+                        account_fingerprint=account_fingerprint_value,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not reconcile durable intent for broker order %s: %s",
+                        order.order_id,
+                        type(exc).__name__,
+                    )
             if status not in ("filled", "partially_filled"):
                 continue
             if order.filled_avg_price is None or order.filled_qty is None:
@@ -3458,10 +3784,24 @@ class TradeOSBot:
                         if remaining_qty < 0:
                             self._position_qty[order.symbol] = remaining_qty
                         else:
-                            self._position_entry_price.pop(order.symbol, None)
+                            entry_price = self._position_entry_price.pop(
+                                order.symbol,
+                                fill_price,
+                            )
                             self._position_entry_ts.pop(order.symbol, None)
                             self._position_qty.pop(order.symbol, None)
                             self._position_entry_branch.pop(order.symbol, None)
+                            self._log_position_close(
+                                symbol=order.symbol,
+                                decision_ts=dec_ts,
+                                entry_price=entry_price,
+                                exit_price=fill_price,
+                                signed_qty=existing_qty,
+                                exit_reason=self._order_exit_reason.get(
+                                    order.order_id,
+                                    "explicit_short_cover",
+                                ),
+                            )
                         self._order_submission_ts.pop(order.order_id, None)
                         self._order_submission_side.pop(order.order_id, None)
                         self._order_exit_reason.pop(order.order_id, None)
@@ -3493,20 +3833,16 @@ class TradeOSBot:
                     self._position_entry_ts.pop(order.symbol, None)
                     self._position_qty.pop(order.symbol, None)
                     self._position_entry_branch.pop(order.symbol, None)
-                    holding_minutes = (
-                        self._position_holding_minutes(order.symbol, datetime.now(timezone.utc)) or 0.0
-                    )
-                    holding_bars = max(1, round(holding_minutes / self.config.bar_timeframe_minutes))
-                    exit_reason = self._order_exit_reason.get(order.order_id, "sell_signal")
-                    self.blog.position_closed(
+                    self._log_position_close(
                         symbol=order.symbol,
                         decision_ts=dec_ts,
                         entry_price=entry_price,
                         exit_price=fill_price,
-                        qty=fill_qty,
-                        holding_bars=holding_bars,
-                        holding_minutes=holding_minutes,
-                        exit_reason=exit_reason,
+                        signed_qty=fill_qty,
+                        exit_reason=self._order_exit_reason.get(
+                            order.order_id,
+                            "sell_signal",
+                        ),
                     )
                 self._order_submission_ts.pop(order.order_id, None)
                 self._order_submission_side.pop(order.order_id, None)
@@ -3553,10 +3889,30 @@ class TradeOSBot:
             )
             return None
 
-        order = self.broker.submit_market_order(symbol=symbol, qty=qty, side="buy")
-        print(f"Submitted BUY {symbol} qty={qty} approx=${qty * execution_price:.2f}")
-        order_id = order.order_id
         dec_ts = decision_ts or self.get_decision_timestamp().isoformat()
+        gate = getattr(self, "submission_gate", None)
+        if gate is None:
+            print(f"Blocked BUY {symbol}: centralized submission gate is unavailable")
+            return None
+        outcome = gate.submit(
+            OrderRequest(
+                symbol=symbol,
+                side="buy",
+                qty=qty,
+                intent_kind=ENTRY_INTENT,
+                decision_id=dec_ts,
+            )
+        )
+        if not outcome.allowed or outcome.order is None:
+            print(f"Blocked BUY {symbol}: {outcome.reason}")
+            return None
+        order = outcome.order
+        submitted_qty = outcome.final_qty
+        print(
+            f"Submitted BUY {symbol} qty={decimal_text(submitted_qty)} "
+            f"approx=${float(submitted_qty) * execution_price:.2f}"
+        )
+        order_id = order.order_id
         if order_id:
             self._order_submission_ts[order_id] = dec_ts
             self._order_submission_side[order_id] = "buy"
@@ -3568,7 +3924,7 @@ class TradeOSBot:
             symbol=symbol,
             decision_ts=dec_ts,
             side="buy",
-            qty=qty,
+            qty=float(submitted_qty),
             live_price=execution_price,
             order_id=order_id,
             signal_bar_close=signal_price,
@@ -3583,19 +3939,37 @@ class TradeOSBot:
         live_price: float | None = None,
         decision_ts: str | None = None,
         signal_price: float | None = None,
+        intent_kind: str = LONG_EXIT_INTENT,
     ) -> OrderSnapshot | None:
-        qty = int(float(position.qty))
+        qty = Decimal(str(position.qty))
         if qty <= 0:
             print(f"Skip SELL {symbol}: non-positive quantity {position.qty}")
             return None
 
         holding_minutes = self._position_holding_minutes(symbol, datetime.now(timezone.utc))
 
-        order = self.broker.submit_market_order(symbol=symbol, qty=qty, side="sell")
-        holding_text = f" holding_minutes={holding_minutes:.1f}" if holding_minutes is not None else ""
-        print(f"Submitted SELL {symbol} qty={qty}{holding_text}")
-        order_id = order.order_id
         dec_ts = decision_ts or self.get_decision_timestamp().isoformat()
+        gate = getattr(self, "submission_gate", None)
+        if gate is None:
+            print(f"Blocked SELL {symbol}: centralized submission gate is unavailable")
+            return None
+        outcome = gate.submit(
+            OrderRequest(
+                symbol=symbol,
+                side="sell",
+                qty=qty,
+                intent_kind=intent_kind,
+                decision_id=dec_ts,
+            )
+        )
+        if not outcome.allowed or outcome.order is None:
+            print(f"Blocked SELL {symbol}: {outcome.reason}")
+            return None
+        order = outcome.order
+        submitted_qty = outcome.final_qty
+        holding_text = f" holding_minutes={holding_minutes:.1f}" if holding_minutes is not None else ""
+        print(f"Submitted SELL {symbol} qty={decimal_text(submitted_qty)}{holding_text}")
+        order_id = order.order_id
         if order_id:
             self._order_submission_ts[order_id] = dec_ts
             self._order_submission_side[order_id] = "sell"
@@ -3606,10 +3980,61 @@ class TradeOSBot:
             symbol=symbol,
             decision_ts=dec_ts,
             side="sell",
-            qty=qty,
+            qty=float(submitted_qty),
             live_price=_float_or_default(live_price if live_price is not None else (getattr(position, "current_price", None) or getattr(position, "avg_entry_price", None))),
             order_id=order_id,
             signal_bar_close=signal_price,
+        )
+        return order
+
+    def place_market_cover(
+        self,
+        symbol: str,
+        qty: Decimal | int | float | str,
+        *,
+        decision_id: str,
+        explicit_authorization: bool = False,
+        live_price: float | None = None,
+        exit_reason: str = "explicit_short_cover",
+    ) -> OrderSnapshot | None:
+        """Explicitly cover a managed short; automatic paths never call this."""
+
+        if not explicit_authorization:
+            print(f"Blocked COVER {symbol}: explicit authorization is required")
+            return None
+        gate = getattr(self, "submission_gate", None)
+        if gate is None:
+            print(f"Blocked COVER {symbol}: centralized submission gate is unavailable")
+            return None
+        outcome = gate.submit(
+            OrderRequest(
+                symbol=symbol,
+                side="buy",
+                qty=qty,
+                intent_kind=SHORT_COVER_INTENT,
+                decision_id=decision_id,
+                explicit_cover=True,
+            )
+        )
+        if not outcome.allowed or outcome.order is None:
+            print(f"Blocked COVER {symbol}: {outcome.reason}")
+            return None
+        order = outcome.order
+        order_id = order.order_id
+        submitted_qty = outcome.final_qty
+        print(f"Submitted BUY-TO-COVER {symbol} qty={decimal_text(submitted_qty)}")
+        if order_id:
+            self._order_submission_ts[order_id] = decision_id
+            self._order_submission_side[order_id] = "buy"
+            self._order_exit_reason[order_id] = exit_reason
+        self.blog.order_submitted(
+            symbol=symbol,
+            decision_ts=decision_id,
+            side="buy",
+            qty=float(submitted_qty),
+            live_price=_float_or_default(live_price),
+            order_id=order_id,
+            signal_bar_close=None,
         )
         return order
 
@@ -3647,12 +4072,14 @@ class TradeOSBot:
         self,
         execute_orders: bool = True,
         force_process: bool = False,
+        durable_decision_cycle: bool = False,
     ) -> BotSnapshot:
         self._active_decision_cycle = None
         try:
             snapshot = self._run_once_impl(
                 execute_orders=execute_orders,
                 force_process=force_process,
+                durable_decision_cycle=durable_decision_cycle,
             )
             self._complete_active_decision_cycle()
             return snapshot
@@ -3666,6 +4093,7 @@ class TradeOSBot:
         self,
         execute_orders: bool = True,
         force_process: bool = False,
+        durable_decision_cycle: bool = False,
     ) -> BotSnapshot:
         print("\n=== BOT TICK ===")
         self._bars_cache.clear()
@@ -3676,7 +4104,7 @@ class TradeOSBot:
         )
         should_process = (
             True
-            if execute_orders or force_process
+            if execute_orders or force_process or durable_decision_cycle
             else self._should_process_decision_timestamp(decision_timestamp)
         )
         buy_signals = 0
@@ -3817,7 +4245,7 @@ class TradeOSBot:
                 )
             return None
 
-        if execute_orders:
+        if execute_orders or durable_decision_cycle:
             claim = self._claim_global_decision_execution(decision_timestamp)
             claim_succeeded = (
                 claim if isinstance(claim, bool) else claim.claimed
@@ -3827,7 +4255,11 @@ class TradeOSBot:
                     decision_timestamp=decision_timestamp,
                     evaluate_signals=False,
                 )
-                forced_exit = _forced_exit_for_rejected_cycle(snapshot)
+                forced_exit = (
+                    _forced_exit_for_rejected_cycle(snapshot)
+                    if execute_orders
+                    else None
+                )
                 if forced_exit is not None:
                     snapshot, skip_reason = forced_exit
                     print(
@@ -3849,7 +4281,11 @@ class TradeOSBot:
                 return snapshot
 
         try:
-            if execute_orders and should_process and self._is_regular_hours(decision_timestamp):
+            if (
+                (execute_orders or durable_decision_cycle)
+                and should_process
+                and self._is_regular_hours(decision_timestamp)
+            ):
                 self._validate_startup_market_data(decision_timestamp)
             if should_process:
                 self._validate_cycle_bar_freshness(
@@ -4327,8 +4763,23 @@ class TradeOSBot:
                         continue
                     try:
                         refreshed_positions = self.get_positions_by_symbol()
-                    except Exception:
-                        refreshed_positions = positions
+                    except Exception as exc:
+                        print(f"Skip {symbol} SELL: broker position refresh failed")
+                        self._log_risk_check(
+                            symbol=symbol,
+                            decision_ts=_dec_ts,
+                            action="SELL",
+                            allowed=False,
+                            block_reason="broker_position_refresh_failed",
+                            snapshot=snapshot,
+                            open_positions=open_positions,
+                            signal_price=item.price or None,
+                            detail=f"fresh broker position was unavailable: {type(exc).__name__}",
+                            in_entry_window=in_entry_window,
+                            remaining_buying_power=remaining_buying_power,
+                            recent_order_count=recent_order_count,
+                        )
+                        continue
                     refreshed_position = refreshed_positions.get(symbol)
                     if not _has_long_position(refreshed_position):
                         print(f"Skip {symbol} SELL: broker no longer reports a long position")
@@ -4424,9 +4875,7 @@ class TradeOSBot:
                     )
                     if order is not None:
                         orders_submitted += 1
-                        open_positions = max(0, open_positions - 1)
                         recent_order_count += 1
-                        positions.pop(symbol, None)
                 elif action == "SELL":
                     print(f"Skip {symbol} SELL: not currently holding")
                     self._log_risk_check(
@@ -4484,15 +4933,32 @@ class TradeOSBot:
 AlpacaTradingBot = TradeOSBot
 
 
-def main(config: BotConfig | None = None, session_id: str | None = None) -> None:
+def main(
+    config: BotConfig | None = None,
+    session_id: str | None = None,
+    *,
+    execute_orders: bool | None = None,
+    require_reconciliation_ready: bool = False,
+    durable_decision_cycles: bool = False,
+) -> None:
     load_dotenv(TRADEOS_REPOSITORY_ROOT / ".env")
     if config is None:
         config = load_config()
-    bot = TradeOSBot(config, session_id=session_id)
-    bot.perform_startup_resync()
-    execute_orders = os.getenv("EXECUTE_ORDERS", "true").lower() != "false"
+    if execute_orders is None:
+        execute_orders = (
+            os.getenv("EXECUTE_ORDERS", "false").strip().lower() == "true"
+        )
+    bot = TradeOSBot(
+        config,
+        session_id=session_id,
+        submission_enabled=execute_orders,
+    )
     try:
-        bot.perform_startup_preflight(execute_orders=execute_orders)
+        bot.perform_startup_preflight(
+            execute_orders=execute_orders,
+            require_reconciliation_ready=require_reconciliation_ready,
+        )
+        bot.perform_startup_resync()
     except Exception as exc:
         bot.blog.lifecycle(
             "startup.failed",
@@ -4587,7 +5053,10 @@ def main(config: BotConfig | None = None, session_id: str | None = None) -> None
 
             tick_start = time.time()
             try:
-                snapshot = bot.run_once(execute_orders=execute_orders)
+                snapshot = bot.run_once(
+                    execute_orders=execute_orders,
+                    durable_decision_cycle=durable_decision_cycles,
+                )
                 if snapshot.kill_switch_triggered:
                     exit_reason = "kill_switch_triggered"
                     print("Main loop: kill switch triggered, exiting")

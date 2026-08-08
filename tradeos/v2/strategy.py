@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Protocol
 
 from .decisions import StrategyDecision
@@ -39,7 +40,7 @@ class LongOnlyMeanReversionStrategy:
                 return StrategyDecision(
                     action="sell",
                     reason="reversion_exit",
-                    target_qty=int(abs(position.qty)),
+                    target_qty=abs(position.qty),
                     metrics={"quote_price": quote_price, "bar_close": anchor},
                 )
             return StrategyDecision(
@@ -53,7 +54,7 @@ class LongOnlyMeanReversionStrategy:
             return StrategyDecision(
                 action="buy",
                 reason="reversion_entry",
-                target_qty=1,
+                target_qty=Decimal("1"),
                 metrics={"quote_price": quote_price, "bar_close": anchor, "entry_price": entry_price},
             )
         return StrategyDecision(
@@ -61,4 +62,3 @@ class LongOnlyMeanReversionStrategy:
             reason="no_entry",
             metrics={"quote_price": quote_price, "bar_close": anchor, "entry_price": entry_price},
         )
-

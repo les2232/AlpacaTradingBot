@@ -1,6 +1,5 @@
 import argparse
 import hashlib
-import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +11,8 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from dotenv import load_dotenv
+
+from dataset_integrity import write_immutable_dataset
 
 
 DATASET_ROOT = Path("datasets")
@@ -260,15 +261,7 @@ def write_dataset(
     output_root: Path,
     dataset_id: str,
 ) -> tuple[Path, Path]:
-    dataset_dir = output_root / dataset_id
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-
-    parquet_path = dataset_dir / "bars.parquet"
-    manifest_path = dataset_dir / "manifest.json"
-
-    dataset.to_parquet(parquet_path, index=False)
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return parquet_path, manifest_path
+    return write_immutable_dataset(dataset, manifest, output_root, dataset_id)
 
 
 def main() -> None:

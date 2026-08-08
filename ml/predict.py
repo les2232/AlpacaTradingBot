@@ -17,13 +17,14 @@ RuntimeError  — model file not found (call load() explicitly to surface early)
 ValueError    — feature_vector has wrong length
 """
 
-import pickle
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+from ml.model_artifact import ModelArtifactError, load_model_payload
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -59,8 +60,10 @@ def load(path: Path = MODEL_PATH) -> dict:
             f"Model file not found: {path}\n"
             "Run `python -m ml.train` to create it."
         )
-    with open(path, "rb") as fh:
-        _payload = pickle.load(fh)
+    try:
+        _payload = load_model_payload(path)
+    except ModelArtifactError as exc:
+        raise RuntimeError(str(exc)) from exc
     return _payload
 
 

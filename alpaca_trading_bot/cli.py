@@ -21,6 +21,7 @@ from tradeos.runtime_paths import (
     TRADEOS_REPOSITORY_ROOT,
     resolve_database_path,
 )
+from tradeos.execution_lock import ExecutionLock
 
 
 PROJECT_ROOT = TRADEOS_REPOSITORY_ROOT
@@ -31,6 +32,7 @@ DASHBOARD_READY_TIMEOUT_SECONDS = 15.0
 STARTUP_ARTIFACT_PATH_ENV = "TRADEOS_STARTUP_ARTIFACT_PATH"
 ALLOW_UNAPPROVED_RUNTIME_ENV = "TRADEOS_ALLOW_UNAPPROVED_RUNTIME"
 ALLOW_BASELINE_MISMATCH_ENV = "TRADEOS_ALLOW_BASELINE_MISMATCH"
+PAPER_SHADOW_CONFIG_PATH = PROJECT_ROOT / "config" / "paper_shadow_config.json"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +45,57 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("live", help="Run the live bot with normal order-execution behavior.")
     subparsers.add_parser("paper", help="Alias for `live` while using the current paper-trading account.")
     subparsers.add_parser("preview", help="Run the live bot with order execution disabled.")
+    subparsers.add_parser(
+        "paper-shadow",
+        help=(
+            "Run the named paper-shadow profile with real data, durable state, "
+            "and broker submission denied."
+        ),
+    )
+    subparsers.add_parser(
+        "reconcile",
+        help="Read broker/local safety state without submitting or modifying orders.",
+    )
+
+    repair_parser = subparsers.add_parser(
+        "repair-local-state",
+        help="Plan an evidence-backed, local-only COP state repair (dry-run by default).",
+    )
+    repair_parser.add_argument(
+        "--symbol",
+        required=True,
+        help="Symbol to reconcile. The guarded repair currently accepts COP only.",
+    )
+    repair_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply an approved dry-run plan after repeating every safety check.",
+    )
+    repair_parser.add_argument(
+        "--repair-id",
+        default=None,
+        help="Exact repair ID printed by the approved dry run.",
+    )
+    repair_parser.add_argument(
+        "--approved-db-raw-sha256",
+        default=None,
+        help="Exact raw database-file digest printed by the approved dry run.",
+    )
+    repair_parser.add_argument(
+        "--approved-db-state-sha256",
+        default=None,
+        help="Exact SQLite main+WAL state digest printed by the approved dry run.",
+    )
+    repair_parser.add_argument(
+        "--approved-plan-sha256",
+        default=None,
+        help="Exact canonical repair-plan digest printed by the approved dry run.",
+    )
+    repair_parser.add_argument(
+        "--approved-evidence-sha256",
+        default=None,
+        help="Exact broker-evidence digest printed by the approved dry run.",
+    )
 
     dashboard_parser = subparsers.add_parser(
         "dashboard",
@@ -292,6 +345,22 @@ def _live_instance_lock():
                     f"Another live process appears to be running with pid={existing_pid}. "
                     f"Lock file: {LIVE_BOT_LOCK_PATH}"
                 )
+            if existing_pid and existing_pid != current_pid and _pid_is_running(existing_pid):
+                identity = _read_process_identity(existing_pid)
+                locked_started_at = str(existing.get("process_started_at_utc", "") or "").strip()
+                actual_started_at = str(identity.get("started_at_utc", "") or "").strip()
+                pid_reuse_is_proven = bool(
+                    locked_started_at
+                    and actual_started_at
+                    and locked_started_at != actual_started_at
+                )
+                if not pid_reuse_is_proven:
+                    raise RuntimeError(
+                        "Refusing to recover the legacy live-bot metadata lock because "
+                        f"pid={existing_pid} is still running and ownership cannot be "
+                        "positively ruled out. Use read-only reconciliation and inspect "
+                        "that exact process before any manual recovery."
+                    )
             if existing_pid:
                 print(
                     f"Recovered stale live bot lock at {LIVE_BOT_LOCK_PATH} "
@@ -329,16 +398,20 @@ def _live_instance_lock():
         yield LIVE_BOT_LOCK_PATH
     finally:
         current_lock = _read_live_lock_metadata()
-        if int(current_lock.get("pid", 0) or 0) != current_pid:
-            return
-        try:
-            LIVE_BOT_LOCK_PATH.unlink()
-        except FileNotFoundError:
-            pass
+        if int(current_lock.get("pid", 0) or 0) == current_pid:
+            try:
+                LIVE_BOT_LOCK_PATH.unlink()
+            except FileNotFoundError:
+                pass
 
 
-def _render_runtime_summary(config: object, preview: bool) -> None:
-    mode = "preview" if preview else "live"
+def _render_runtime_summary(
+    config: object,
+    preview: bool,
+    *,
+    launch_mode: str | None = None,
+) -> None:
+    mode = launch_mode or ("preview" if preview else "live")
     paper_text = "paper" if bool(getattr(config, "paper", False)) else "live-account"
     symbols = list(getattr(config, "symbols", []))
     execution_text = "disabled" if preview else "enabled"
@@ -368,6 +441,8 @@ def _persist_startup_config(
     *,
     session_id: str,
     database_path: Path | None = None,
+    launch_mode: str | None = None,
+    execution_enabled: bool | None = None,
 ) -> Path:
     config = getattr(details, "config")
     resolved_database_path = resolve_database_path(database_path)
@@ -375,8 +450,10 @@ def _persist_startup_config(
     payload = {
         "session_id": session_id,
         "started_at_utc": started_at_utc,
-        "launch_mode": "preview" if preview else "live",
-        "execution_enabled": not preview,
+        "launch_mode": launch_mode or ("preview" if preview else "live"),
+        "execution_enabled": (
+            not preview if execution_enabled is None else execution_enabled
+        ),
         "paper": bool(getattr(config, "paper", False)),
         "account_mode": "paper" if bool(getattr(config, "paper", False)) else "live-account",
         "strategy_mode": getattr(config, "strategy_mode", ""),
@@ -389,6 +466,9 @@ def _persist_startup_config(
         "runtime_overrides": list(getattr(details, "overridden_fields", ()) or ()),
         "runtime_config_approved": getattr(details, "runtime_config_approved", None),
         "runtime_config_rejection_reasons": list(getattr(details, "runtime_config_rejection_reasons", ()) or ()),
+        "broker_environment": getattr(details, "broker_environment", None),
+        "broker_submission_policy": getattr(details, "submission_policy", None),
+        "dashboard_mode": getattr(details, "dashboard_mode", None),
         "baseline_valid_for_comparison": getattr(details, "baseline_valid_for_comparison", None),
         "baseline_validation_errors": list(getattr(details, "baseline_validation_errors", ()) or ()),
         "max_usd_per_trade": float(getattr(config, "max_usd_per_trade", 0.0) or 0.0),
@@ -438,21 +518,58 @@ def _persist_startup_config(
 
 
 def _validate_live_runtime(config: object, preview: bool) -> None:
-    if preview:
-        return
     if bool(getattr(config, "paper", False)):
         return
     raise RuntimeError(
-        "Refusing to start live order execution with ALPACA_PAPER=false. "
-        "This TradeOS workspace is currently being operated in paper-trading mode."
+        "Refusing to connect Automation V1 with ALPACA_PAPER=false. "
+        "This workspace is restricted to the Alpaca paper environment."
     )
+
+
+def _validate_paper_shadow_runtime(details: object) -> None:
+    from automation_safety import account_fingerprint
+
+    runtime_path = getattr(details, "runtime_config_path", None)
+    if not runtime_path or Path(runtime_path).resolve() != PAPER_SHADOW_CONFIG_PATH.resolve():
+        raise RuntimeError(
+            "Paper shadow must use the named config/paper_shadow_config.json profile."
+        )
+    expected_values = {
+        "launch_profile": "paper_shadow",
+        "broker_environment": "paper",
+        "submission_policy": "deny",
+        "dashboard_mode": "read_only",
+    }
+    for field, expected in expected_values.items():
+        if getattr(details, field, None) != expected:
+            raise RuntimeError(
+                f"Paper-shadow config requires {field}={expected!r}."
+            )
+    config = getattr(details, "config")
+    if bool(getattr(config, "paper", False)) is not True:
+        raise RuntimeError("Paper shadow requires ALPACA_PAPER=true.")
+    if str(getattr(config, "broker_backend", "")).strip().lower() != "alpaca":
+        raise RuntimeError("Paper shadow requires the Alpaca paper broker backend.")
+    expected_account_id = str(os.getenv("ALPACA_EXPECTED_ACCOUNT_ID") or "").strip()
+    if not expected_account_id:
+        raise RuntimeError(
+            "Paper shadow requires ALPACA_EXPECTED_ACCOUNT_ID for exact account binding."
+        )
+    configured_fingerprint = str(
+        getattr(details, "expected_account_fingerprint", None) or ""
+    ).strip().lower()
+    if account_fingerprint(expected_account_id) != configured_fingerprint:
+        raise RuntimeError(
+            "Paper-shadow expected-account binding does not match the configured account."
+        )
 
 
 def _validate_runtime_config_approval(details: object, preview: bool) -> None:
     if preview:
         return
     approved = getattr(details, "runtime_config_approved", None)
-    if approved is not False:
+    runtime_path = getattr(details, "runtime_config_path", None)
+    if approved is True or (approved is None and not runtime_path):
         return
     if os.getenv(ALLOW_UNAPPROVED_RUNTIME_ENV, "").strip().lower() in {"1", "true", "yes"}:
         print(
@@ -460,12 +577,17 @@ def _validate_runtime_config_approval(details: object, preview: bool) -> None:
             "continuing with an unapproved runtime config."
         )
         return
-    runtime_path = getattr(details, "runtime_config_path", None) or "runtime config"
+    runtime_path = runtime_path or "runtime config"
     reasons = list(getattr(details, "runtime_config_rejection_reasons", ()) or ())
-    reasons_text = "; ".join(reasons) if reasons else "no rejection reasons were recorded"
+    if reasons:
+        reasons_text = "; ".join(reasons)
+    elif approved is None:
+        reasons_text = "no explicit source.approved=true marker was recorded"
+    else:
+        reasons_text = "no rejection reasons were recorded"
     raise RuntimeError(
         "Refusing to start live trading with an unapproved runtime config. "
-        f"{runtime_path} is marked approved=false ({reasons_text}). "
+        f"{runtime_path} is not explicitly approved ({reasons_text}). "
         f"To override intentionally, set {ALLOW_UNAPPROVED_RUNTIME_ENV}=true."
     )
 
@@ -513,38 +635,163 @@ def _validate_runtime_baseline(details: object, preview: bool) -> None:
     )
 
 
-def _run_live(preview: bool) -> int:
+def _run_live(preview: bool, *, paper_shadow: bool = False) -> int:
     load_dotenv(PROJECT_ROOT / ".env")
     database_path = resolve_database_path()
     print(f"Database authority: {database_path}")
     live_lock = contextlib.nullcontext()
-    if not preview:
+    execution_lock = contextlib.nullcontext()
+    writer_mode = not preview or paper_shadow
+    if writer_mode:
+        execution_lock = ExecutionLock()
         live_lock = _live_instance_lock()
-    with live_lock:
-        import trading_bot
+    runtime_config_context = (
+        _temporary_env("BOT_RUNTIME_CONFIG_PATH", str(PAPER_SHADOW_CONFIG_PATH))
+        if paper_shadow
+        else contextlib.nullcontext()
+    )
+    with runtime_config_context:
+        with execution_lock:
+            with live_lock:
+                import trading_bot
 
-        details = _attach_baseline_validation(trading_bot.load_config_details())
-        config = details.config
-        session_id = f"live-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
-        _validate_live_runtime(config, preview=preview)
-        _validate_runtime_config_approval(details, preview=preview)
-        _validate_runtime_baseline(details, preview=preview)
-        _render_runtime_summary(config, preview=preview)
-        env_value = "false" if preview else "true"
-        startup_artifact_path: Path | None = None
-        if not preview:
-            startup_artifact_path = _persist_startup_config(
-                details,
-                preview=preview,
-                session_id=session_id,
-                database_path=database_path,
-            )
-        startup_artifact_env = str(startup_artifact_path) if startup_artifact_path is not None else ""
-        with _temporary_env(DATABASE_PATH_ENV, str(database_path)):
-            with _temporary_env("EXECUTE_ORDERS", env_value):
-                with _temporary_env(STARTUP_ARTIFACT_PATH_ENV, startup_artifact_env):
-                    trading_bot.main(config=config, session_id=session_id)
+                details = _attach_baseline_validation(trading_bot.load_config_details())
+                config = details.config
+                mode = "paper-shadow" if paper_shadow else ("preview" if preview else "live")
+                session_id = (
+                    f"{mode}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
+                    f"{uuid4().hex[:8]}"
+                )
+                _validate_live_runtime(config, preview=preview)
+                if paper_shadow:
+                    _validate_paper_shadow_runtime(details)
+                elif not preview and getattr(details, "submission_policy", None) == "deny":
+                    raise RuntimeError(
+                        "The selected runtime profile denies broker order submission."
+                    )
+                approval_preview = preview and not paper_shadow
+                _validate_runtime_config_approval(details, preview=approval_preview)
+                _validate_runtime_baseline(details, preview=approval_preview)
+                _render_runtime_summary(
+                    config,
+                    preview=preview or paper_shadow,
+                    launch_mode=mode,
+                )
+                execute_orders = not preview and not paper_shadow
+                env_value = "true" if execute_orders else "false"
+                startup_artifact_path: Path | None = None
+                if writer_mode:
+                    startup_artifact_path = _persist_startup_config(
+                        details,
+                        preview=preview or paper_shadow,
+                        session_id=session_id,
+                        database_path=database_path,
+                        launch_mode=mode,
+                        execution_enabled=execute_orders,
+                    )
+                startup_artifact_env = (
+                    str(startup_artifact_path)
+                    if startup_artifact_path is not None
+                    else ""
+                )
+                with _temporary_env(DATABASE_PATH_ENV, str(database_path)):
+                    with _temporary_env("EXECUTE_ORDERS", env_value):
+                        with _temporary_env(
+                            STARTUP_ARTIFACT_PATH_ENV,
+                            startup_artifact_env,
+                        ):
+                            trading_bot.main(
+                                config=config,
+                                session_id=session_id,
+                                execute_orders=execute_orders,
+                                require_reconciliation_ready=paper_shadow,
+                                durable_decision_cycles=paper_shadow,
+                            )
     return 0
+
+
+def _run_reconcile() -> int:
+    """Run broker-read-only safety reconciliation without taking the trading lock."""
+
+    load_dotenv(PROJECT_ROOT / ".env")
+    import trading_bot
+    from automation_safety import SafetyReconciler, format_reconciliation
+    from storage import BotStorage
+
+    details = trading_bot.load_config_details()
+    config = details.config
+    database_path = resolve_database_path()
+    if not bool(getattr(config, "paper", False)):
+        report = SafetyReconciler(
+            broker=None,
+            storage=BotStorage(database_path),
+            configured_paper=False,
+        ).reconcile()
+        print(format_reconciliation(report))
+        return 2
+
+    bot = trading_bot.TradeOSBot(
+        config,
+        session_id=f"reconcile-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+    )
+    report = bot.reconcile_broker_safety()
+    print(format_reconciliation(report))
+    return 0 if report.ready else 2
+
+
+def _run_repair_local_state(args: argparse.Namespace) -> int:
+    """Run the local-state repair planner without constructing or starting the bot."""
+
+    load_dotenv(PROJECT_ROOT / ".env")
+    import trading_bot
+    from local_state_repair import RepairSafetyError, execute_repair, format_repair_plan
+    from tradeos.brokers.alpaca_broker import AlpacaBroker
+
+    details = trading_bot.load_config_details()
+    config = details.config
+    configured_paper = bool(getattr(config, "paper", False))
+    if not configured_paper:
+        print("BLOCKED_LOCAL_STATE_PROVENANCE_UNKNOWN")
+        print("Reason: paper environment is not positively configured")
+        return 2
+    api_key = str(os.getenv("ALPACA_API_KEY") or "").strip()
+    api_secret = str(os.getenv("ALPACA_API_SECRET") or "").strip()
+    expected_account_id = str(os.getenv("ALPACA_EXPECTED_ACCOUNT_ID") or "").strip()
+    if not api_key or not api_secret:
+        print("BLOCKED_LOCAL_STATE_PROVENANCE_UNKNOWN")
+        print("Reason: Alpaca credentials are missing")
+        return 2
+
+    broker = AlpacaBroker(
+        api_key=api_key,
+        api_secret=api_secret,
+        paper=True,
+        symbols=[str(args.symbol).strip().upper()],
+        price_stream_feed=str(getattr(config, "live_feed", "iex") or "iex"),
+        latest_data_feed=str(getattr(config, "latest_bar_feed", "iex") or "iex"),
+    )
+    try:
+        plan = execute_repair(
+            broker=broker,
+            database_path=resolve_database_path(),
+            configured_paper=configured_paper,
+            expected_account_id=expected_account_id,
+            symbol=args.symbol,
+            apply=bool(args.apply),
+            repair_id=args.repair_id,
+            approved_db_raw_sha256=args.approved_db_raw_sha256,
+            approved_db_state_sha256=args.approved_db_state_sha256,
+            approved_plan_sha256=args.approved_plan_sha256,
+            approved_evidence_sha256=args.approved_evidence_sha256,
+        )
+    except RepairSafetyError as exc:
+        print("BLOCKED_LOCAL_STATE_PROVENANCE_UNKNOWN")
+        print(f"Reason: {exc}")
+        return 2
+    print(format_repair_plan(plan))
+    if plan.applied:
+        return 0
+    return 0 if plan.application_allowed else 2
 
 
 def _dashboard_url(port: int) -> str:
@@ -615,6 +862,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run_live(preview=False)
     if args.command == "preview":
         return _run_live(preview=True)
+    if args.command == "paper-shadow":
+        return _run_live(preview=True, paper_shadow=True)
+    if args.command == "reconcile":
+        return _run_reconcile()
+    if args.command == "repair-local-state":
+        return _run_repair_local_state(args)
     if args.command == "dashboard":
         return _run_dashboard(args.port)
     if args.command == "backtest":

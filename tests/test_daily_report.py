@@ -32,7 +32,17 @@ def test_load_logs_skips_malformed_lines_and_deduplicates() -> None:
             ),
             encoding="utf-8",
         )
-        for name in ("risk", "execution", "positions"):
+        (log_dir / "execution.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"event": "order.partial_fill", "trace": "A", "order_id": "order-1", "filled_qty": 1.0}),
+                    json.dumps({"event": "order.partial_fill", "trace": "A", "order_id": "order-1", "filled_qty": 2.0}),
+                    json.dumps({"event": "order.partial_fill", "trace": "A", "order_id": "order-1", "filled_qty": 2.0}),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        for name in ("risk", "positions"):
             (log_dir / f"{name}.jsonl").write_text("", encoding="utf-8")
 
         logs = daily_report.load_logs(log_dir)
@@ -42,9 +52,10 @@ def test_load_logs_skips_malformed_lines_and_deduplicates() -> None:
         assert logs["bars"].attrs["malformed_line_count"] == 1
         assert logs["bars"].attrs["duplicate_row_count"] == 1
         assert log_health["malformed_lines"] == 1
-        assert log_health["duplicate_rows"] == 2
+        assert log_health["duplicate_rows"] == 3
         assert signals["total_evaluated"] == 2
         assert signals["buy_signals"] == 1
+        assert logs["execution"]["filled_qty"].tolist() == [1.0, 2.0]
     finally:
         shutil.rmtree(base_dir, ignore_errors=True)
 

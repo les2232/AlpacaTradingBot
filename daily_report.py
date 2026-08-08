@@ -286,8 +286,15 @@ def _dedupe(df: pd.DataFrame) -> pd.DataFrame:
         df.attrs["unique_row_count"] = 0
         return df
 
-    key_columns = [col for col in ("event", "trace") if col in df.columns]
-    deduped = df.drop_duplicates(subset=key_columns or None, keep="first").copy()
+    # A trace identifies one decision context, not one immutable event. Partial
+    # fills, lifecycle transitions, and retries can legitimately share the same
+    # event/trace pair while carrying different state. Only discard exact rows.
+    fingerprints = [
+        json.dumps(record, sort_keys=True, default=str, separators=(",", ":"))
+        for record in df.to_dict(orient="records")
+    ]
+    duplicate_mask = pd.Series(fingerprints, index=df.index).duplicated(keep="first")
+    deduped = df.loc[~duplicate_mask].copy()
     deduped.attrs.update(df.attrs)
     deduped.attrs["duplicate_row_count"] = len(df) - len(deduped)
     deduped.attrs["unique_row_count"] = len(deduped)

@@ -1,6 +1,7 @@
 __pycache__/
 .tmp/
 .pytest_cache/
+.pytest_tmp*/
 build/
 dist/
 *.egg-info/
@@ -10,6 +11,7 @@ bot_history.db-shm
 bot_history.db-wal
 .env
 .live_bot.lock
+.automation_v1.lock
 test_live_lock_*.lock
 test_botlog_*/
 test_botlog_*.db

@@ -1,7 +1,13 @@
 """Smoke tests for BacktestConfig and run_backtest default assumptions."""
 from pathlib import Path
 
-from backtest_runner import BacktestConfig, _summarize_hybrid_branch_stats, run_backtest
+from backtest_runner import (
+    BacktestConfig,
+    _execute_buy,
+    _execute_sell,
+    _summarize_hybrid_branch_stats,
+    run_backtest,
+)
 import inspect
 
 
@@ -181,3 +187,95 @@ def test_summarize_hybrid_branch_stats_classifies_completed_trades_by_origin_bra
     assert stats["mean_reversion"]["wins"] == 1
     assert stats["mean_reversion"]["losses"] == 0
     assert stats["mean_reversion"]["realized_pnl"] == 5.0
+
+
+def test_backtest_counts_closed_trades_separately_from_orders() -> None:
+    symbol = "AMD"
+    results = {
+        "realized_pnl": 0.0,
+        "winning_pnls": [],
+        "losing_pnls": [],
+        "symbol_trade_counts": {symbol: 0},
+        "total_trades": 0,
+        "order_count": 0,
+    }
+    symbol_stats = {
+        symbol: {
+            "realized_pnl": 0.0,
+            "winning_pnls": [],
+            "losing_pnls": [],
+            "cash": 1000.0,
+            "total_trades": 0,
+            "order_count": 0,
+        }
+    }
+    trades = []
+    shares_held = {symbol: 0.0}
+    entry_price = {symbol: 0.0}
+    entry_cost = {symbol: 0.0}
+    hybrid_entry_branch = {symbol: None}
+    entry_bar_index = {symbol: None}
+    latest_mark_price = {symbol: 0.0}
+    position = {symbol: False}
+
+    cash = _execute_buy(
+        results=results,
+        symbol_stats=symbol_stats,
+        trades=trades,
+        symbol=symbol,
+        fill_price=100.0,
+        timestamp_str="2026-01-05T15:30:00Z",
+        position_size=100.0,
+        commission=1.0,
+        cash=1000.0,
+        shares_held=shares_held,
+        entry_price=entry_price,
+        entry_cost=entry_cost,
+        hybrid_entry_branch=hybrid_entry_branch,
+        entry_bar_index=entry_bar_index,
+        latest_mark_price=latest_mark_price,
+        position=position,
+        current_bar_index=0,
+    )
+
+    assert results["total_trades"] == 0
+    assert results["order_count"] == 1
+    assert results["symbol_trade_counts"][symbol] == 0
+
+    zero_float = {symbol: 0.0}
+    zero_int = {symbol: 0}
+    cash = _execute_sell(
+        results=results,
+        symbol_stats=symbol_stats,
+        trades=trades,
+        symbol=symbol,
+        fill_price=110.0,
+        timestamp_str="2026-01-05T15:45:00Z",
+        shares_held=shares_held,
+        entry_price=entry_price,
+        entry_cost=entry_cost,
+        breakout_trailing_high=zero_float.copy(),
+        breakout_range_at_entry=zero_float.copy(),
+        breakout_stored_stop=zero_float.copy(),
+        mean_reversion_target_price=zero_float.copy(),
+        hybrid_entry_branch=hybrid_entry_branch,
+        entry_bar_index=entry_bar_index,
+        wick_fade_stop=zero_float.copy(),
+        wick_fade_target=zero_float.copy(),
+        wick_fade_bars_held=zero_int.copy(),
+        trend_pullback_bars_held=zero_int.copy(),
+        momentum_breakout_bars_held=zero_int.copy(),
+        volatility_expansion_bars_held=zero_int.copy(),
+        latest_mark_price=latest_mark_price,
+        position=position,
+        commission=1.0,
+        cash=cash,
+        current_bar_index=1,
+    )
+
+    assert cash == 1008.0
+    assert results["total_trades"] == 1
+    assert results["order_count"] == 2
+    assert results["symbol_trade_counts"][symbol] == 1
+    assert symbol_stats[symbol]["total_trades"] == 1
+    assert symbol_stats[symbol]["order_count"] == 2

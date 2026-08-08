@@ -17,6 +17,13 @@ class ExecutionResult:
 
 
 class BrokerIntentExecutor:
+    """Non-live clean-room adapter.
+
+    V2 intents do not carry the durable identity required by Automation V1's
+    SubmissionGate, so this adapter is deliberately incapable of reaching a
+    broker submission method.
+    """
+
     def __init__(self, broker: BrokerClient) -> None:
         self.broker = broker
 
@@ -47,16 +54,11 @@ class BrokerIntentExecutor:
                         )
                     )
                     continue
-            order = self.broker.submit_market_order(
-                symbol=intent.symbol,
-                qty=intent.qty,
-                side=intent.side,
-            )
             results.append(
                 ExecutionResult(
                     intent=intent,
-                    status="submitted",
-                    order=order,
+                    status="rejected",
+                    reason="v2_broker_submission_disabled",
                 )
             )
         return tuple(results)

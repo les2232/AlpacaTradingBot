@@ -17,7 +17,6 @@ Usage:
 """
 
 import argparse
-import pickle
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +35,8 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from dataset_integrity import load_verified_manifest
+
 # Resolve paths relative to this file so the script works from any cwd.
 _HERE        = Path(__file__).resolve().parent
 DATASETS_DIR = _HERE.parent / "datasets"
@@ -50,6 +51,7 @@ from ml.feature_pipeline import (
     LABEL_THRESHOLD,
     build_features_multi_symbol,
 )
+from ml.model_artifact import save_model_payload
 
 # ---------------------------------------------------------------------------
 # Config
@@ -86,20 +88,73 @@ def _split_per_symbol(
     train_fraction: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Chronological train/test split applied independently per symbol.
+    Split all symbols at one global timestamp and purge crossing labels.
 
-    Each symbol is split at its own (train_fraction * n) row index so no
-    future data leaks into the training set and all symbols contribute
-    equally to both sets.
+    The cutoff is selected from the globally ordered unique timestamps.  Test
+    rows are strictly later than that cutoff.  The final LABEL_HORIZON
+    candidate training rows for every symbol are purged because their forward
+    return labels can use closes from the test period.
+
+    The cutoff and purge count are attached to both returned frames via
+    ``DataFrame.attrs`` for reporting/model provenance without changing the
+    longstanding two-frame return shape.
     """
-    train_parts, test_parts = [], []
-    for _symbol, group in df.groupby("symbol", sort=True):
-        n     = len(group)
-        split = int(n * train_fraction)
-        train_parts.append(group.iloc[:split])
-        test_parts.append(group.iloc[split:])
-    train_df = pd.concat(train_parts, ignore_index=True)
-    test_df  = pd.concat(test_parts,  ignore_index=True)
+    required = {"symbol", "timestamp"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"_split_per_symbol: missing required columns {missing}")
+    if not 0.0 < train_fraction < 1.0:
+        raise ValueError(f"train_fraction must be between 0 and 1, got {train_fraction}.")
+    if df.empty:
+        raise ValueError("Cannot split an empty feature DataFrame.")
+
+    working = df.copy().reset_index(drop=True)
+    working["_split_timestamp_utc"] = pd.to_datetime(working["timestamp"], utc=True)
+    if working["_split_timestamp_utc"].isna().any():
+        raise ValueError("Cannot split rows with missing or invalid timestamps.")
+
+    unique_timestamps = (
+        working["_split_timestamp_utc"]
+        .drop_duplicates()
+        .sort_values()
+        .reset_index(drop=True)
+    )
+    split_index = int(len(unique_timestamps) * train_fraction)
+    if split_index <= 0 or split_index >= len(unique_timestamps):
+        raise ValueError(
+            "Chronological split requires at least one unique timestamp on each side of the cutoff."
+        )
+    cutoff = unique_timestamps.iloc[split_index - 1]
+
+    train_candidates = working.loc[working["_split_timestamp_utc"] <= cutoff].copy()
+    test_df = working.loc[working["_split_timestamp_utc"] > cutoff].copy()
+
+    # Purge at least one complete forward-label horizon per symbol.  tail()
+    # is intentionally applied after chronological sorting, so missing bars in
+    # one ticker cannot make another ticker's label window cross the boundary.
+    train_candidates = train_candidates.sort_values(["symbol", "_split_timestamp_utc"])
+    purge_indices = train_candidates.groupby("symbol", sort=False).tail(LABEL_HORIZON).index
+    train_df = train_candidates.drop(index=purge_indices)
+    purged_rows = len(purge_indices)
+
+    train_df = train_df.drop(columns="_split_timestamp_utc").reset_index(drop=True)
+    test_df = (
+        test_df.sort_values(["symbol", "_split_timestamp_utc"])
+        .drop(columns="_split_timestamp_utc")
+        .reset_index(drop=True)
+    )
+    if train_df.empty or test_df.empty:
+        raise ValueError(
+            "Chronological split is empty after the label-horizon purge; use more data or a different split."
+        )
+
+    split_metadata = {
+        "chronological_cutoff": cutoff,
+        "label_horizon_purged_per_symbol": LABEL_HORIZON,
+        "purged_rows": purged_rows,
+    }
+    train_df.attrs.update(split_metadata)
+    test_df.attrs.update(split_metadata)
     return train_df, test_df
 
 
@@ -112,9 +167,12 @@ def _print_data_summary(
     train_df: pd.DataFrame,
     test_df:  pd.DataFrame,
 ) -> None:
+    purged_rows = int(train_df.attrs.get("purged_rows", 0))
     total = len(train_df) + len(test_df)
+    feature_rows = total + purged_rows
     print(f"  Raw bars         : {raw_rows:,}")
-    print(f"  Feature rows     : {total:,}  (dropped {raw_rows - total:,} warm-up + label rows)")
+    print(f"  Feature rows     : {feature_rows:,}  (dropped {raw_rows - feature_rows:,} warm-up + label rows)")
+    print(f"  Purged split rows: {purged_rows:,}  ({LABEL_HORIZON} per symbol at the cutoff)")
     print(f"  Train rows       : {len(train_df):,}")
     print(f"  Test  rows       : {len(test_df):,}")
     print()
@@ -124,7 +182,10 @@ def _print_data_summary(
     train_end   = train_df.timestamp.max().strftime("%Y-%m-%d")
     test_start  = test_df.timestamp.min().strftime("%Y-%m-%d")
     test_end    = test_df.timestamp.max().strftime("%Y-%m-%d")
+    cutoff = train_df.attrs.get("chronological_cutoff")
     print(f"  Train period     : {train_start} to {train_end}")
+    if cutoff is not None:
+        print(f"  Global cutoff    : {pd.Timestamp(cutoff).isoformat()}")
     print(f"  Test  period     : {test_start} to {test_end}")
     print()
 
@@ -247,8 +308,7 @@ def _save_model(
             "test_recall":      round(test_metrics["recall"],    4),
         },
     }
-    with open(output_path, "wb") as fh:
-        pickle.dump(payload, fh)
+    save_model_payload(payload, output_path)
     print(f"  Saved: {output_path}")
 
 
@@ -274,6 +334,7 @@ def main() -> None:
     # ── 1. Load and build features ─────────────────────────────────────────
     print()
     print("Loading dataset ...")
+    load_verified_manifest(dataset_path)
     raw = pd.read_parquet(bars_path)
     print(f"  {dataset_path.name}")
     print(f"  {len(raw):,} raw bars  |  {raw['symbol'].nunique()} symbols: "
@@ -285,7 +346,7 @@ def main() -> None:
     print(f"  {len(df):,} feature rows ready")
     print()
 
-    # ── 2. Chronological split per symbol ──────────────────────────────────
+    # ── 2. Global chronological split + per-symbol label purge ─────────────
     print("Splitting data ...")
     train_df, test_df = _split_per_symbol(df, TRAIN_FRACTION)
     _print_data_summary(len(raw), train_df, test_df)

@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from dashboard_state import (
     PersistedBotSnapshot,
     PersistedCycleReport,
@@ -91,7 +93,10 @@ def test_load_dashboard_state_reads_persisted_startup_config(monkeypatch, tmp_pa
         _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 
 
-def test_load_dashboard_state_reports_missing_startup_config(monkeypatch, tmp_path: Path) -> None:
+def test_load_dashboard_state_reports_missing_database_without_creating_it(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     unique = uuid4().hex
     logs_dir = tmp_path / f"test_dashboard_logs_{unique}"
     db_path = tmp_path / f"test_dashboard_state_{unique}.db"
@@ -99,10 +104,9 @@ def test_load_dashboard_state_reports_missing_startup_config(monkeypatch, tmp_pa
     monkeypatch.setenv("BOT_DB_PATH", str(db_path))
 
     try:
-        state = load_dashboard_state()
-
-        assert state.has_persisted_startup_config is False
-        assert state.startup_config is None
+        with pytest.raises(FileNotFoundError, match="read-only database does not exist"):
+            load_dashboard_state()
+        assert not db_path.exists()
     finally:
         _cleanup_dashboard_test_artifacts(logs_dir, db_path)
 

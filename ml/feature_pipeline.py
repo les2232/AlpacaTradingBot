@@ -93,8 +93,16 @@ def _core_features(df: pd.DataFrame) -> pd.DataFrame:
     df["dist_sma_10"] = close / sma_10 - 1.0
     df["dist_sma_20"] = close / sma_20 - 1.0
 
-    # Rolling volatility: std of 1-bar returns over VOL_PERIOD bars
-    df["rolling_vol"] = (close / close.shift(1) - 1.0).rolling(VOL_PERIOD).std()
+    # Rolling volatility: population std of 1-bar returns over VOL_PERIOD bars.
+    # The live/backtest path divides variance by N (not N - 1) and floors the
+    # variance at 1e-12 before taking the square root.  Keep those semantics
+    # here so an offline-trained model sees exactly the same feature values.
+    rolling_variance = (
+        (close / close.shift(1) - 1.0)
+        .rolling(VOL_PERIOD)
+        .var(ddof=0)
+    )
+    df["rolling_vol"] = rolling_variance.clip(lower=1e-12).pow(0.5)
 
     # Volume ratio vs. short-period average
     avg_vol_10 = volume.rolling(SMA_SHORT_PERIOD).mean()
@@ -220,6 +228,8 @@ def build_features_multi_symbol(
 if __name__ == "__main__":
     from pathlib import Path
 
+    from dataset_integrity import load_verified_manifest
+
     datasets_dir = Path(__file__).resolve().parent.parent / "datasets"
     if not datasets_dir.is_dir():
         raise SystemExit("No datasets/ directory found. Run dataset_snapshotter.py first.")
@@ -227,6 +237,7 @@ if __name__ == "__main__":
     dataset_path = max(datasets_dir.iterdir(), key=lambda p: p.stat().st_mtime)
     print(f"Using dataset: {dataset_path.name}")
 
+    load_verified_manifest(dataset_path)
     raw = pd.read_parquet(dataset_path / "bars.parquet")
     print(f"Raw bars: {len(raw)} rows, {raw['symbol'].nunique()} symbols")
 

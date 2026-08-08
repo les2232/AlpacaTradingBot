@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 
 @dataclass(frozen=True)
@@ -34,9 +35,20 @@ class AccountState:
 @dataclass(frozen=True)
 class PositionState:
     symbol: str
-    qty: float
+    qty: Decimal
     avg_entry_price: float | None = None
     current_price: float | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.qty, bool):
+            raise ValueError("Position quantity must be a finite number.")
+        try:
+            quantity = self.qty if isinstance(self.qty, Decimal) else Decimal(str(self.qty))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("Position quantity must be a finite number.") from exc
+        if not quantity.is_finite():
+            raise ValueError("Position quantity must be a finite number.")
+        object.__setattr__(self, "qty", quantity)
 
     @property
     def is_open(self) -> bool:
@@ -57,4 +69,3 @@ class PositionState:
         if self.qty < 0:
             return "short"
         return "flat"
-

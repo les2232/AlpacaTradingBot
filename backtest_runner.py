@@ -2,7 +2,6 @@ import argparse
 import json
 import logging
 import math
-import pickle
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +9,9 @@ from time import perf_counter
 from typing import Any
 
 import pandas as pd
+
+from dataset_integrity import load_verified_manifest
+from ml.model_artifact import ModelArtifactError, load_model_payload
 
 from strategy import (
     BOLLINGER_EXIT_CHOICES,
@@ -403,11 +405,10 @@ def _load_offline_model_payload(model_path: Path = OFFLINE_MODEL_PATH) -> dict[s
             f"Offline ML model not found at {model_path}. "
             "Train it first so ML and HYBRID backtests can use the saved model."
         )
-    with open(model_path, "rb") as fh:
-        payload = pickle.load(fh)
-    if not isinstance(payload, dict) or "model" not in payload or "feature_cols" not in payload:
-        raise RuntimeError("Offline ML model payload is invalid. Expected keys: model, feature_cols.")
-    return payload
+    try:
+        return load_model_payload(model_path)
+    except ModelArtifactError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _model_age_seconds(payload: dict[str, Any]) -> float:
@@ -532,12 +533,9 @@ def _summarize_ml_signals(
 def load_dataset(dataset_path: Path) -> tuple[pd.DataFrame, dict]:
     bars_path = dataset_path / "bars.parquet"
     manifest_path = dataset_path / "manifest.json"
+    manifest = load_verified_manifest(dataset_path)
     df = pd.read_parquet(bars_path)
-    if manifest_path.exists():
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-    else:
-        manifest = {}
+    if not manifest_path.exists():
         logger.warning("Dataset manifest not found at %s; symbol discovery will fall back to dataset content.", manifest_path)
     return df, manifest
 
@@ -701,6 +699,7 @@ def _build_performance_summary(
     final_equity: float,
     max_drawdown_pct: float,
     total_trades: int,
+    order_count: int,
     winning_pnls: list[float],
     losing_pnls: list[float],
     realized_pnl: float,
@@ -737,6 +736,7 @@ def _build_performance_summary(
         "total_return_pct": ((final_equity - starting_capital) / starting_capital * 100) if starting_capital > 0 else 0.0,
         "max_drawdown_pct": max_drawdown_pct,
         "total_trades": total_trades,
+        "order_count": order_count,
         "trades_per_day": total_trades / len(ordered_days) if ordered_days else 0.0,
         "win_rate": len(winning_pnls) / max(1, len(closed)) * 100,
         "avg_winning_trade": sum(winning_pnls) / len(winning_pnls) if winning_pnls else 0.0,
@@ -904,7 +904,9 @@ def _execute_sell(
     volatility_expansion_bars_held[symbol] = 0
     results["symbol_trade_counts"][symbol] += 1
     results["total_trades"] += 1
+    results["order_count"] += 1
     symbol_stat["total_trades"] += 1
+    symbol_stat["order_count"] += 1
     return cash
 
 
@@ -951,9 +953,8 @@ def _execute_buy(
         "timestamp": timestamp_str,
         "entry_branch": entry_branch,
     })
-    results["symbol_trade_counts"][symbol] += 1
-    results["total_trades"] += 1
-    symbol_stat["total_trades"] += 1
+    results["order_count"] += 1
+    symbol_stat["order_count"] += 1
     return cash
 
 
@@ -1347,6 +1348,7 @@ def _initialize_simulation_state(
         "ml_probability_buy": inputs.dummy_ml.buy_threshold,
         "ml_probability_sell": inputs.dummy_ml.sell_threshold,
         "total_trades": 0,
+        "order_count": 0,
         "realized_pnl": 0.0,
         "starting_capital": starting_capital,
         "final_equity": starting_capital,
@@ -1377,6 +1379,7 @@ def _initialize_simulation_state(
             "peak_equity": per_symbol_starting_capital,
             "max_drawdown_pct": 0.0,
             "total_trades": 0,
+            "order_count": 0,
         }
         for symbol in symbols
     }
@@ -2108,6 +2111,7 @@ def _build_final_results(
             final_equity=cash + open_positions_value,
             max_drawdown_pct=max_drawdown_pct,
             total_trades=results["total_trades"],
+            order_count=results["order_count"],
             winning_pnls=results["winning_pnls"],
             losing_pnls=results["losing_pnls"],
             realized_pnl=results["realized_pnl"],
@@ -2125,6 +2129,7 @@ def _build_final_results(
                 final_equity=stats["cash"] + stats["open_positions_value"],
                 max_drawdown_pct=stats["max_drawdown_pct"],
                 total_trades=stats["total_trades"],
+                order_count=stats["order_count"],
                 winning_pnls=stats["winning_pnls"],
                 losing_pnls=stats["losing_pnls"],
                 realized_pnl=stats["realized_pnl"],
@@ -3619,7 +3624,34 @@ def run_walk_forward(
     output_csv: str | None,
     **backtest_kwargs: Any,
 ) -> None:
-    """Orchestrate walk-forward validation and print/write results."""
+    """Orchestrate valid non-ML walk-forward evaluation and report results."""
+    primary_mode = normalize_strategy_mode(
+        str(backtest_kwargs.get("strategy_mode", STRATEGY_MODE_HYBRID))
+    )
+    symbol_mode_map = {
+        str(symbol).strip().upper(): normalize_strategy_mode(str(mode))
+        for symbol, mode in (backtest_kwargs.get("symbol_strategy_modes") or {}).items()
+    }
+    requested_symbols = _normalize_symbol_list(symbols)
+    active_modes = (
+        {symbol_mode_map.get(symbol, primary_mode) for symbol in requested_symbols}
+        if requested_symbols
+        # Without an explicit symbol list, conservatively include the default
+        # and every override because dataset symbol discovery happens later.
+        else {primary_mode, *symbol_mode_map.values()}
+    )
+    ml_dependent_modes = {STRATEGY_MODE_ML, STRATEGY_MODE_HYBRID}
+    if active_modes.intersection(ml_dependent_modes):
+        active_ml_modes = sorted(active_modes.intersection(ml_dependent_modes))
+        raise RuntimeError(
+            "Walk-forward validation cannot run an ML-dependent strategy "
+            f"({', '.join(active_ml_modes)}) with the single pre-trained "
+            "ml/models/logistic_latest.pkl artifact. Fold-local model training and "
+            "provenance are not implemented, so reporting these windows as "
+            "out-of-sample would be contaminated. Use a non-ML strategy or implement "
+            "and verify fold-local training before requesting ML walk-forward results."
+        )
+
     print(f"\nLoading dataset to determine trading days: {dataset_path}")
     trading_days = _get_trading_days(dataset_path)
     print(f"Dataset spans {len(trading_days)} trading days: {trading_days[0]} -> {trading_days[-1]}")
