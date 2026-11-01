@@ -5,6 +5,12 @@ daily_report.py
 Reads the bot's JSONL logs for one trading day and prints a diagnostic
 report comparing live behavior to backtest expectations.
 
+The comparison is fail-closed: when the saved baseline is not valid for
+comparison (BACKTEST_SOURCE["valid_for_comparison"] is not True), BACKTEST
+holds fallback numbers only, so the report says "comparison unavailable" with
+the validation reasons and omits every backtest-relative statement.  Observed
+metrics and absolute WARN thresholds are still reported.
+
 Usage:
     python daily_report.py                      # today
     python daily_report.py --date 2026-04-09
@@ -1084,6 +1090,28 @@ def _flag(value: float, warn_threshold: float, low_is_bad: bool = True) -> str:
         return "WARN" if value > warn_threshold else "ok"
 
 
+def baseline_comparison_status() -> dict[str, Any]:
+    """Fail-closed view of whether live metrics may be compared to BACKTEST.
+
+    ``BACKTEST`` always holds numbers, falling back to ``DEFAULT_BACKTEST``
+    when the saved baseline is missing or fails validation.  Those fallback
+    numbers are not an approved expectation, so every live-vs-backtest
+    statement must be gated on this status rather than on ``BACKTEST`` alone.
+    """
+    if BACKTEST_SOURCE.get("valid_for_comparison") is True:
+        return {"available": True, "status": "available", "reasons": []}
+    reasons = [
+        str(item)
+        for item in (BACKTEST_SOURCE.get("validation_errors") or [])
+        if str(item)
+    ]
+    return {
+        "available": False,
+        "status": "unavailable",
+        "reasons": reasons or ["baseline validation failed"],
+    }
+
+
 def _session_signal_rate(sig: dict) -> tuple[float | None, float | None, float | None]:
     total_evaluated = sig.get("total_evaluated", 0) or 0
     buy_signals = sig.get("buy_signals", 0) or 0
@@ -1281,11 +1309,13 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict, log_health: dic
     Return a list of concern strings.  Empty list = everything looks normal.
     """
     concerns = []
-    n_sym = BACKTEST["symbols"]
-    if BACKTEST_SOURCE.get("valid_for_comparison") is not True:
-        validation_errors = BACKTEST_SOURCE.get("validation_errors") or []
-        detail = "; ".join(str(item) for item in validation_errors if str(item)) or "baseline validation failed"
-        concerns.append(f"BASELINE INVALID: {detail}")
+    comparison = baseline_comparison_status()
+    if not comparison["available"]:
+        detail = "; ".join(comparison["reasons"])
+        concerns.append(
+            f"BASELINE INVALID: {detail} — comparison unavailable; "
+            f"backtest-relative checks (signal rate, session coverage) suppressed"
+        )
 
     # --- Slippage ---
     if ex["avg_slippage_bps"] is not None:
@@ -1301,8 +1331,12 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict, log_health: dic
                 f"(threshold {WARN['worst_slippage_bps']} bps) — check that fill for anomalies"
             )
 
-    # --- Signal rate ---
-    _, coverage_pct, full_day_signal_rate = _session_signal_rate(sig)
+    # --- Signal rate (backtest-relative: only against a valid baseline) ---
+    # Coverage and the full-day equivalent are both derived from the
+    # baseline's symbols/bars_per_day, so they are suppressed with it.
+    coverage_pct = full_day_signal_rate = None
+    if comparison["available"]:
+        _, coverage_pct, full_day_signal_rate = _session_signal_rate(sig)
     if full_day_signal_rate is not None:
         live_rate = full_day_signal_rate
         bt_rate   = BACKTEST["signal_rate_per_symbol_per_day"]
@@ -1408,6 +1442,8 @@ def print_report(
     concerns: list[str],
     log_health: dict | None = None,
 ) -> None:
+    comparison = baseline_comparison_status()
+    comparable = comparison["available"]
     n_sym     = BACKTEST["symbols"]
     bt_bars   = BACKTEST["bars_per_day"]
     divider   = "─" * 60
@@ -1428,13 +1464,17 @@ def print_report(
 
     # ── Data quality ──────────────────────────────────────────────
     section("DATA QUALITY")
-    expected_bars = n_sym * bt_bars
-    row("Bars evaluated",        fmt(bar_q["evaluated"]),
-        f"(expect ~{expected_bars} = {n_sym} syms × {bt_bars} bars)")
+    if comparable:
+        expected_bars = n_sym * bt_bars
+        row("Bars evaluated",        fmt(bar_q["evaluated"]),
+            f"(expect ~{expected_bars} = {n_sym} syms × {bt_bars} bars)")
+    else:
+        row("Bars evaluated",        fmt(bar_q["evaluated"]))
     row("Baseline source",       str(BACKTEST_SOURCE.get("mode", "defaults")))
-    if BACKTEST_SOURCE.get("valid_for_comparison") is not True:
+    if not comparable:
+        row("Backtest comparison",   "unavailable", flag="WARN")
         print("  Baseline validation:")
-        for item in BACKTEST_SOURCE.get("validation_errors", []):
+        for item in comparison["reasons"]:
             print(f"    - {item}")
     avg_age = bar_q["avg_age_s"]
     row("Avg bar age (s)",        fmt(avg_age, ".1f"),
@@ -1452,24 +1492,29 @@ def print_report(
     section("SIGNAL BEHAVIOR")
     total_eval = sig["total_evaluated"]
     buy_count  = sig["buy_signals"]
-    bars_per_symbol_seen, coverage_pct, live_per_sym = _session_signal_rate(sig)
-    if live_per_sym is None:
-        live_per_sym = buy_count / n_sym if n_sym > 0 else 0
-    bt_per_sym   = BACKTEST["signal_rate_per_symbol_per_day"]
-    sig_ratio    = live_per_sym / bt_per_sym if bt_per_sym > 0 else 0
-
+    live_per_sym = None
     row("Total bars evaluated",   fmt(total_eval))
-    row("BUY signals fired",      fmt(buy_count),
-        f"({live_per_sym:.1f}/sym/day equiv  bt={bt_per_sym:.1f}  ratio={sig_ratio:.0%})",
-        flag=_flag(sig_ratio, WARN["signal_rate_pct_of_bt"], low_is_bad=True)
-             if buy_count > 0 else "")
-    row("SELL signals fired",     fmt(sig["sell_signals"]))
-    if coverage_pct is not None:
-        row("Session coverage",    f"{coverage_pct:.0%}",
-            f"(~{bars_per_symbol_seen:.1f}/{BACKTEST['bars_per_day']} bars per symbol observed)")
+    if comparable:
+        bars_per_symbol_seen, coverage_pct, live_per_sym = _session_signal_rate(sig)
+        if live_per_sym is None:
+            live_per_sym = buy_count / n_sym if n_sym > 0 else 0
+        bt_per_sym   = BACKTEST["signal_rate_per_symbol_per_day"]
+        sig_ratio    = live_per_sym / bt_per_sym if bt_per_sym > 0 else 0
+
+        row("BUY signals fired",      fmt(buy_count),
+            f"({live_per_sym:.1f}/sym/day equiv  bt={bt_per_sym:.1f}  ratio={sig_ratio:.0%})",
+            flag=_flag(sig_ratio, WARN["signal_rate_pct_of_bt"], low_is_bad=True)
+                 if buy_count > 0 else "")
+        row("SELL signals fired",     fmt(sig["sell_signals"]))
+        if coverage_pct is not None:
+            row("Session coverage",    f"{coverage_pct:.0%}",
+                f"(~{bars_per_symbol_seen:.1f}/{BACKTEST['bars_per_day']} bars per symbol observed)")
+    else:
+        row("BUY signals fired",      fmt(buy_count))
+        row("SELL signals fired",     fmt(sig["sell_signals"]))
     rej_rate = sig["rejection_rate"]
     row("Rejection rate",         fmt(rej_rate, ".0%") if rej_rate is not None else "n/a",
-        f"(backtest ~{BACKTEST['rejection_rate']:.0%})")
+        f"(backtest ~{BACKTEST['rejection_rate']:.0%})" if comparable else "")
 
     if sig["rejections"]:
         print()
@@ -1493,7 +1538,7 @@ def print_report(
     avg_slip = ex["avg_slippage_bps"]
     worst_slip = ex["worst_slippage_bps"]
     row("Avg slippage (bps)",      fmt(avg_slip, ".1f"),
-        f"(backtest ~{BACKTEST['avg_slippage_bps']:.1f} bps)",
+        f"(backtest ~{BACKTEST['avg_slippage_bps']:.1f} bps)" if comparable else "",
         flag=_flag(avg_slip or 0, WARN["avg_slippage_bps"], low_is_bad=False) if avg_slip else "")
     row("Worst slippage (bps)",    fmt(worst_slip, ".1f"),
         flag=_flag(worst_slip or 0, WARN["worst_slippage_bps"], low_is_bad=False) if worst_slip else "")
@@ -1524,7 +1569,7 @@ def print_report(
     if n_closed >= WARN["min_trades_for_win_rate"] and pos["win_rate"] is not None:
         wr = pos["win_rate"]
         row("Win rate",            fmt(wr, ".0%"),
-            f"(backtest {BACKTEST['win_rate']:.0%})",
+            f"(backtest {BACKTEST['win_rate']:.0%})" if comparable else "",
             flag=_flag(wr, WARN["win_rate_low"], low_is_bad=True))
     elif n_closed > 0:
         row("Win rate",            f"{pos['win_rate']:.0%}" if pos["win_rate"] else "n/a",
@@ -1534,7 +1579,7 @@ def print_report(
 
     avg_hold = pos["avg_hold_bars"]
     row("Avg hold (bars)",         fmt(avg_hold, ".1f"),
-        f"(backtest {BACKTEST['avg_hold_bars']:.1f})")
+        f"(backtest {BACKTEST['avg_hold_bars']:.1f})" if comparable else "")
     row("Avg PnL per trade ($)",   fmt(pos["avg_pnl_usd"], ".2f"))
     row("Total PnL today ($)",     fmt(pos["total_pnl_usd"], ".2f"))
 
@@ -1551,6 +1596,26 @@ def print_report(
 
     # ── Backtest comparison ───────────────────────────────────────
     section("vs BACKTEST COMPARISON")
+    if comparable:
+        _print_backtest_comparison(sig, ex, pos, live_per_sym if buy_count > 0 else None)
+    else:
+        print("  Comparison unavailable: baseline is not valid for comparison.")
+        for item in comparison["reasons"]:
+            print(f"    - {item}")
+
+    # ── Concerns ──────────────────────────────────────────────────
+    section("CONCERNS")
+    if not concerns:
+        print("  No concerns. Live behavior is within expected parameters.")
+    else:
+        for i, c in enumerate(concerns, 1):
+            print(f"  {i}. {c}")
+
+    print(f"\n{'═' * 60}\n")
+
+
+def _print_backtest_comparison(sig: dict, ex: dict, pos: dict, live_per_sym: float | None) -> None:
+    """Live-vs-backtest table.  Callers must check baseline_comparison_status()."""
     print(f"  {'Metric':<32} {'Live':>10}  {'Backtest':>10}  {'Delta':>10}")
     print(f"  {'─'*32} {'─'*10}  {'─'*10}  {'─'*10}")
 
@@ -1567,23 +1632,13 @@ def print_report(
         bt_str = format(bt, fmt_s)
         print(f"  {label:<32} {live_str:>10}  {bt_str:>10}  {delta_str:>10}")
 
-    compare_row("BUY signals/sym/day",   live_per_sym if buy_count > 0 else None,
+    compare_row("BUY signals/sym/day",   live_per_sym,
                 BACKTEST["signal_rate_per_symbol_per_day"])
     compare_row("Win rate",              pos["win_rate"], BACKTEST["win_rate"], ".0%")
     compare_row("Avg hold (bars)",       pos["avg_hold_bars"], BACKTEST["avg_hold_bars"])
     compare_row("Rejection rate",        sig["rejection_rate"], BACKTEST["rejection_rate"], ".0%")
     compare_row("Avg slippage (bps)",    ex["avg_slippage_bps"], BACKTEST["avg_slippage_bps"],
                 invert=True)
-
-    # ── Concerns ──────────────────────────────────────────────────
-    section("CONCERNS")
-    if not concerns:
-        print("  No concerns. Live behavior is within expected parameters.")
-    else:
-        for i, c in enumerate(concerns, 1):
-            print(f"  {i}. {c}")
-
-    print(f"\n{'═' * 60}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1600,9 +1655,16 @@ def build_json_output(
     concerns: list[str],
     log_health: dict | None = None,
 ) -> dict:
+    comparison = baseline_comparison_status()
+    if comparison["available"]:
+        expected: dict[str, Any] = dict(BACKTEST)
+    else:
+        # Fail closed: never publish DEFAULT_BACKTEST fallbacks as expectations.
+        expected = {key: None for key in BACKTEST}
     return {
         "date":          report_date,
         "backtest_source": BACKTEST_SOURCE,
+        "comparison":    comparison,
         "bar_quality":   bar_q,
         "signals":       sig,
         "execution":     ex,
@@ -1610,7 +1672,7 @@ def build_json_output(
         "positions":     pos,
         "concerns":      concerns,
         "log_health":    log_health or {},
-        "backtest":      BACKTEST,
+        "backtest":      expected,
     }
 
 

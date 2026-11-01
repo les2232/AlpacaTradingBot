@@ -268,26 +268,218 @@ def test_load_logs_skips_malformed_lines_and_deduplicates() -> None:
         shutil.rmtree(base_dir, ignore_errors=True)
 
 
-def test_detect_concerns_normalizes_partial_session_signal_rate() -> None:
-    sig = {
+_VALID_BASELINE: dict[str, object] = {
+    "symbols": 15,
+    "bars_per_day": 26,
+    "signal_rate_per_symbol_per_day": 2.1,
+    "win_rate": 0.65,
+    "avg_hold_bars": 4.2,
+    "rejection_rate": 0.72,
+    "avg_slippage_bps": 5.0,
+}
+_INVALID_BASELINE_REASONS = [
+    "promotion pointer results/promotion_current.json is missing",
+    "research config is not approved",
+]
+
+
+@pytest.fixture
+def valid_baseline(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    baseline = dict(_VALID_BASELINE)
+    monkeypatch.setattr(daily_report, "BACKTEST", baseline)
+    monkeypatch.setattr(
+        daily_report,
+        "BACKTEST_SOURCE",
+        {"mode": "live_config+research", "validation_errors": [], "valid_for_comparison": True},
+    )
+    return baseline
+
+
+@pytest.fixture
+def invalid_baseline(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    # BACKTEST still holds the DEFAULT_BACKTEST fallback numbers, exactly as
+    # load_backtest_baseline() returns them when validation fails.
+    baseline = dict(daily_report.DEFAULT_BACKTEST)
+    monkeypatch.setattr(daily_report, "BACKTEST", baseline)
+    monkeypatch.setattr(
+        daily_report,
+        "BACKTEST_SOURCE",
+        {
+            "mode": "defaults",
+            "validation_errors": list(_INVALID_BASELINE_REASONS),
+            "valid_for_comparison": False,
+        },
+    )
+    return baseline
+
+
+def _partial_session_sig() -> dict:
+    return {
         "total_evaluated": 255,
         "buy_signals": 7,
         "sell_signals": 2,
         "hold_count": 246,
-        "by_symbol": {},
-        "rejections": {},
+        "by_symbol": {"AMD": 4, "MSFT": 3},
+        "rejections": {"no_signal": 246},
         "rejection_rate": 246 / 255,
     }
-    concerns = daily_report.detect_concerns(
+
+
+def _quiet_inputs() -> tuple[dict, dict, dict, dict, dict]:
+    return (
         {"evaluated": 255, "avg_age_s": None, "stale_count": 0, "symbols": []},
-        sig,
+        _partial_session_sig(),
         {"submitted_buys": 0, "submitted_sells": 0, "avg_slippage_bps": None, "worst_slippage_bps": None, "partial_fills": 0, "avg_latency_ms": None},
         {"opened": 0, "closed": 0, "win_rate": None, "avg_hold_bars": None, "avg_pnl_usd": None, "exit_reasons": {}, "total_pnl_usd": None},
         {"malformed_lines": 0, "duplicate_rows": 0},
     )
 
+
+def _noisy_inputs() -> tuple[dict, dict, dict, dict, dict]:
+    """Inputs that breach every baseline-independent (absolute) threshold."""
+    return (
+        {"evaluated": 255, "avg_age_s": 300.0, "stale_count": 3, "symbols": []},
+        _partial_session_sig(),
+        {"submitted_buys": 6, "submitted_sells": 6, "avg_slippage_bps": 20.0, "worst_slippage_bps": 55.0, "partial_fills": 1, "avg_latency_ms": 120.0},
+        {"opened": 6, "closed": 6, "win_rate": 1 / 3, "avg_hold_bars": 3.0, "avg_pnl_usd": -1.5, "exit_reasons": {"eod_flatten": 4, "sma_exit": 2}, "total_pnl_usd": -9.0},
+        {"malformed_lines": 2, "duplicate_rows": 1},
+    )
+
+
+def test_detect_concerns_normalizes_partial_session_signal_rate(valid_baseline: dict) -> None:
+    concerns = daily_report.detect_concerns(*_quiet_inputs())
+
     assert any("PARTIAL SESSION" in concern for concern in concerns)
     assert any("SIGNAL RATE LOW" in concern for concern in concerns)
+    assert not any("BASELINE INVALID" in concern for concern in concerns)
+
+
+def test_detect_concerns_flags_high_signal_rate_against_valid_baseline(valid_baseline: dict) -> None:
+    bar_q, sig, ex, pos, log_health = _quiet_inputs()
+    sig = {**sig, "total_evaluated": 390, "buy_signals": 150}  # full session, 10/sym/day
+
+    concerns = daily_report.detect_concerns(bar_q, sig, ex, pos, log_health)
+
+    assert any("SIGNAL RATE HIGH" in concern for concern in concerns)
+    assert not any("PARTIAL SESSION" in concern for concern in concerns)
+
+
+def test_baseline_comparison_status_reflects_baseline_validity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daily_report, "BACKTEST_SOURCE", {"valid_for_comparison": True, "validation_errors": []})
+    assert daily_report.baseline_comparison_status() == {"available": True, "status": "available", "reasons": []}
+
+    for source in (
+        {"valid_for_comparison": False, "validation_errors": []},
+        {"valid_for_comparison": "true", "validation_errors": None},  # truthy but not True
+        {},
+    ):
+        monkeypatch.setattr(daily_report, "BACKTEST_SOURCE", source)
+        assert daily_report.baseline_comparison_status() == {
+            "available": False,
+            "status": "unavailable",
+            "reasons": ["baseline validation failed"],
+        }
+
+
+def test_detect_concerns_suppresses_backtest_relative_checks_when_baseline_invalid(
+    invalid_baseline: dict,
+) -> None:
+    concerns = daily_report.detect_concerns(*_quiet_inputs())
+
+    assert len(concerns) == 1
+    assert concerns[0].startswith("BASELINE INVALID: ")
+    assert "comparison unavailable" in concerns[0]
+    for reason in _INVALID_BASELINE_REASONS:
+        assert reason in concerns[0]
+    assert not any("SIGNAL RATE" in concern for concern in concerns)
+    assert not any("PARTIAL SESSION" in concern for concern in concerns)
+    assert not any("vs backtest" in concern for concern in concerns)
+
+
+def test_detect_concerns_keeps_absolute_threshold_checks_when_baseline_invalid(
+    invalid_baseline: dict,
+) -> None:
+    concerns = daily_report.detect_concerns(*_noisy_inputs())
+    prefixes = [concern.split(":", 1)[0] for concern in concerns]
+
+    assert prefixes == [
+        "BASELINE INVALID",
+        "SLIPPAGE HIGH",
+        "SLIPPAGE SPIKE",
+        "WIN RATE LOW",
+        "EOD EXITS HIGH",
+        "STALE BARS",
+        "BAR LATENCY",
+        "PARTIAL FILLS",
+        "LOG PARSE WARNINGS",
+        "RESTART DUPLICATES",
+    ]
+
+
+def _report_args(inputs: tuple[dict, dict, dict, dict, dict]) -> tuple:
+    bar_q, sig, ex, pos, log_health = inputs
+    risk = {"kill_switch_triggered": False, "buy_blocks_by_reason": {}, "sell_blocks_by_reason": {}}
+    concerns = daily_report.detect_concerns(bar_q, sig, ex, pos, log_health)
+    return ("2026-04-16", bar_q, sig, ex, risk, pos, concerns, log_health)
+
+
+def test_build_json_output_nulls_expectations_when_baseline_invalid(invalid_baseline: dict) -> None:
+    output = daily_report.build_json_output(*_report_args(_noisy_inputs()))
+
+    assert output["comparison"] == {
+        "available": False,
+        "status": "unavailable",
+        "reasons": _INVALID_BASELINE_REASONS,
+    }
+    assert set(output["backtest"]) == set(daily_report.DEFAULT_BACKTEST)
+    assert all(value is None for value in output["backtest"].values())
+    assert not any("SIGNAL RATE" in concern for concern in output["concerns"])
+    # Observed metrics are still reported.
+    assert output["execution"]["avg_slippage_bps"] == 20.0
+    assert output["signals"]["buy_signals"] == 7
+    # The report must stay JSON-serialisable for --json.
+    payload = json.loads(json.dumps(output, default=str))
+    assert payload["backtest"]["signal_rate_per_symbol_per_day"] is None
+    assert payload["comparison"]["available"] is False
+
+
+def test_build_json_output_reports_expectations_when_baseline_valid(valid_baseline: dict) -> None:
+    output = daily_report.build_json_output(*_report_args(_quiet_inputs()))
+
+    assert output["comparison"] == {"available": True, "status": "available", "reasons": []}
+    assert output["backtest"] == valid_baseline
+    assert any("SIGNAL RATE LOW" in concern for concern in output["concerns"])
+
+
+def test_print_report_omits_backtest_expectations_when_baseline_invalid(
+    invalid_baseline: dict, capsys: pytest.CaptureFixture[str]
+) -> None:
+    daily_report.print_report(*_report_args(_noisy_inputs()))
+    out = capsys.readouterr().out
+
+    assert "Comparison unavailable" in out
+    for reason in _INVALID_BASELINE_REASONS:
+        assert reason in out
+    for fallback_marker in ("expect ~", "(backtest", "bt=", "/sym/day", "Session coverage", "Delta"):
+        assert fallback_marker not in out
+    # Absolute-threshold flags and observed values survive.
+    assert "Avg slippage (bps)" in out and "20.0" in out
+    assert "SLIPPAGE HIGH" in out
+
+
+def test_print_report_shows_backtest_comparison_when_baseline_valid(
+    valid_baseline: dict, capsys: pytest.CaptureFixture[str]
+) -> None:
+    daily_report.print_report(*_report_args(_quiet_inputs()))
+    out = capsys.readouterr().out
+
+    assert "(expect ~390 = 15 syms × 26 bars)" in out
+    assert "bt=2.1" in out
+    assert "Session coverage" in out
+    assert "Backtest" in out and "BUY signals/sym/day" in out
+    assert "Comparison unavailable" not in out
 
 
 def test_load_backtest_baseline_uses_pointer_bound_live_and_research_artifacts(
