@@ -596,6 +596,13 @@ def _mix_to_dict(items: tuple[tuple[str, float], ...]) -> dict[str, float]:
     return {key: value for key, value in items}
 
 
+# The rejection_rate_high alert fires when the live rejection rate exceeds the
+# drift policy rate by at least this many points (warn), escalating to err at
+# REJECTION_RATE_ERR_MARGIN.
+REJECTION_RATE_WARN_MARGIN = 0.12
+REJECTION_RATE_ERR_MARGIN = 0.20
+
+
 def _severity_for_ratio(delta_ratio: float) -> str:
     return "err" if delta_ratio >= 0.6 else "warn"
 
@@ -653,17 +660,23 @@ def evaluate_drift(baseline: BaselineProfile, live: LiveMetrics) -> tuple[DriftA
         and live.total_evaluated >= 10
     ):
         delta = live.rejection_rate - baseline.rejection_rate
-        if delta >= 0.12:
+        if delta >= REJECTION_RATE_WARN_MARGIN:
+            # baseline.rejection_rate is the drift policy v1 rate bound into
+            # the promotion, not a research measurement.  The alert fires at
+            # that rate plus REJECTION_RATE_WARN_MARGIN, so the message states
+            # that trigger rather than the policy rate itself.
+            threshold = baseline.rejection_rate + REJECTION_RATE_WARN_MARGIN
             alerts.append(
                 DriftAlert(
                     key="rejection_rate_high",
-                    severity="err" if delta >= 0.2 else "warn",
-                    # baseline.rejection_rate is the drift policy v1 threshold
-                    # bound into the promotion, not a research measurement, so
-                    # the alert must not present it as the validated profile.
+                    severity="err" if delta >= REJECTION_RATE_ERR_MARGIN else "warn",
                     summary="Rejection rate materially exceeds the drift policy threshold.",
                     observed=f"{live.rejection_rate:.0%}",
-                    expected=f"{baseline.rejection_rate:.0%} or lower (drift policy threshold, not research-measured)",
+                    expected=(
+                        f"at most {threshold:.0%} (drift policy rate "
+                        f"{baseline.rejection_rate:.0%} + {REJECTION_RATE_WARN_MARGIN:.0%} "
+                        "margin, not research-measured)"
+                    ),
                     why_it_matters="The bot is rejecting far more setups than the operator drift policy allows. This threshold is a fixed policy value rather than a research result, so treat it as an operational check on filters and data, not as proof the strategy has drifted from research.",
                 )
             )

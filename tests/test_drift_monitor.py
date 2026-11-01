@@ -633,8 +633,7 @@ def test_drift_rejection_expectation_comes_from_bound_profile_not_defaults(
     )
     rejection_alerts = [a for a in report.alerts if a.key == "rejection_rate_high"]
     assert [a.expected for a in rejection_alerts] == [
-        f"{DRIFT_PROFILE_POLICY_V1.rejection_rate:.0%} or lower "
-        "(drift policy threshold, not research-measured)"
+        "at most 84% (drift policy rate 72% + 12% margin, not research-measured)"
     ]
 
 
@@ -660,11 +659,11 @@ def test_rejection_alert_is_labelled_as_policy_threshold(
     )
 
     (alert,) = [a for a in report.alerts if a.key == "rejection_rate_high"]
-    # Same trigger and severity as before: 100% observed vs a 72% threshold.
+    # Same trigger and severity as before: 100% observed vs the 72% policy rate.
     assert alert.severity == "err"
     assert alert.observed == "100%"
     assert alert.summary == "Rejection rate materially exceeds the drift policy threshold."
-    assert alert.expected == "72% or lower (drift policy threshold, not research-measured)"
+    assert alert.expected == "at most 84% (drift policy rate 72% + 12% margin, not research-measured)"
     assert "drift policy" in alert.why_it_matters
     assert "not as proof the strategy has drifted from research" in alert.why_it_matters
     # The policy value is never presented as research evidence.
@@ -692,3 +691,64 @@ def test_drift_profile_rejection_rate_off_policy_fails_closed(
         "rejection rate does not match drift policy v1" in error
         for error in profile.validation_errors
     )
+
+
+def _profile_with_rejection_rate(rate: float) -> drift_monitor.BaselineProfile:
+    return drift_monitor.BaselineProfile(
+        source_label="live_config+research+pointer_drift_profile",
+        valid_for_comparison=True,
+        validation_errors=(),
+        strategy_mode="mean_reversion",
+        symbols=2,
+        bars_per_day=26,
+        buy_signal_rate_per_symbol_per_day=None,
+        sell_signal_rate_per_symbol_per_day=None,
+        rejection_rate=rate,
+        rejection_breakdown=(),
+        hybrid_branch_participation=(),
+        avg_bar_age_s=None,
+        stale_bar_rate=None,
+        trade_count_per_day=None,
+        win_rate=None,
+    )
+
+
+def _rejection_alerts(profile: drift_monitor.BaselineProfile, holds: int, total: int = 100):
+    events = [
+        {"event": "signal.evaluated", "action": "HOLD", "symbol": "AMD", "rejection": "no_signal"}
+        for _ in range(holds)
+    ] + [
+        {"event": "signal.evaluated", "action": "SELL", "symbol": "AMD"}
+        for _ in range(total - holds)
+    ]
+    report = build_drift_report(
+        signal_events=events, bar_events=[], risk_events=[], baseline=profile
+    )
+    return [a for a in report.alerts if a.key == "rejection_rate_high"]
+
+
+@pytest.mark.parametrize(
+    ("holds", "severity"),
+    [(73, None), (83, None), (85, "warn"), (91, "warn"), (93, "err")],
+)
+def test_rejection_alert_states_the_rate_that_actually_triggers_it(
+    holds: int, severity: str | None
+) -> None:
+    profile = _profile_with_rejection_rate(DRIFT_PROFILE_POLICY_V1.rejection_rate)
+
+    alerts = _rejection_alerts(profile, holds)
+
+    # Above the 72% policy rate but within the 12-point margin: no alert, so
+    # the message must not imply that anything above 72% is a breach.
+    if severity is None:
+        assert alerts == []
+        return
+    (alert,) = alerts
+    assert alert.severity == severity
+    assert alert.observed == f"{holds}%"
+    assert alert.expected == (
+        "at most 84% (drift policy rate 72% + 12% margin, not research-measured)"
+    )
+    threshold = DRIFT_PROFILE_POLICY_V1.rejection_rate + drift_monitor.REJECTION_RATE_WARN_MARGIN
+    assert holds / 100 > threshold
+    assert "or lower" not in alert.expected

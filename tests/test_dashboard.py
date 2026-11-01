@@ -462,7 +462,7 @@ def test_drift_panel_derives_numbers_only_from_a_valid_baseline(
     )
     assert "Buy rate 1.30/sym/day" in valid_html
     assert (
-        "Expected: 72% or lower (drift policy threshold, not research-measured)."
+        "Expected: at most 84% (drift policy rate 72% + 12% margin, not research-measured)."
         in valid_html
     )
     assert "Rejection rate materially exceeds the drift policy threshold." in valid_html
