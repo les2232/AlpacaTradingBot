@@ -6,9 +6,11 @@ import uuid
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import run_research
 from drift_monitor import load_baseline_profile
+from tradeos.research_bundle import DRIFT_PROFILE_POLICY_V1
 
 
 def _make_dataset(base_dir: Path, *, symbols: list[str], timeframe: str = "15Min") -> Path:
@@ -52,13 +54,41 @@ def test_build_drift_profile_payload_includes_operator_facing_metrics() -> None:
         assert payload["context"]["symbol_count"] == 3
         assert payload["metrics"]["buy_signal_rate_per_symbol_per_day"] == 2.0
         assert payload["metrics"]["sell_signal_rate_per_symbol_per_day"] == 2.0
-        assert payload["metrics"]["rejection_rate"] == run_research.DEFAULT_BACKTEST["rejection_rate"]
+        assert payload["metrics"]["rejection_rate"] == DRIFT_PROFILE_POLICY_V1.rejection_rate
         assert payload["metrics"]["rejection_breakdown"] is None
         assert payload["metrics"]["hybrid_branch_participation"] is None
         assert payload["metrics"]["avg_bar_age_s"] == run_research.WARN["avg_bar_age_s"]
         assert payload["metrics"]["stale_bar_rate"] == 0.0
     finally:
         shutil.rmtree(base_dir, ignore_errors=True)
+
+
+def test_build_drift_profile_payload_rejection_rate_is_drift_policy_not_default_backtest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import daily_report
+
+    # DEFAULT_BACKTEST["rejection_rate"] is a report placeholder with no
+    # research backing; the drift profile must not copy it.
+    monkeypatch.setitem(daily_report.DEFAULT_BACKTEST, "rejection_rate", 0.123)
+    base_dir = Path.cwd() / f"test_run_research_drift_policy_{uuid.uuid4().hex}"
+    try:
+        dataset_dir = _make_dataset(base_dir, symbols=["AMD", "MSFT"])
+        payload = run_research.build_drift_profile_payload(
+            best_row={"strategy_mode": "mean_reversion", "trades_per_day": 4.0},
+            dataset_path=dataset_dir,
+            approved=True,
+            stability={"stable": True},
+            regime={"regime": "sideways"},
+        )
+    finally:
+        shutil.rmtree(base_dir, ignore_errors=True)
+
+    policy_sources = DRIFT_PROFILE_POLICY_V1.metric_sources()
+    assert payload["metrics"]["rejection_rate"] == DRIFT_PROFILE_POLICY_V1.rejection_rate
+    assert payload["metric_sources"]["rejection_rate"] == policy_sources["rejection_rate"]
+    assert "DEFAULT_BACKTEST" not in json.dumps(payload)
+    assert not hasattr(run_research, "DEFAULT_BACKTEST")
 
 
 def test_build_drift_profile_payload_includes_hybrid_branch_participation() -> None:
