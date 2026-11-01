@@ -3926,7 +3926,19 @@ def _render_operator_header(state: DashboardState, snapshot, recent_orders: list
         components.html(
             """
             <script>
-            window.setTimeout(() => window.parent.location.reload(), 15000);
+            // A full reload starts a new Streamlit session, which would discard an
+            // Ask TradeOS answer and reset the selected tab. Pause while that tab is open.
+            const askTabOpen = () => Array.from(
+                window.parent.document.querySelectorAll('button[role="tab"][aria-selected="true"]')
+            ).some((tab) => (tab.innerText || "").includes("Ask TradeOS"));
+            const tick = () => {
+                if (askTabOpen()) {
+                    window.setTimeout(tick, 15000);
+                    return;
+                }
+                window.parent.location.reload();
+            };
+            window.setTimeout(tick, 15000);
             </script>
             """,
             height=0,

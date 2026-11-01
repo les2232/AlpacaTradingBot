@@ -137,10 +137,48 @@ def _render_answer(package: Any, result: Any) -> None:
             st.json(body, expanded=False)
 
 
+_TAB_CSS = """
+<style>
+.st-key-ask_tradeos, .st-key-ask_tradeos p, .st-key-ask_tradeos li, .st-key-ask_tradeos label,
+.st-key-ask_tradeos h3, .st-key-ask_tradeos h4, .st-key-ask_tradeos input,
+.st-key-ask_tradeos [data-baseweb="select"] div {
+    font-family: var(--font-family-ui, Inter, system-ui, "Segoe UI", sans-serif) !important;
+}
+.st-key-ask_tradeos [data-testid="stWidgetLabel"] p,
+.st-key-ask_tradeos [role="radiogroup"] label p,
+.st-key-ask_tradeos [data-testid="stAlert"] p,
+.st-key-ask_tradeos [data-testid="stAlert"] li,
+.st-key-ask_tradeos [data-testid="stExpander"] summary p {
+    color: var(--text-primary, #E6EDF3) !important;
+}
+.st-key-ask_tradeos [data-testid="stCaptionContainer"],
+.st-key-ask_tradeos [data-testid="stCaptionContainer"] p {
+    color: var(--text-secondary, #9DA7B3) !important;
+}
+.st-key-ask_tradeos code {
+    font-family: 'DM Mono', Consolas, monospace !important;
+    font-size: 0.9em !important;
+    color: var(--text-primary, #E6EDF3) !important;
+    background: rgba(157, 167, 179, 0.16) !important;
+}
+</style>
+"""
+
+
 def render_ask_tradeos_tab(
     *,
     settings_loader: Callable[[], AskSettings] = load_ask_settings,
     client: Any | None = None,
+) -> None:
+    st.markdown(_TAB_CSS, unsafe_allow_html=True)
+    with st.container(key="ask_tradeos"):
+        _render_tab_body(settings_loader=settings_loader, client=client)
+
+
+def _render_tab_body(
+    *,
+    settings_loader: Callable[[], AskSettings],
+    client: Any | None,
 ) -> None:
     st.markdown("### Ask TradeOS")
     st.caption(
