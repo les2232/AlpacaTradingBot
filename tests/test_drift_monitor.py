@@ -9,7 +9,7 @@ import drift_monitor
 import pytest
 from daily_report import PROMOTED_RUNTIME_FIELDS
 from drift_monitor import build_drift_report, compute_live_metrics, evaluate_drift, load_baseline_profile
-from tradeos.research_bundle import generation_directory_component
+from tradeos.research_bundle import DRIFT_PROFILE_POLICY_V1, generation_directory_component
 from tradeos.strategy_contract import (
     CanonicalResolvedPromotedStrategy,
     RUNTIME_FIXED_STRATEGY_ASSUMPTIONS,
@@ -476,3 +476,183 @@ def test_evaluate_drift_returns_no_alerts_when_within_profile(
 
     assert report.alerts == ()
     assert report.within_expected_profile is True
+
+
+_NUMERIC_PROFILE_FIELDS = (
+    "symbols",
+    "bars_per_day",
+    "buy_signal_rate_per_symbol_per_day",
+    "sell_signal_rate_per_symbol_per_day",
+    "rejection_rate",
+    "avg_bar_age_s",
+    "stale_bar_rate",
+    "trade_count_per_day",
+    "win_rate",
+)
+
+_INVALID_SIGNAL_EVENTS = [
+    {"event": "signal.evaluated", "action": "BUY", "symbol": "AMD"},
+    {"event": "signal.evaluated", "action": "BUY", "symbol": "MSFT"},
+] + [
+    {"event": "signal.evaluated", "action": "HOLD", "symbol": "AMD", "rejection": "trend_filter"}
+    for _ in range(38)
+]
+
+
+def _assert_profile_carries_no_numbers(profile: drift_monitor.BaselineProfile) -> None:
+    assert profile.valid_for_comparison is False
+    assert profile.strategy_mode is None
+    for field in _NUMERIC_PROFILE_FIELDS:
+        assert getattr(profile, field) is None, field
+    assert profile.rejection_breakdown == ()
+    assert profile.hybrid_branch_participation == ()
+
+
+def _install_invalid_daily_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exactly what load_backtest_baseline() returns when validation fails:
+    # DEFAULT_BACKTEST placeholders plus validation errors.
+    monkeypatch.setattr(
+        drift_monitor,
+        "load_backtest_baseline",
+        lambda _root: (
+            dict(drift_monitor.DEFAULT_BACKTEST),
+            {
+                "mode": "defaults",
+                "valid_for_comparison": False,
+                "validation_errors": ["promotion pointer is missing or invalid"],
+            },
+        ),
+    )
+
+
+def test_invalid_daily_baseline_profile_carries_no_default_numbers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_invalid_daily_baseline(monkeypatch)
+
+    profile = load_baseline_profile(tmp_path)
+
+    _assert_profile_carries_no_numbers(profile)
+    assert profile.validation_errors == ("promotion pointer is missing or invalid",)
+
+
+def test_missing_baseline_artifacts_profile_carries_no_default_numbers(
+    tmp_path: Path,
+) -> None:
+    # Unpatched loader against an empty repository: nothing validates.
+    profile = load_baseline_profile(tmp_path)
+
+    _assert_profile_carries_no_numbers(profile)
+    assert any("promotion pointer" in error for error in profile.validation_errors)
+
+
+def test_drift_overlay_failure_drops_daily_baseline_numbers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    overlay_path, _, _ = _install_verified_pointer_baseline(
+        monkeypatch,
+        tmp_path,
+        trades_per_day=4.0,
+        win_rate=60.0,
+    )
+    overlay_path.write_text('{"approved":true}', encoding="utf-8")
+
+    profile = load_baseline_profile(tmp_path)
+
+    _assert_profile_carries_no_numbers(profile)
+
+
+def test_invalid_baseline_drift_alerts_never_expect_default_numbers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_invalid_daily_baseline(monkeypatch)
+
+    report = build_drift_report(
+        signal_events=_INVALID_SIGNAL_EVENTS,
+        bar_events=[
+            {"event": "bar.received", "symbol": "AMD", "bar_age_s": 900.0, "stale": True},
+        ],
+        risk_events=[],
+        position_events=[],
+        repo_root=tmp_path,
+    )
+
+    assert [alert.key for alert in report.alerts] == ["baseline_invalid"]
+    assert report.alerts[0].expected == "Approved, runtime-aligned baseline"
+    assert not any(char.isdigit() for alert in report.alerts for char in alert.expected)
+    assert report.within_expected_profile is False
+    # Live per-symbol/day rates need the baseline's session shape; with an
+    # invalid baseline that shape is a placeholder, so no rate is derived.
+    assert report.live.buy_signal_rate_per_symbol_per_day is None
+    assert report.live.sell_signal_rate_per_symbol_per_day is None
+    # Directly observed live metrics are still reported.
+    assert report.live.rejection_rate == 38 / 40
+    assert report.live.avg_bar_age_s == 900.0
+
+
+def test_drift_rejection_expectation_comes_from_bound_profile_not_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_verified_pointer_baseline(
+        monkeypatch,
+        tmp_path,
+        trades_per_day=4.0,
+        win_rate=60.0,
+    )
+    daily_loader = drift_monitor.load_backtest_baseline
+
+    def _daily_baseline_with_placeholder_rejection(root: Path):
+        baseline, source = daily_loader(root)
+        # BACKTEST["rejection_rate"] is a DEFAULT_BACKTEST placeholder; the
+        # drift profile must neither read nor be validated against it.
+        baseline["rejection_rate"] = 0.123
+        return baseline, source
+
+    monkeypatch.setattr(
+        drift_monitor,
+        "load_backtest_baseline",
+        _daily_baseline_with_placeholder_rejection,
+    )
+
+    profile = load_baseline_profile(tmp_path)
+
+    assert profile.valid_for_comparison is True
+    assert profile.rejection_rate == DRIFT_PROFILE_POLICY_V1.rejection_rate
+    report = build_drift_report(
+        signal_events=[
+            {"event": "signal.evaluated", "action": "HOLD", "symbol": "AMD", "rejection": "no_signal"}
+            for _ in range(12)
+        ],
+        bar_events=[],
+        risk_events=[],
+        baseline=profile,
+    )
+    rejection_alerts = [a for a in report.alerts if a.key == "rejection_rate_high"]
+    assert [a.expected for a in rejection_alerts] == [
+        f"{DRIFT_PROFILE_POLICY_V1.rejection_rate:.0%}"
+    ]
+
+
+def test_drift_profile_rejection_rate_off_policy_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_verified_pointer_baseline(
+        monkeypatch,
+        tmp_path,
+        trades_per_day=4.0,
+        win_rate=60.0,
+        metrics_overrides={"rejection_rate": 0.5},
+    )
+
+    profile = load_baseline_profile(tmp_path)
+
+    _assert_profile_carries_no_numbers(profile)
+    assert any(
+        "rejection rate does not match drift policy v1" in error
+        for error in profile.validation_errors
+    )

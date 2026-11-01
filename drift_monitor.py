@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from daily_report import DEFAULT_BACKTEST, WARN, load_backtest_baseline
-from tradeos.research_bundle import load_verified_promotion_pointer
+from tradeos.research_bundle import DRIFT_PROFILE_POLICY_V1, load_verified_promotion_pointer
 
 
 @dataclass(frozen=True)
@@ -289,13 +289,16 @@ def _load_verified_drift_overlay(
         metrics.get("rejection_rate"),
         field="metrics.rejection_rate",
     )
-    baseline_rejection_rate = _safe_float(baseline.get("rejection_rate"))
     if (
         overlay_buy_rate != baseline_buy_rate
         or overlay_sell_rate != baseline_buy_rate
-        or overlay_rejection_rate != baseline_rejection_rate
     ):
         raise ValueError("drift projection metrics contradict the daily baseline")
+    # The daily baseline has no research-backed rejection rate (its BACKTEST
+    # value is a DEFAULT_BACKTEST placeholder), so the bound drift profile is
+    # pinned to the versioned policy its producer writes instead.
+    if overlay_rejection_rate != DRIFT_PROFILE_POLICY_V1.rejection_rate:
+        raise ValueError("drift projection rejection rate does not match drift policy v1")
     avg_bar_age_s = _strict_finite_number(
         metrics.get("avg_bar_age_s"),
         field="metrics.avg_bar_age_s",
@@ -378,6 +381,29 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
     if overlay is not None:
         source_parts.append("pointer_drift_profile")
 
+    if source.get("valid_for_comparison") is not True or not isinstance(overlay, dict):
+        # Fail closed: an invalid baseline's numbers are DEFAULT_BACKTEST
+        # placeholders (or unvalidated live/research values).  Carry none of
+        # them, so neither drift expectations nor live per-symbol/day rates
+        # normalized by placeholder symbols/bars_per_day can reach the panel.
+        return BaselineProfile(
+            source_label="+".join(source_parts),
+            valid_for_comparison=False,
+            validation_errors=tuple(validation_errors),
+            strategy_mode=None,
+            symbols=None,
+            bars_per_day=None,
+            buy_signal_rate_per_symbol_per_day=None,
+            sell_signal_rate_per_symbol_per_day=None,
+            rejection_rate=None,
+            rejection_breakdown=(),
+            hybrid_branch_participation=(),
+            avg_bar_age_s=None,
+            stale_bar_rate=None,
+            trade_count_per_day=None,
+            win_rate=None,
+        )
+
     return BaselineProfile(
         source_label="+".join(source_parts),
         valid_for_comparison=source.get("valid_for_comparison") is True,
@@ -387,7 +413,7 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
         bars_per_day=_safe_int(baseline.get("bars_per_day")),
         buy_signal_rate_per_symbol_per_day=buy_rate,
         sell_signal_rate_per_symbol_per_day=sell_rate,
-        rejection_rate=_safe_float(baseline.get("rejection_rate")),
+        rejection_rate=_safe_float(overlay["metrics"]["rejection_rate"]),
         rejection_breakdown=rejection_breakdown,
         hybrid_branch_participation=hybrid_branch_participation,
         avg_bar_age_s=avg_bar_age_s,

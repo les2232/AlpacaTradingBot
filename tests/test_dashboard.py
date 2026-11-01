@@ -415,3 +415,87 @@ def test_drilldown_panel_keeps_timestamp_markup() -> None:
 
     assert "<br><span" in html
     assert "&lt;span" not in html
+
+
+def _drift_events() -> list[dict]:
+    return [
+        {"event": "signal.evaluated", "action": "BUY", "symbol": "AMD"},
+        {"event": "signal.evaluated", "action": "BUY", "symbol": "MSFT"},
+    ] + [
+        {"event": "signal.evaluated", "action": "HOLD", "symbol": "AMD", "rejection": "trend_filter"}
+        for _ in range(38)
+    ]
+
+
+def test_drift_panel_derives_numbers_only_from_a_valid_baseline(
+    monkeypatch, tmp_path
+) -> None:
+    import drift_monitor
+
+    # Valid baseline: the live buy rate (normalized by the validated session
+    # shape) and the drift-profile expectation are shown.
+    valid_profile = BaselineProfile(
+        source_label="live_config+research+pointer_drift_profile",
+        valid_for_comparison=True,
+        validation_errors=(),
+        strategy_mode="mean_reversion",
+        symbols=2,
+        bars_per_day=26,
+        buy_signal_rate_per_symbol_per_day=2.0,
+        sell_signal_rate_per_symbol_per_day=2.0,
+        rejection_rate=0.72,
+        rejection_breakdown=(),
+        hybrid_branch_participation=(),
+        avg_bar_age_s=240.0,
+        stale_bar_rate=0.0,
+        trade_count_per_day=4.0,
+        win_rate=0.6,
+    )
+    valid_html = dashboard._drift_summary_html(
+        drift_monitor.build_drift_report(
+            signal_events=_drift_events(),
+            bar_events=[],
+            risk_events=[],
+            baseline=valid_profile,
+        )
+    )
+    assert "Buy rate 1.30/sym/day" in valid_html
+    assert "Expected: 72%" in valid_html
+
+    # Invalid baseline: load_backtest_baseline() returns DEFAULT_BACKTEST
+    # placeholders, none of which may reach the panel.
+    monkeypatch.setattr(
+        drift_monitor,
+        "load_backtest_baseline",
+        lambda _root: (
+            dict(drift_monitor.DEFAULT_BACKTEST),
+            {
+                "mode": "defaults",
+                "valid_for_comparison": False,
+                "validation_errors": ["promotion pointer is missing or invalid"],
+            },
+        ),
+    )
+    html = dashboard._drift_summary_html(
+        drift_monitor.build_drift_report(
+            signal_events=_drift_events(),
+            bar_events=[],
+            risk_events=[],
+            repo_root=tmp_path,
+        )
+    )
+
+    assert "Expected: Approved, runtime-aligned baseline." in html
+    # No placeholder expectation and no rate normalized by placeholder
+    # symbols/bars_per_day.
+    assert "Buy rate" not in html
+    assert "/sym/day" not in html
+    default = drift_monitor.DEFAULT_BACKTEST
+    for placeholder in (
+        f"{default['signal_rate_per_symbol_per_day']:.2f}",
+        f"{default['rejection_rate']:.0%}",
+        f"{default['win_rate']:.0%}",
+    ):
+        assert placeholder not in html
+    # The directly observed live rejection rate is still shown.
+    assert "Rejections 95%" in html
