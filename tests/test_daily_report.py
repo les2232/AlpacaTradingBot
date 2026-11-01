@@ -1790,3 +1790,62 @@ def test_print_report_shows_small_sample_win_rate_including_zero(
     ]
     assert win_rate_line.split()[2] == expected_value
     assert "(only 3 trade(s) — not meaningful yet)" in win_rate_line
+
+
+def _full_session_sig(buy_signals: int) -> dict:
+    # 15 symbols x 26 bars: a full session, so no PARTIAL SESSION concern.
+    return {
+        "total_evaluated": 390,
+        "buy_signals": buy_signals,
+        "sell_signals": 0,
+        "hold_count": 390 - buy_signals,
+        "by_symbol": {},
+        "rejections": {},
+        "rejection_rate": (390 - buy_signals) / 390,
+    }
+
+
+@pytest.mark.parametrize("buy_signals", [30, 0])
+def test_zero_research_signal_rate_never_reports_signal_rate_low(
+    valid_baseline: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    buy_signals: int,
+) -> None:
+    valid_baseline["signal_rate_per_symbol_per_day"] = 0.0
+    bar_q, _sig, ex, pos, log_health = _quiet_inputs()
+    sig = _full_session_sig(buy_signals)
+
+    concerns = daily_report.detect_concerns(bar_q, sig, ex, pos, log_health)
+
+    assert not any("SIGNAL RATE LOW" in concern for concern in concerns)
+    signal_concerns = [c for c in concerns if c.startswith("SIGNAL RATE")]
+    if buy_signals:
+        # Live 2.0/symbol/day is above a zero research rate, never below it.
+        assert signal_concerns == [
+            "SIGNAL RATE HIGH: 2.0/symbol/day vs backtest 0.0 (research expected "
+            "no BUY signals) — filter may not be applying correctly in live"
+        ]
+    else:
+        assert signal_concerns == []
+
+    daily_report.print_report(
+        "2026-04-16", bar_q, sig, ex,
+        {"kill_switch_triggered": False, "buy_blocks_by_reason": {}, "sell_blocks_by_reason": {}},
+        pos, concerns, log_health,
+    )
+    out = capsys.readouterr().out
+    (buy_row,) = [line for line in out.splitlines() if "BUY signals fired" in line]
+    assert "bt=0.0  ratio=n/a" in buy_row
+    assert "[WARN]" not in buy_row
+    assert "ratio=0%" not in out
+
+    # Invalid baseline: the zero rate is a placeholder and is never compared.
+    monkeypatch.setitem(daily_report.BACKTEST_SOURCE, "valid_for_comparison", False)
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE, "validation_errors", list(_INVALID_BASELINE_REASONS)
+    )
+    invalid_concerns = daily_report.detect_concerns(bar_q, sig, ex, pos, log_health)
+    assert invalid_concerns[0].startswith("BASELINE INVALID: ")
+    assert not any(c.startswith("SIGNAL RATE") for c in invalid_concerns)
+

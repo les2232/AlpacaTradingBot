@@ -1488,16 +1488,24 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict, log_health: dic
     if full_day_signal_rate is not None:
         live_rate = full_day_signal_rate
         bt_rate   = BACKTEST["signal_rate_per_symbol_per_day"]
-        ratio     = live_rate / bt_rate if bt_rate > 0 else 0
-        if ratio < WARN["signal_rate_pct_of_bt"]:
-            concerns.append(
-                f"SIGNAL RATE LOW: {live_rate:.1f}/symbol/day vs backtest {bt_rate} "
-                f"({ratio:.0%} of backtest) — live filters may differ from backtest"
-            )
-        if ratio > WARN["signal_rate_pct_of_bt_hi"]:
+        if bt_rate > 0:
+            ratio = live_rate / bt_rate
+            if ratio < WARN["signal_rate_pct_of_bt"]:
+                concerns.append(
+                    f"SIGNAL RATE LOW: {live_rate:.1f}/symbol/day vs backtest {bt_rate} "
+                    f"({ratio:.0%} of backtest) — live filters may differ from backtest"
+                )
+            if ratio > WARN["signal_rate_pct_of_bt_hi"]:
+                concerns.append(
+                    f"SIGNAL RATE HIGH: {live_rate:.1f}/symbol/day vs backtest {bt_rate} "
+                    f"({ratio:.0%} of backtest) — filter may not be applying correctly in live"
+                )
+        elif live_rate > 0:
+            # A zero research rate makes the ratio undefined; any live BUY
+            # signal is above it, never below it.
             concerns.append(
                 f"SIGNAL RATE HIGH: {live_rate:.1f}/symbol/day vs backtest {bt_rate} "
-                f"({ratio:.0%} of backtest) — filter may not be applying correctly in live"
+                f"(research expected no BUY signals) — filter may not be applying correctly in live"
             )
         if coverage_pct is not None and coverage_pct < 1.0:
             concerns.append(
@@ -1660,12 +1668,14 @@ def print_report(
         if live_per_sym is None:
             live_per_sym = buy_count / n_sym if n_sym > 0 else 0
         bt_per_sym   = BACKTEST["signal_rate_per_symbol_per_day"]
-        sig_ratio    = live_per_sym / bt_per_sym if bt_per_sym > 0 else 0
+        # A zero research rate makes the ratio undefined: show n/a, not 0%.
+        sig_ratio    = live_per_sym / bt_per_sym if bt_per_sym > 0 else None
 
         row("BUY signals fired",      fmt(buy_count),
-            f"({live_per_sym:.1f}/sym/day equiv  bt={bt_per_sym:.1f}  ratio={sig_ratio:.0%})",
+            f"({live_per_sym:.1f}/sym/day equiv  bt={bt_per_sym:.1f}  "
+            f"ratio={fmt(sig_ratio, '.0%')})",
             flag=_flag(sig_ratio, WARN["signal_rate_pct_of_bt"], low_is_bad=True)
-                 if buy_count > 0 else "")
+                 if buy_count > 0 and sig_ratio is not None else "")
         row("SELL signals fired",     fmt(sig["sell_signals"]))
         if coverage_pct is not None:
             row("Session coverage",    f"{coverage_pct:.0%}",
