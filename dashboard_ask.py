@@ -122,7 +122,7 @@ def _render_answer(package: Any, result: Any) -> None:
 
     with st.expander(f"All evidence in the request ({len(package.items)} items)", expanded=False):
         rows = [{"id": i.id, "kind": i.kind, "title": i.title, "source": i.source} for i in package.items]
-        st.dataframe(rows, hide_index=True, width="stretch")
+        st.dataframe(rows, hide_index=True)
 
     if result.request_body is not None:
         with st.expander("Exact model request body (no credentials)", expanded=False):
