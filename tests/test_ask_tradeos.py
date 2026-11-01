@@ -789,3 +789,13 @@ def test_full_dashboard_exposes_ask_tab_even_when_state_fails(ui_env, tmp_path: 
     at = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "dashboard.py"), default_timeout=60)
     at.run()
     assert any(b.label == "Show calculated diagnostics" for b in at.button)
+
+
+def test_dashboard_sources_have_no_double_encoded_text() -> None:
+    """UTF-8 text re-saved as cp1252 shows up as 'â€”' etc. in the operator UI."""
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("dashboard.py", "dashboard_ask.py", *(str(p.relative_to(root)) for p in (root / "tradeos" / "ask").glob("*.py"))):
+        text = (root / name).read_text(encoding="utf-8")
+        for marker in ("â€", "â”", "â†", "â‰", "Ã"):
+            assert marker not in text, f"double-encoded text {marker!r} in {name}"

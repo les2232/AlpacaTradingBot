@@ -71,7 +71,7 @@ def _resync_status_summary(state: DashboardState) -> tuple[str, str, str]:
     return f"Resync {status.lower()}", f"Startup reconciliation reported {status}.", "warn"
 
 
-# â”€â”€ CSS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── CSS ───────────────────────────────────────────────────────────────────────
 
 def _inject_css() -> None:
     st.markdown(
@@ -173,7 +173,7 @@ def _inject_css() -> None:
         .dot-rest  { background: #facc15; }
         .dot-error { background: #f87171; }
 
-        /* Badges â€” rectangular chip style, DM Mono, semi-transparent tints */
+        /* Badges — rectangular chip style, DM Mono, semi-transparent tints */
         .badge {
             display: inline-block;
             border-radius: 4px;
@@ -264,7 +264,7 @@ def _inject_css() -> None:
             font-weight: 600;
         }
 
-        /* â”€â”€ v2 dashboard layout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        /* ── v2 dashboard layout ─────────────────────────────────── */
         .config-stack {
             display: flex;
             flex-direction: column;
@@ -585,7 +585,7 @@ def _inject_css() -> None:
         /* Tabs */
         [data-testid="stTabs"] { margin-top: 0.1rem; }
 
-        /* Watchlist card+button overlay â€” button is an invisible full-cover click target */
+        /* Watchlist card+button overlay — button is an invisible full-cover click target */
         [data-testid="column"]:first-child > [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlock"] {
             position: relative;
         }
@@ -1650,7 +1650,7 @@ def _inject_css() -> None:
             color: #7db6f7;
             letter-spacing: 0.04em;
         }
-        /* Near-miss symbol chip â€” amber tint to signal "almost" */
+        /* Near-miss symbol chip — amber tint to signal "almost" */
         .miss-sym {
             font-family: 'DM Mono', monospace;
             font-size: 0.78rem;
@@ -2109,7 +2109,7 @@ def _inject_css() -> None:
             .action-card { min-width: 0; }
         }
 
-        /* â”€â”€ Trade Decision Drilldown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+        /* ── Trade Decision Drilldown ────────────────────────────── */
         .dd-shell {
             padding: 22px 24px 20px;
             border-radius: 22px;
@@ -2684,9 +2684,9 @@ def _inject_css() -> None:
     )
 
 
-# â”€â”€ Bot singleton â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Bot singleton ─────────────────────────────────────────────────────────────
 
-# â”€â”€ Utilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
 def parse_mixed_iso_timestamps(values: pd.Series) -> pd.Series:
     try:
@@ -2704,7 +2704,7 @@ def _fmt_money(v: float) -> str:
 
 def _fmt_optional_money(v) -> str:
     if v is None or pd.isna(v):
-        return "â€”"
+        return "—"
     return _fmt_money(float(v))
 
 
@@ -2744,7 +2744,7 @@ def _get_bar_timing(timeframe_minutes: int) -> dict[str, object]:
     }
 
 
-# â”€â”€ HTML builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── HTML builders ─────────────────────────────────────────────────────────────
 
 def _ml_bar_html(
     prob: float | None,
@@ -2753,7 +2753,7 @@ def _ml_bar_html(
     confidence: float | None,
 ) -> str:
     if prob is None:
-        return "<div class='ml-wrap'><div class='ml-label'>ML Probability â€” n/a</div></div>"
+        return "<div class='ml-wrap'><div class='ml-label'>ML Probability — n/a</div></div>"
     pct = min(max(prob * 100, 0), 100)
     if buy_thr is not None and prob >= buy_thr:
         fill_color = "#4ade80"
@@ -2790,7 +2790,7 @@ def _ml_mini_bar_html(
     buy_thr: float | None,
     sell_thr: float | None,
 ) -> str:
-    """Compact track-only ML bar for watchlist cards â€” no labels, no axis."""
+    """Compact track-only ML bar for watchlist cards — no labels, no axis."""
     if prob is None:
         return ""
     pct = min(max(prob * 100, 0), 100)
@@ -2873,7 +2873,7 @@ def _decision_log_outcome_badge(outcome: str, tone: str) -> str:
 
 
 def _escape_html(value) -> str:
-    return html.escape(str(value if value not in (None, "") else "â€”"))
+    return html.escape(str(value if value not in (None, "") else "—"))
 
 
 def _config_stat_html(label: str, value, subtext: str | None = None) -> str:
@@ -2992,7 +2992,7 @@ def _render_bar_timing(bot) -> None:
     )
 
 
-# â”€â”€ Drilldown panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Drilldown panel ───────────────────────────────────────────────────────────
 
 def _drilldown_label(event: DrilldownEvent) -> str:
     """Short selector label for one drilldown event."""
@@ -3002,7 +3002,7 @@ def _drilldown_label(event: DrilldownEvent) -> str:
         "risk.check": "risk",
         "position.closed": "exit",
     }.get(event.event_type, event.event_type)
-    action = event.action or "â€”"
+    action = event.action or "—"
     return f"{event.symbol}  {time_str}  [{etype_short}]  {action}"
 
 
@@ -3075,22 +3075,22 @@ def _drilldown_path_html(event: DrilldownEvent) -> str:
             outcome_note = f"reason: {_pretty_reason(event.rejection)}"
         else:
             outcome_note = "no actionable signal"
-        _step("â†’ Decision", f"<span class='badge {action_cls}'>{action}</span>", outcome_note)
+        _step("→ Decision", f"<span class='badge {action_cls}'>{action}</span>", outcome_note)
 
     elif et == "risk.check":
         action = (event.action or "").upper()
         action_cls = {"BUY": "b-buy", "SELL": "b-sell"}.get(action, "b-hold")
-        _step("Signal direction", f"<span class='badge {action_cls}'>{action or 'â€”'}</span>")
+        _step("Signal direction", f"<span class='badge {action_cls}'>{action or '—'}</span>")
         if event.allowed is True:
             _step("Risk gate", "<span class='dd-pass'>PASSED</span>", "all checks cleared")
         elif event.allowed is False:
             block_note = _pretty_reason(event.block_reason) if event.block_reason else "reason unknown"
             _step("Risk gate", "<span class='dd-reject'>BLOCKED</span>", block_note)
         else:
-            _step("Risk gate", "<span class='dd-step-val'>â€”</span>")
+            _step("Risk gate", "<span class='dd-step-val'>—</span>")
 
     elif et == "position.closed":
-        exit_label = _escape_html(event.exit_reason or "â€”")
+        exit_label = _escape_html(event.exit_reason or "—")
         exit_note = _pretty_reason(event.exit_reason) if event.exit_reason else ""
         _step("Exit trigger", f"<span class='dd-step-val'>{exit_label}</span>", exit_note)
         if event.pnl_usd is not None:
@@ -3131,7 +3131,7 @@ def _drilldown_panel_html(event: DrilldownEvent) -> str:
     }.get(et, "b-nosignal")
     action_badge_cls = {"BUY": "b-buy", "SELL": "b-sell", "HOLD": "b-hold"}.get(action, "b-nosignal")
 
-    ts_str = _format_datetime_pretty(event.timestamp_utc) if event.timestamp_utc else "â€”"
+    ts_str = _format_datetime_pretty(event.timestamp_utc) if event.timestamp_utc else "—"
 
     # Allowed / blocked display
     if event.allowed is True:
@@ -3143,14 +3143,14 @@ def _drilldown_panel_html(event: DrilldownEvent) -> str:
 
     # Primary rejection/block reason
     reason_raw = event.block_reason or event.rejection or event.exit_reason
-    reason_html = _escape_html(_pretty_reason(reason_raw) if reason_raw else "â€”")
+    reason_html = _escape_html(_pretty_reason(reason_raw) if reason_raw else "—")
 
     fields: list[str] = [
-        _kv("Symbol", _escape_html(event.symbol or "â€”")),
+        _kv("Symbol", _escape_html(event.symbol or "—")),
         _kv("Timestamp", ts_str),
         _kv("Event type", _escape_html(etype_label)),
-        _kv("Action", _escape_html(action or "â€”")),
-        _kv("Strategy mode", _escape_html(event.strategy_mode or "â€”")),
+        _kv("Action", _escape_html(action or "—")),
+        _kv("Strategy mode", _escape_html(event.strategy_mode or "—")),
         _kv("Allowed / blocked", allowed_html),
         _kv("Rejection / reason", reason_html),
     ]
@@ -3176,7 +3176,7 @@ def _drilldown_panel_html(event: DrilldownEvent) -> str:
         "<div class='dd-header'>"
         f"<span class='dd-symbol'>{_escape_html(event.symbol)}</span>"
         f"<span class='badge {etype_cls}'>{etype_label}</span>"
-        f"<span class='badge {action_badge_cls}'>{action or 'â€”'}</span>"
+        f"<span class='badge {action_badge_cls}'>{action or '—'}</span>"
         f"<span class='dd-ts'>{ts_str}</span>"
         "</div>"
         f"{''.join(fields)}"
@@ -3237,7 +3237,7 @@ def _normalize_decision_log_rows(candidates: list[DrilldownEvent]) -> list[dict[
                 "timestamp": timestamp,
                 "timestamp_label": _compact_time_str(event.timestamp_utc),
                 "timestamp_full": _format_datetime_pretty(event.timestamp_utc),
-                "symbol": event.symbol or "â€”",
+                "symbol": event.symbol or "—",
                 "event_type": event.event_type,
                 "event_type_label": event_type_label,
                 "outcome": outcome,
@@ -3441,11 +3441,11 @@ def _render_drilldown(state: DashboardState) -> None:
         _render_decision_log_detail(selected_row)
 
 
-# â”€â”€ Error page â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Error page ────────────────────────────────────────────────────────────────
 
 def render_startup_error(exc: Exception) -> None:
     st.markdown(
-        "<div class='ks-banner'>Bot initialization failed â€” see details below</div>",
+        "<div class='ks-banner'>Bot initialization failed — see details below</div>",
         unsafe_allow_html=True,
     )
     st.error(f"{type(exc).__name__}: {exc}")
@@ -3459,7 +3459,7 @@ def render_startup_error(exc: Exception) -> None:
         st.exception(exc)
 
 
-# â”€â”€ Orders helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Orders helper ─────────────────────────────────────────────────────────────
 
 def _orders_dataframe(recent_orders: list) -> pd.DataFrame:
     if not recent_orders:
@@ -3793,7 +3793,7 @@ def _operator_header_html(state: DashboardState, snapshot, recent_orders: list) 
     )
 
 
-# â”€â”€ v2 HTML builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── v2 HTML builders ─────────────────────────────────────────────────────────
 
 def _build_operator_header_summary(state: DashboardState, snapshot, recent_orders: list) -> dict[str, object]:
     runtime_mode = _runtime_mode_label(state)
@@ -4318,7 +4318,7 @@ def _sym_card_v2_html(
         extra_cls = ""
 
     state_cls = {"BUY": "sym-s-buy", "SELL": "sym-s-sell"}.get(action, "")
-    price_str = f"${item.price:,.2f}" if item.price is not None else "â€”"
+    price_str = f"${item.price:,.2f}" if item.price is not None else "—"
     change_str = "n/a"
     if item.sma is not None and item.price is not None and item.sma != 0:
         delta = (item.price - item.sma) / item.sma * 100
@@ -4506,7 +4506,7 @@ def _timestamp_html(primary: str, secondary: str | None = None) -> str:
 
 def _compact_time_str(value: str | None) -> str:
     if not value:
-        return "â€”"
+        return "—"
     try:
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if dt.tzinfo is not None:
@@ -4546,7 +4546,7 @@ def _format_datetime_pretty(value, include_time: bool = True) -> str:
         fmt = "%b %d, %Y · %I:%M %p ET" if include_time else "%b %d, %Y"
         return html.escape(parsed.strftime(fmt).replace(" 0", " "))
     if value in (None, ""):
-        return "â€”"
+        return "—"
     return html.escape(str(value))
 
 
@@ -4648,8 +4648,8 @@ def _execution_panel_html(recent_execution_activity: list) -> str:
     rows: list[str] = []
     for item in recent_execution_activity[:5]:
         time_str = _compact_time_str(item.observed_at_utc)
-        qty_str = f"{float(item.qty):.2f} sh" if item.qty is not None else "â€”"
-        price_str = f"${float(item.price):,.2f}" if item.price is not None else "â€”"
+        qty_str = f"{float(item.qty):.2f} sh" if item.qty is not None else "—"
+        price_str = f"${float(item.price):,.2f}" if item.price is not None else "—"
         reason_text = _pretty_reason(item.reason)
         side = (item.side or "HOLD").upper()
         row_cls = side.lower()
@@ -4945,7 +4945,7 @@ def _render_detail_panel(
     *,
     ml_enabled: bool = True,
 ) -> None:
-    price_str = f"${item.price:,.2f}" if item.price is not None else "â€”"
+    price_str = f"${item.price:,.2f}" if item.price is not None else "—"
     try:
         sym_history = pd.DataFrame(storage.get_symbol_history(item.symbol, limit=20))
     except Exception:
@@ -4956,7 +4956,7 @@ def _render_detail_panel(
     else:
         error_text = ""
 
-    pos_str = "â€”"
+    pos_str = "—"
     if pos_row is not None:
         mv = _fmt_money(float(pos_row.get("market_value") or 0.0))
         qty = f"{float(pos_row.get('qty') or 0.0):.2f} sh"
@@ -4964,21 +4964,21 @@ def _render_detail_panel(
     hold_str = (
         f"{item.holding_minutes:.0f} min"
         if item.holding and item.holding_minutes is not None
-        else "â€”"
+        else "—"
     )
-    sma_str = f"${item.sma:,.2f}" if item.sma is not None else "â€”"
+    sma_str = f"${item.sma:,.2f}" if item.sma is not None else "—"
     ml_probability = item.ml_probability_up if ml_enabled else None
     ml_confidence = item.ml_confidence if ml_enabled else None
-    ml_str = f"{ml_probability:.3f}" if ml_probability is not None else "â€”"
-    signal_str = preview.status if preview is not None else "â€”"
-    delta_str = "â€”"
+    ml_str = f"{ml_probability:.3f}" if ml_probability is not None else "—"
+    signal_str = preview.status if preview is not None else "—"
+    delta_str = "—"
     if item.price is not None and item.sma not in (None, 0):
         diff_pct = ((item.price - item.sma) / item.sma) * 100
         sign = "+" if diff_pct >= 0 else ""
         delta_str = f"{sign}{diff_pct:.2f}%"
 
-    action_badge = _badge_html(item.action or "â€”") if item.action else "â€”"
-    signal_badge = _execution_status_badge(signal_str) if preview is not None else "â€”"
+    action_badge = _badge_html(item.action or "—") if item.action else "—"
+    signal_badge = _execution_status_badge(signal_str) if preview is not None else "—"
     context_copy = (
         f"Current action is {(item.action or 'HOLD').upper()} with {signal_str.lower().replace('_', ' ')} execution status."
         if preview is not None
@@ -4990,7 +4990,7 @@ def _render_detail_panel(
         "<div>"
         f"<div class='detail-symbol'>{item.symbol}</div>"
         f"<div class='detail-subline'><span>Updated {_relative_age(snapshot.timestamp_utc)}</span><span>&bull;</span><span>Selected symbol</span></div>"
-        f"<div class='detail-pill-row'>{action_badge}{signal_badge if signal_badge != 'â€”' else ''}</div>"
+        f"<div class='detail-pill-row'>{action_badge}{signal_badge if signal_badge != '—' else ''}</div>"
         "</div>"
         f"<div class='detail-price'>{price_str}</div>"
         "</div>"
@@ -5181,7 +5181,7 @@ def _render_right_rail(
             pnl_cls = "m-pos" if pnl >= 0 else "m-neg"
             held_text = (
                 f"{float(row['held_mins']):.0f} min"
-                if row.get("held_mins") is not None else "â€”"
+                if row.get("held_mins") is not None else "—"
             )
             positions_html += (
                 f"<div class='rail-row'>"
@@ -5197,7 +5197,7 @@ def _render_right_rail(
     else:
         positions_html = "<div class='rail-empty'>There are no open positions right now.</div>"
     st.markdown(
-        f"<div class='rail-card'><div class='sec-head'>What Youâ€™re Holding</div>{positions_html}</div>",
+        f"<div class='rail-card'><div class='sec-head'>What You’re Holding</div>{positions_html}</div>",
         unsafe_allow_html=True,
     )
 
@@ -5213,8 +5213,8 @@ def _render_right_rail(
             status = od.get("status", "")
 
             action_cls = "buy" if str(side).upper() == "BUY" else "sell"
-            price_str = f"${float(filled_avg):,.2f}" if filled_avg is not None else "â€”"
-            qty_str = f"{float(qty):.2f}" if qty is not None else "â€”"
+            price_str = f"${float(filled_avg):,.2f}" if filled_avg is not None else "—"
+            qty_str = f"{float(qty):.2f}" if qty is not None else "—"
             time_str = _compact_time_str(submitted)
 
             orders_html += (
@@ -5242,7 +5242,7 @@ def _render_right_rail(
     st.markdown(_near_misses_html(recent_near_misses or []), unsafe_allow_html=True)
 
 
-# â”€â”€ Tab: Live â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Tab: Live ─────────────────────────────────────────────────────────────────
 
 def _render_live(
     storage,
@@ -5405,7 +5405,7 @@ def _render_live(
         )
 
 
-# â”€â”€ Tab: History â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Tab: History ──────────────────────────────────────────────────────────────
 
 def _render_history(state: DashboardState, snapshot) -> None:
     st.markdown(
@@ -5487,7 +5487,7 @@ def _render_history(state: DashboardState, snapshot) -> None:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown(f"<div class='sec-head'>{selected} â€” Price vs SMA</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sec-head'>{selected} — Price vs SMA</div>", unsafe_allow_html=True)
         if symbol_history.empty:
             st.info("This symbol does not have saved history for the current session yet.")
         else:
@@ -5540,26 +5540,26 @@ def _render_history(state: DashboardState, snapshot) -> None:
                     st.plotly_chart(fig3, use_container_width=True)
 
     with right:
-        st.markdown(f"<div class='sec-head'>{selected} â€” Decision Mix</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sec-head'>{selected} — Decision Mix</div>", unsafe_allow_html=True)
         if not symbol_history.empty and "action" in symbol_history.columns:
             mix = symbol_history["action"].value_counts().rename_axis("action").reset_index(name="count")
             st.dataframe(mix, use_container_width=True, hide_index=True)
 
-        st.markdown(f"<div class='sec-head'>{selected} â€” Recent Snapshots</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sec-head'>{selected} — Recent Snapshots</div>", unsafe_allow_html=True)
         if not symbol_history.empty:
             latest = symbol_history.tail(10).copy()
             if "timestamp_utc" in latest.columns:
                 latest["Time"] = parse_mixed_iso_timestamps(latest["timestamp_utc"]).dt.strftime("%m-%d-%Y %I:%M %p")
             if "price" in latest.columns:
-                latest["Price"] = pd.to_numeric(latest["price"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "â€”")
+                latest["Price"] = pd.to_numeric(latest["price"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
             if "sma" in latest.columns:
-                latest["SMA"] = pd.to_numeric(latest["sma"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "â€”")
+                latest["SMA"] = pd.to_numeric(latest["sma"], errors="coerce").map(lambda v: f"${v:,.2f}" if pd.notna(v) else "—")
             if "action" in latest.columns:
-                latest["Action"] = latest["action"].fillna("â€”").astype(str).str.title()
+                latest["Action"] = latest["action"].fillna("—").astype(str).str.title()
             if ml_enabled and "ml_probability_up" in latest.columns:
-                latest["ML Up"] = pd.to_numeric(latest["ml_probability_up"], errors="coerce").map(lambda v: f"{v:.2f}" if pd.notna(v) else "â€”")
+                latest["ML Up"] = pd.to_numeric(latest["ml_probability_up"], errors="coerce").map(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
             if "holding_minutes" in latest.columns:
-                latest["Hold Min"] = pd.to_numeric(latest["holding_minutes"], errors="coerce").round(1).map(lambda v: f"{v:.1f}" if pd.notna(v) else "â€”")
+                latest["Hold Min"] = pd.to_numeric(latest["holding_minutes"], errors="coerce").round(1).map(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
             display_cols = [c for c in ["Time", "Action", "Price", "SMA", "ML Up", "Hold Min"] if c in latest.columns]
             st.dataframe(latest[display_cols].iloc[::-1].reset_index(drop=True), use_container_width=True, hide_index=True)
     _render_experiment_history()
@@ -5722,7 +5722,7 @@ def _render_experiment_history() -> None:
         st.dataframe(_build_top_experiment_table(experiments_df, metric_name), use_container_width=True, hide_index=True)
 
 
-# â”€â”€ Tab: Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Tab: Config ───────────────────────────────────────────────────────────────
 
 def _render_config(state: DashboardState, snapshot) -> None:
     cfg = state.startup_config
@@ -5813,7 +5813,7 @@ def _render_config(state: DashboardState, snapshot) -> None:
             if model_names:
                 st.markdown(_kv("Model", ", ".join(model_names)), unsafe_allow_html=True)
             ml_rows = [
-                f"{item.symbol}: buy â‰¥ {item.ml_buy_threshold:.2f}  sell â‰¤ {item.ml_sell_threshold:.2f}"
+                f"{item.symbol}: buy ≥ {item.ml_buy_threshold:.2f}  sell ≤ {item.ml_sell_threshold:.2f}"
                 for item in snapshot.symbols
                 if getattr(item, "ml_buy_threshold", None) is not None
             ]
@@ -5823,7 +5823,7 @@ def _render_config(state: DashboardState, snapshot) -> None:
                 st.markdown(_kv("Thresholds", "n/a"), unsafe_allow_html=True)
 
 
-# â”€â”€ Main â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def _render_config_v2(state: DashboardState, snapshot) -> None:
     st.markdown(
