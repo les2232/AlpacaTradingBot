@@ -696,6 +696,129 @@ def test_load_backtest_baseline_marks_every_metric_unavailable_without_artifacts
     assert baseline == daily_report.DEFAULT_BACKTEST
 
 
+_LONG_FIELD_LIST_REASONS = [
+    "promotion pointer is missing or invalid (Promotion pointer is unreadable.)",
+    "live runtime is missing promoted fields ("
+    + ", ".join(daily_report.PROMOTED_RUNTIME_FIELDS)
+    + ")",
+    "research baseline is missing promoted fields ("
+    + ", ".join(daily_report.PROMOTED_RUNTIME_FIELDS[:-1])
+    + ")",
+]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (
+            "live runtime is missing promoted fields (a, b, c, d, e, f, g)",
+            "live runtime is missing 7 promoted fields",
+        ),
+        # Short lists stay verbatim.
+        (
+            "live runtime is missing promoted fields (a, b)",
+            "live runtime is missing promoted fields (a, b)",
+        ),
+        (
+            "research baseline symbols are missing or invalid",
+            "research baseline symbols are missing or invalid",
+        ),
+        # "missing or invalid" is not a field list: keep a preview, never a
+        # misleading "is missing N or invalid".
+        (
+            "promotion pointer is missing or invalid (a, b, c, d, e, f)",
+            "promotion pointer is missing or invalid (a, b, c, and 3 more)",
+        ),
+        # Semicolon lists are split at the top level only, so values that
+        # contain commas or brackets stay intact.
+        (
+            "research config does not match live runtime ("
+            "a: live=[1, 2] research=[3]; b: live=1 research=2; "
+            "c: live=1 research=2; d: live=1 research=2; "
+            "e: live=1 research=2; f: live=1 research=2)",
+            "research config does not match live runtime ("
+            "a: live=[1, 2] research=[3]; b: live=1 research=2; "
+            "c: live=1 research=2; and 3 more)",
+        ),
+        # Nested parentheticals are summarized from the inside.
+        (
+            "runtime execution context is missing or invalid (selected runtime "
+            "is missing promoted fields (a, b, c, d, e, f))",
+            "runtime execution context is missing or invalid (selected runtime "
+            "is missing 6 promoted fields)",
+        ),
+        # Unbalanced text is left alone.
+        ("broken (a, b, c, d, e, f", "broken (a, b, c, d, e, f"),
+    ],
+)
+def test_summarize_validation_reason(reason: str, expected: str) -> None:
+    assert daily_report.summarize_validation_reason(reason) == expected
+
+
+def test_baseline_invalid_concern_summarizes_long_field_lists(
+    invalid_baseline: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE,
+        "validation_errors",
+        list(_LONG_FIELD_LIST_REASONS),
+    )
+    n_fields = len(daily_report.PROMOTED_RUNTIME_FIELDS)
+    assert n_fields > 40
+
+    concerns = daily_report.detect_concerns(*_quiet_inputs())
+
+    assert concerns == [
+        "BASELINE INVALID: promotion pointer is missing or invalid "
+        "(Promotion pointer is unreadable.); "
+        f"live runtime is missing {n_fields} promoted fields; "
+        f"research baseline is missing {n_fields - 1} promoted fields"
+        " — comparison unavailable; backtest-relative checks "
+        "(signal rate, session coverage) suppressed"
+    ]
+
+    daily_report.print_report(*_report_args(_quiet_inputs()))
+    out = capsys.readouterr().out
+    assert f"    - live runtime is missing {n_fields} promoted fields\n" in out
+    assert "long lists summarized; full text in --json comparison.reasons" in out
+    for field in daily_report.PROMOTED_RUNTIME_FIELDS:
+        assert f"{field}," not in out
+
+    # The JSON keeps every field name.
+    output = daily_report.build_json_output(*_report_args(_quiet_inputs()))
+    assert output["comparison"]["reasons"] == _LONG_FIELD_LIST_REASONS
+    assert output["concerns"] == concerns
+
+
+def test_baseline_reason_summary_leaves_valid_and_short_invalid_reports_alone(
+    valid_baseline: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    daily_report.print_report(*_report_args(_quiet_inputs()))
+    valid_out = capsys.readouterr().out
+    assert "BASELINE INVALID" not in valid_out
+    assert "long lists summarized" not in valid_out
+    assert "Baseline validation" not in valid_out
+
+    # Short invalid reasons are printed verbatim without the summary hint.
+    monkeypatch.setitem(daily_report.BACKTEST_SOURCE, "valid_for_comparison", False)
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE, "validation_errors", list(_INVALID_BASELINE_REASONS)
+    )
+    daily_report.print_report(*_report_args(_quiet_inputs()))
+    invalid_out = capsys.readouterr().out
+    for reason in _INVALID_BASELINE_REASONS:
+        assert f"    - {reason}\n" in invalid_out
+    assert "long lists summarized" not in invalid_out
+    assert [
+        daily_report.summarize_validation_reason(reason)
+        for reason in _INVALID_BASELINE_REASONS
+    ] == _INVALID_BASELINE_REASONS
+
+
 def test_load_backtest_baseline_uses_pointer_bound_live_and_research_artifacts(
     monkeypatch,
 ) -> None:

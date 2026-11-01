@@ -1163,6 +1163,84 @@ def baseline_comparison_status() -> dict[str, Any]:
     }
 
 
+_REASON_SUMMARY_MAX_ITEMS = 5
+_REASON_SUMMARY_PREVIEW_ITEMS = 3
+_OPENERS = {")": "(", "]": "[", "}": "{"}
+
+
+def _split_top_level(text: str, separator: str) -> list[str]:
+    """Split on ``separator`` only outside (), [] and {} nesting."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and text.startswith(separator, index):
+            parts.append(text[start:index])
+            index += len(separator)
+            start = index
+            continue
+        index += 1
+    parts.append(text[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _trailing_parenthetical(text: str) -> tuple[str, str] | None:
+    """Return (head, inner) for text ending in a balanced "(...)" group."""
+    if not text.endswith(")"):
+        return None
+    stack: list[str] = []
+    for index in range(len(text) - 1, -1, -1):
+        char = text[index]
+        if char in _OPENERS:
+            stack.append(_OPENERS[char])
+        elif char in "([{":
+            if not stack or stack.pop() != char:
+                return None
+            if not stack:
+                if char != "(":
+                    return None
+                return text[:index].rstrip(), text[index + 1:-1]
+    return None
+
+
+def summarize_validation_reason(reason: str) -> str:
+    """Shorten one baseline validation error for human-facing output.
+
+    Long trailing lists such as ``live runtime is missing promoted fields
+    (a, b, ... 40 more)`` become ``live runtime is missing 43 promoted
+    fields``; other long lists keep their first few items plus a count.
+    Short reasons are returned unchanged.  The JSON ``comparison.reasons``
+    always carries the full, unsummarized text.
+    """
+    text = str(reason)
+    split = _trailing_parenthetical(text)
+    if split is None:
+        return text
+    head, inner = split
+    separator = "; "
+    items = _split_top_level(inner, separator)
+    if len(items) <= 1:
+        separator = ", "
+        items = _split_top_level(inner, separator)
+    if len(items) <= 1:
+        summarized_inner = summarize_validation_reason(inner)
+        return text if summarized_inner == inner else f"{head} ({summarized_inner})"
+    if len(items) <= _REASON_SUMMARY_MAX_ITEMS:
+        return text
+    subject, marker, noun = head.partition(" is missing ")
+    if marker and noun.endswith("fields") and " or " not in noun:
+        return f"{subject} is missing {len(items)} {noun}"
+    preview = separator.join(items[:_REASON_SUMMARY_PREVIEW_ITEMS])
+    remaining = len(items) - _REASON_SUMMARY_PREVIEW_ITEMS
+    return f"{head} ({preview}{separator}and {remaining} more)"
+
+
 def _expectation(comparison: dict[str, Any], key: str) -> Any:
     """Return BACKTEST[key] only when it is a validated, artifact-backed value."""
     if comparison.get("available") is not True:
@@ -1379,7 +1457,9 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict, log_health: dic
     concerns = []
     comparison = baseline_comparison_status()
     if not comparison["available"]:
-        detail = "; ".join(comparison["reasons"])
+        detail = "; ".join(
+            summarize_validation_reason(item) for item in comparison["reasons"]
+        )
         concerns.append(
             f"BASELINE INVALID: {detail} — comparison unavailable; "
             f"backtest-relative checks (signal rate, session coverage) suppressed"
@@ -1547,11 +1627,16 @@ def print_report(
     else:
         row("Bars evaluated",        fmt(bar_q["evaluated"]))
     row("Baseline source",       str(BACKTEST_SOURCE.get("mode", "defaults")))
+    reason_summaries = [
+        summarize_validation_reason(item) for item in comparison["reasons"]
+    ]
     if not comparable:
         row("Backtest comparison",   "unavailable", flag="WARN")
         print("  Baseline validation:")
-        for item in comparison["reasons"]:
+        for item in reason_summaries:
             print(f"    - {item}")
+        if reason_summaries != comparison["reasons"]:
+            print("    (long lists summarized; full text in --json comparison.reasons)")
     avg_age = bar_q["avg_age_s"]
     row("Avg bar age (s)",        fmt(avg_age, ".1f"),
         flag=_flag(avg_age or 0, WARN["avg_bar_age_s"], low_is_bad=False) if avg_age else "")
@@ -1678,7 +1763,7 @@ def print_report(
         )
     else:
         print("  Comparison unavailable: baseline is not valid for comparison.")
-        for item in comparison["reasons"]:
+        for item in reason_summaries:
             print(f"    - {item}")
 
     # ── Concerns ──────────────────────────────────────────────────
