@@ -6060,6 +6060,17 @@ def _render_broker_safety_panel() -> None:
     st.markdown(_broker_safety_panel_html(panel), unsafe_allow_html=True)
 
 
+def _render_ask_tradeos() -> None:
+    """Read-only historical analyst; failures stay inside this tab."""
+
+    try:
+        from dashboard_ask import render_ask_tradeos_tab
+    except Exception as exc:
+        st.error(f"Ask TradeOS is unavailable ({type(exc).__name__}).")
+        return
+    render_ask_tradeos_tab()
+
+
 def main() -> None:
     _inject_css()
 
@@ -6067,6 +6078,9 @@ def main() -> None:
         state = load_dashboard_state()
     except Exception as exc:
         render_startup_error(exc)
+        # Historical analysis reads saved logs only, so it stays available.
+        st.divider()
+        _render_ask_tradeos()
         return
 
     snapshot = state.snapshot
@@ -6117,7 +6131,9 @@ def main() -> None:
     if status_cards:
         st.markdown("".join(status_cards), unsafe_allow_html=True)
 
-    live_tab, history_tab, config_tab, drill_tab = st.tabs(["Live Desk", "Performance", "Setup", "Decision Log"])
+    live_tab, history_tab, config_tab, drill_tab, ask_tab = st.tabs(
+        ["Live Desk", "Performance", "Setup", "Decision Log", "Ask TradeOS"]
+    )
 
     with live_tab:
         _render_live(
@@ -6149,6 +6165,9 @@ def main() -> None:
 
     with drill_tab:
         _render_drilldown(state)
+
+    with ask_tab:
+        _render_ask_tradeos()
 
 
 if __name__ == "__main__":

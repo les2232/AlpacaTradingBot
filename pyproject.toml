@@ -17,6 +17,7 @@ dependencies = [
     "pyarrow",
     "scikit-learn",
     "plotly",
+    "openai>=3.42,<4",
 ]
 
 [project.scripts]
@@ -35,6 +36,7 @@ py-modules = [
     "compare_mr_strategies",
     "daily_report",
     "dashboard",
+    "dashboard_ask",
     "dashboard_state",
     "dataset_integrity",
     "dataset_snapshotter",

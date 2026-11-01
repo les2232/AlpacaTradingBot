@@ -69,6 +69,71 @@ this workflow.
 .\start_dashboard.ps1 -DashboardOnly
 ```
 
+## Ask TradeOS
+
+The **Ask TradeOS** tab in the dashboard is a read-only analyst for historical sessions. It reads
+`logs/<date>/*.jsonl`, the session's own `startup_config.*.json`, and `bot_history.db` (opened read-only).
+It never submits orders, changes trading rules or risk limits, repairs state, or promotes research
+configurations.
+
+### Configure
+
+1. Optional: add `OPENAI_API_KEY=...` to the repository `.env`. `TRADEOS_ASK_MODEL` defaults to
+   `gpt-6.1-sol`, and `TRADEOS_ASK_TIMEOUT_SECONDS` defaults to `60`. A process environment variable
+   overrides the `.env` value. Only these three keys are read from `.env`, and they are not exported.
+2. Start the dashboard as usual: `.\start_dashboard.ps1` (or `tradeos dashboard`).
+3. Open the **Ask TradeOS** tab, choose a session and question, then press **Ask TradeOS**. Without a key,
+   the button is **Show calculated diagnostics**.
+
+### How to read the answer
+
+- **Observation** findings are directly shown by the cited records. **Hypothesis** findings are plausible
+  but unproven explanations. Every finding lists evidence IDs. *Supporting evidence* shows each cited item
+  and its source, such as `logs/2026-10-15/signals.jsonl:L57` or a startup artifact.
+- **Bound sessions** have a `session_id`. Only records carrying that id are used. Records on the same day
+  without an id are counted and excluded. **Unbound log days** (older logs without ids) are offered
+  separately. They describe the whole day and have no known configuration.
+- A historical session's configuration comes only from its own startup artifact. The current
+  `config/live_config.json` is never applied to an old session.
+- **Comparison unavailable** appears unless every check passes:
+  - the session is bound and has a valid startup artifact with a canonical strategy hash;
+  - the environment is identified;
+  - at least 50% of the expected decisions were observed;
+  - the baseline was valid at launch and passes validation now;
+  - the baseline's bundle and generation hashes match the ones recorded at launch;
+  - the pointer-bound drift profile is valid.
+
+  When unavailable, the tab lists the reasons and suppresses underperformance, drift, and improvement
+  conclusions. Observed metrics are still reported. The `daily_report.DEFAULT_BACKTEST` fallback numbers
+  are never used as a comparison target.
+- Win rate is marked not interpretable below 5 closed trades. Partial sessions (under 90% of the
+  09:45-15:45 ET decisions) are flagged.
+
+### What is sent to the model
+
+Only the evidence package for the selected question goes to OpenAI's Responses API, with `store=false`.
+It contains allowlisted event fields, calculated metrics, configuration values, and limitations. Order
+ids, account fingerprints, balances, file system paths, and credentials are excluded, and the request is
+refused if a credential-like value appears. The *Exact model request body* expander shows the payload.
+
+### Tablet access (Android)
+
+Streamlit is a web app, so the tablet only needs a browser:
+
+1. Start the dashboard on the Windows PC as usual.
+2. Find the PC's LAN address with `ipconfig` (IPv4 address, for example `192.168.1.20`).
+3. Allow inbound TCP 8501 for **Private** networks only, in an elevated PowerShell:
+   `New-NetFirewallRule -DisplayName "TradeOS dashboard (LAN)" -Direction Inbound -Protocol TCP -LocalPort 8501 -Profile Private -Action Allow`
+4. On the tablet (same Wi-Fi), open `http://192.168.1.20:8501` in Chrome. Use **Add to Home screen** for
+   an app icon.
+
+`.streamlit/config.toml` does not set `server.address`, so Streamlit listens on all interfaces, and the
+firewall rule is what grants LAN access. The dashboard has no login: anyone on that network can view it
+and use Ask TradeOS, which spends OpenAI credit when a key is configured. Keep the Windows network profile
+**Private** and the rule scoped to Private. For access away from home, use a private VPN such as Tailscale
+rather than opening a router port. Remove the rule with
+`Remove-NetFirewallRule -DisplayName "TradeOS dashboard (LAN)"`.
+
 ## What Not To Do
 
 - Do not run multiple `tradeos live` processes.
@@ -183,6 +248,7 @@ Run this set before moving the project forward after meaningful runtime or dashb
 ```powershell
 python -m pytest -q
 python -m pytest -q tests/test_trading_bot.py tests/test_dashboard.py tests/test_cli.py
+python -m pytest -q tests/test_ask_tradeos.py
 python -m tradeos --help
 ```
 

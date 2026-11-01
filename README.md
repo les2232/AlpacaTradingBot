@@ -37,6 +37,21 @@ Read these first:
 
 Streamlit is now the only supported UI surface in the repository.
 
+### Ask TradeOS (read-only session analyst)
+
+The dashboard's **Ask TradeOS** tab explains one historical session at a time:
+
+1. Explain this session.
+2. Why did this symbol buy, sell, or hold?
+3. Can this session validly be compared with this backtest?
+
+Python (`tradeos/ask/`) builds an evidence package first: session identity, time range, symbols,
+metrics calculated by the existing `daily_report` functions, selected log events, launch-time
+configuration, baseline validity, data coverage, and a source reference for every item. The model only
+explains that package, and every finding must cite evidence IDs that were in the request. Without an
+API key, the tab shows the same calculated diagnostics without a model. See
+[`OPERATIONS.md`](OPERATIONS.md#ask-tradeos) for setup and limits.
+
 ### Research and offline analysis
 
 - `tradeos snapshot ...`
@@ -84,6 +99,14 @@ ALPACA_PAPER=true
 MAX_USD_PER_TRADE=200
 MAX_OPEN_POSITIONS=3
 MAX_DAILY_LOSS_USD=300
+```
+
+Optional, for Ask TradeOS model explanations (read only by the dashboard, never exported or logged):
+
+```env
+OPENAI_API_KEY=your_openai_key
+TRADEOS_ASK_MODEL=gpt-6.1-sol
+TRADEOS_ASK_TIMEOUT_SECONDS=60
 ```
 
 Keep active trading settings in [`config/live_config.json`](config/live_config.json). In this repo, `.env` is for secrets and risk limits, while `config/live_config.json` is the runtime trading-settings source of truth.
@@ -145,6 +168,8 @@ The current cleanup direction is a conservative `v2-in-place`: reduce repo-root 
   Diagnostic reporting.
 - [`drift_monitor.py`](drift_monitor.py)
   Drift-analysis support used by the dashboard and reports.
+- [`dashboard_ask.py`](dashboard_ask.py) and [`tradeos/ask/`](tradeos/ask/)
+  Ask TradeOS tab and its read-only evidence, comparison-validity, and model-explanation layer.
 
 ### Offline research
 
