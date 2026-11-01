@@ -64,7 +64,7 @@ def _install_verified_pointer_baseline(
         "symbols": 2,
         "bars_per_day": 26,
         "signal_rate_per_symbol_per_day": trades_per_day / 2,
-        "win_rate": win_rate / 100.0 if win_rate > 1.0 else win_rate,
+        "win_rate": win_rate / 100.0,
         "rejection_rate": float(DEFAULT_BACKTEST["rejection_rate"]),
     }
     source: dict[str, object] = {
@@ -752,3 +752,41 @@ def test_rejection_alert_states_the_rate_that_actually_triggers_it(
     threshold = DRIFT_PROFILE_POLICY_V1.rejection_rate + drift_monitor.REJECTION_RATE_WARN_MARGIN
     assert holds / 100 > threshold
     assert "or lower" not in alert.expected
+
+
+def test_drift_overlay_reads_a_low_win_rate_as_a_percent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # performance.win_rate = 1.0 means 1%; the daily baseline holds 0.01.
+    _install_verified_pointer_baseline(
+        monkeypatch,
+        tmp_path,
+        trades_per_day=4.0,
+        win_rate=1.0,
+    )
+
+    profile = load_baseline_profile(tmp_path)
+
+    assert profile.valid_for_comparison is True
+    assert profile.win_rate == 0.01
+
+
+def test_drift_overlay_win_rate_above_one_hundred_percent_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_verified_pointer_baseline(
+        monkeypatch,
+        tmp_path,
+        trades_per_day=4.0,
+        win_rate=150.0,
+    )
+
+    profile = load_baseline_profile(tmp_path)
+
+    _assert_profile_carries_no_numbers(profile)
+    assert any(
+        "performance contradicts the daily baseline" in error
+        for error in profile.validation_errors
+    )

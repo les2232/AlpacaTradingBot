@@ -1849,3 +1849,47 @@ def test_zero_research_signal_rate_never_reports_signal_rate_low(
     assert invalid_concerns[0].startswith("BASELINE INVALID: ")
     assert not any(c.startswith("SIGNAL RATE") for c in invalid_concerns)
 
+
+
+@pytest.mark.parametrize(
+    ("research_win_rate", "expected_ratio", "expected_text"),
+    [(1.0, 0.01, "(backtest 1%)"), (0.5, 0.005, "(backtest 0%)")],
+)
+def test_research_win_rate_is_always_read_as_a_percent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    research_win_rate: float,
+    expected_ratio: float,
+    expected_text: str,
+) -> None:
+    _write_approved_baseline_artifacts(tmp_path)
+    research_path = tmp_path / "results" / "best_config_latest.json"
+    research = json.loads(research_path.read_text(encoding="utf-8"))
+    research["performance"]["win_rate"] = research_win_rate  # percent, 0-100
+    research_path.write_text(json.dumps(research), encoding="utf-8")
+
+    # Without a committed promotion the research number is never used.
+    invalid_baseline, invalid_source = daily_report.load_backtest_baseline(tmp_path)
+    assert invalid_source["valid_for_comparison"] is False
+    assert invalid_baseline["win_rate"] == daily_report.DEFAULT_BACKTEST["win_rate"]
+    assert invalid_source["metric_sources"]["win_rate"] == "unavailable"
+
+    # With a valid promotion, 1.0 means 1%, not 100%.
+    _mock_committed_promotion_pointer(monkeypatch, tmp_path)
+    baseline, source = daily_report.load_backtest_baseline(tmp_path)
+    assert source["valid_for_comparison"] is True
+    assert baseline["win_rate"] == expected_ratio
+
+    monkeypatch.setattr(daily_report, "BACKTEST", baseline)
+    monkeypatch.setattr(daily_report, "BACKTEST_SOURCE", source)
+    daily_report.print_report(*_report_args(_noisy_inputs()))  # 6 closed trades
+    out = capsys.readouterr().out
+    (win_rate_row,) = [
+        line for line in out.splitlines()
+        if line.strip().startswith("Win rate ") and "backtest" in line
+    ]
+    assert expected_text in win_rate_row
+    assert "(backtest 100%)" not in out and "(backtest 50%)" not in out
+    output = daily_report.build_json_output(*_report_args(_noisy_inputs()))
+    assert output["backtest"]["win_rate"] == expected_ratio

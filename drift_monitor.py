@@ -272,8 +272,9 @@ def _load_verified_drift_overlay(
         or baseline_buy_rate is None
         or baseline_win_rate is None
         or trades_per_day / symbol_count != baseline_buy_rate
-        or (overlay_win_rate / 100.0 if overlay_win_rate > 1.0 else overlay_win_rate)
-        != baseline_win_rate
+        # performance.win_rate is a research percent (0-100), never a fraction.
+        or not 0.0 <= overlay_win_rate <= 100.0
+        or overlay_win_rate / 100.0 != baseline_win_rate
     ):
         raise ValueError("drift projection performance contradicts the daily baseline")
 

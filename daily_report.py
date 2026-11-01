@@ -209,7 +209,14 @@ def _canonical_sha256(value: object) -> str | None:
     return value
 
 
-def _to_ratio(value: Any) -> float | None:
+def _percent_to_ratio(value: Any) -> float | None:
+    """Convert a research percent (0-100) to a fraction.
+
+    Research performance metrics store win_rate as a percent (backtest_runner
+    multiplies by 100 and normalize_metrics validates 0-100), so the value is
+    always divided by 100.  Guessing from magnitude would misread a real 0.5%
+    or 1% win rate as 50% or 100%.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
@@ -218,7 +225,7 @@ def _to_ratio(value: Any) -> float | None:
         return None
     if not math.isfinite(numeric) or not 0.0 <= numeric <= 100.0:
         return None
-    return numeric / 100.0 if numeric > 1.0 else numeric
+    return numeric / 100.0
 
 
 def _to_nonnegative_finite_number(value: Any) -> float | None:
@@ -978,7 +985,7 @@ def load_backtest_baseline(
                 source["validation_errors"].append(
                     "research trades_per_day is missing or invalid"
                 )
-            win_rate = _to_ratio(performance.get("win_rate"))
+            win_rate = _percent_to_ratio(performance.get("win_rate"))
             if win_rate is None:
                 source["validation_errors"].append(
                     "research win_rate is missing or invalid"
