@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from daily_report import DEFAULT_BACKTEST, WARN, load_backtest_baseline
+from daily_report import WARN, load_backtest_baseline
 from tradeos.research_bundle import DRIFT_PROFILE_POLICY_V1, load_verified_promotion_pointer
 
 

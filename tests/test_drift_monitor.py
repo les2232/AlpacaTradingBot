@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import drift_monitor
 import pytest
-from daily_report import PROMOTED_RUNTIME_FIELDS
+from daily_report import DEFAULT_BACKTEST, PROMOTED_RUNTIME_FIELDS
 from drift_monitor import build_drift_report, compute_live_metrics, evaluate_drift, load_baseline_profile
 from tradeos.research_bundle import DRIFT_PROFILE_POLICY_V1, generation_directory_component
 from tradeos.strategy_contract import (
@@ -65,7 +65,7 @@ def _install_verified_pointer_baseline(
         "bars_per_day": 26,
         "signal_rate_per_symbol_per_day": trades_per_day / 2,
         "win_rate": win_rate / 100.0 if win_rate > 1.0 else win_rate,
-        "rejection_rate": float(drift_monitor.DEFAULT_BACKTEST["rejection_rate"]),
+        "rejection_rate": float(DEFAULT_BACKTEST["rejection_rate"]),
     }
     source: dict[str, object] = {
         "mode": "live_config+research",
@@ -83,7 +83,7 @@ def _install_verified_pointer_baseline(
     metrics: dict[str, object] = {
         "buy_signal_rate_per_symbol_per_day": trades_per_day / 2,
         "sell_signal_rate_per_symbol_per_day": trades_per_day / 2,
-        "rejection_rate": float(drift_monitor.DEFAULT_BACKTEST["rejection_rate"]),
+        "rejection_rate": DRIFT_PROFILE_POLICY_V1.rejection_rate,
         "rejection_breakdown": {
             "no_signal": 0.7,
             "trend_filter": 0.2,
@@ -302,7 +302,7 @@ def test_truthy_nonboolean_daily_validity_never_enables_drift(
         drift_monitor,
         "load_backtest_baseline",
         lambda _root: (
-            dict(drift_monitor.DEFAULT_BACKTEST),
+            dict(DEFAULT_BACKTEST),
             {
                 "mode": "untrusted",
                 "valid_for_comparison": "true",
@@ -515,7 +515,7 @@ def _install_invalid_daily_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
         drift_monitor,
         "load_backtest_baseline",
         lambda _root: (
-            dict(drift_monitor.DEFAULT_BACKTEST),
+            dict(DEFAULT_BACKTEST),
             {
                 "mode": "defaults",
                 "valid_for_comparison": False,

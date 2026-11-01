@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import dashboard
+from daily_report import DEFAULT_BACKTEST
 from drift_monitor import BaselineProfile, DriftAlert, DriftReport, LiveMetrics
 from dashboard_state import PersistedSignalDecision
 from dashboard_state import DrilldownEvent
@@ -473,7 +474,7 @@ def test_drift_panel_derives_numbers_only_from_a_valid_baseline(
         drift_monitor,
         "load_backtest_baseline",
         lambda _root: (
-            dict(drift_monitor.DEFAULT_BACKTEST),
+            dict(DEFAULT_BACKTEST),
             {
                 "mode": "defaults",
                 "valid_for_comparison": False,
@@ -495,7 +496,7 @@ def test_drift_panel_derives_numbers_only_from_a_valid_baseline(
     # symbols/bars_per_day.
     assert "Buy rate" not in html
     assert "/sym/day" not in html
-    default = drift_monitor.DEFAULT_BACKTEST
+    default = DEFAULT_BACKTEST
     for placeholder in (
         f"{default['signal_rate_per_symbol_per_day']:.2f}",
         f"{default['rejection_rate']:.0%}",
