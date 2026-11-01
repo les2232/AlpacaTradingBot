@@ -206,14 +206,20 @@ def _render_tab_body(
         return
 
     by_key = {s.key: s for s in sessions}
+    # Open on the newest session that actually logged something; empty launches stay selectable.
+    default_index = next((i for i, s in enumerate(sessions) if s.log_record_count > 0), 0)
     left, middle = st.columns([3, 2])
     with left:
         session_key = st.selectbox(
             "Session",
             options=list(by_key),
+            index=default_index,
             format_func=lambda key: by_key[key].label,
             key="ask_session",
-            help="Bound sessions carry a session id. Unbound log days hold records without one.",
+            help=(
+                "Bound sessions carry a session id. Unbound log days hold records without one. "
+                "Sessions with 0 log records never wrote any decisions."
+            ),
         )
     session = by_key[session_key]
     with middle:

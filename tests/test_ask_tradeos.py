@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -209,6 +210,17 @@ def build_fixture(root: Path, *, artifact_overrides: dict[str, Any] | None = Non
             "INSERT INTO bot_runs (session_id, environment, timestamp_utc) VALUES (NULL, NULL, ?)", (_ts(12),)
         )
     return {"logs": logs, "db": db, "root": root}
+
+
+@pytest.fixture(autouse=True)
+def _restore_main_module():
+    """AppTest leaves its generated script registered as __main__; multiprocessing
+    "spawn" children in later tests would re-run that script. Restore it."""
+
+    original = sys.modules.get("__main__")
+    yield
+    if original is not None:
+        sys.modules["__main__"] = original
 
 
 @pytest.fixture()
@@ -842,3 +854,28 @@ def test_inspect_reports_session_sources_without_sensitive_values(fx) -> None:
         assert forbidden not in text
     missing = inspect_session("does-not-exist", fx["logs"], fx["db"])
     assert missing["startup_artifacts"] == [] and missing["log_records_by_day_and_stream"] == {}
+
+
+def test_inspect_list_shows_record_counts_and_config_status(fx) -> None:
+    from tradeos.ask.inspect import list_sessions
+
+    lines = list_sessions(fx["logs"], fx["db"])
+    sess_a = next(line for line in lines if line.endswith("sess-A"))
+    sess_b = next(line for line in lines if line.endswith("sess-B"))
+    assert "config=valid" in sess_a and "logs=    109" in sess_a and "db_runs=      3" in sess_a
+    assert "config=missing" in sess_b
+    assert any("unbound log day" in line for line in lines)
+
+
+def test_dashboard_tab_defaults_to_newest_session_with_records(ui_env) -> None:
+    from streamlit.testing.v1 import AppTest
+
+    with sqlite3.connect(ui_env["db"]) as connection:  # newest session, but no log records
+        connection.execute(
+            "INSERT INTO bot_runs (session_id, environment, timestamp_utc) "
+            "VALUES ('live-20261020T130000Z-empty', 'paper', '2026-10-20T13:00:00+00:00')"
+        )
+    at = AppTest.from_function(_tab_app, kwargs={"mode": "nokey"}, default_timeout=30)
+    at.run()
+    assert at.selectbox(key="ask_session").options[0].endswith("live-20261020T130000Z-empty")
+    assert at.selectbox(key="ask_session").value != "session:live-20261020T130000Z-empty"

@@ -106,10 +106,36 @@ def inspect_session(session_id: str, log_root: Path, db_path: Path | None) -> di
     return report
 
 
+def list_sessions(log_root: Path, db_path: Path | None) -> list[str]:
+    """One line per session: start, run type, record counts, config status, id."""
+
+    from tradeos.ask.records import discover_sessions
+
+    artifacts: dict[str, list[bool]] = {}
+    for artifact in load_startup_artifacts(log_root):
+        if artifact.session_id:
+            artifacts.setdefault(artifact.session_id, []).append(artifact.valid)
+    lines = []
+    for ref in discover_sessions(log_root, db_path):
+        if ref.kind != "bound":
+            lines.append(f"{ref.days[0]}  unbound log day  logs={ref.log_record_count:>7,}  db_runs=      0  config=n/a      {ref.key}")
+            continue
+        valid = artifacts.get(ref.session_id or "", [])
+        config = "valid" if any(valid) else ("invalid" if valid else "missing")
+        lines.append(
+            f"{(ref.first_ts or '')[:16]:16}  {ref.run_type:34}  logs={ref.log_record_count:>7,}  "
+            f"db_runs={ref.db_run_count:>7,}  config={config:8} {ref.session_id}"
+        )
+    return lines
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("session_id")
+    parser.add_argument("session_id", nargs="?", help="session id to inspect")
+    parser.add_argument("--list", action="store_true", help="list every session with record counts")
     args = parser.parse_args(argv)
+    if not args.list and not args.session_id:
+        parser.error("give a session id or --list")
     log_root = resolve_log_root()
     try:
         db_path = resolve_explicit_database_path() or resolve_database_path()
@@ -117,6 +143,11 @@ def main(argv: list[str] | None = None) -> int:
         db_path = None
     if db_path is not None and not db_path.is_file():
         db_path = None
+    if args.list:
+        print("start (UTC)       run type                            log records   db runs        startup config / id")
+        for line in list_sessions(log_root, db_path):
+            print(line)
+        return 0
     json.dump(inspect_session(args.session_id.strip(), log_root, db_path), sys.stdout, indent=2, default=str)
     print()
     return 0
