@@ -1759,3 +1759,34 @@ def test_load_backtest_baseline_rejects_runtime_config_outside_repository() -> N
     finally:
         shutil.rmtree(base_dir, ignore_errors=True)
         outside_config.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("baseline_fixture", ["valid_baseline", "invalid_baseline"])
+@pytest.mark.parametrize(
+    ("win_rate", "expected_value"),
+    [(0.0, "0%"), (1 / 3, "33%"), (None, "n/a")],
+)
+def test_print_report_shows_small_sample_win_rate_including_zero(
+    baseline_fixture: str,
+    win_rate: float | None,
+    expected_value: str,
+    request: pytest.FixtureRequest,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request.getfixturevalue(baseline_fixture)
+    bar_q, sig, ex, _pos, log_health = _quiet_inputs()
+    # Fewer closed trades than WARN["min_trades_for_win_rate"].
+    pos = {
+        "opened": 3, "closed": 3, "win_rate": win_rate, "avg_hold_bars": 2.0,
+        "avg_pnl_usd": -1.0, "exit_reasons": {"stop_loss": 3}, "total_pnl_usd": -3.0,
+    }
+
+    daily_report.print_report(*_report_args((bar_q, sig, ex, pos, log_health)))
+    out = capsys.readouterr().out
+
+    (win_rate_line,) = [
+        line for line in out.splitlines() if line.strip().startswith("Win rate ")
+        and "trade(s)" in line
+    ]
+    assert win_rate_line.split()[2] == expected_value
+    assert "(only 3 trade(s) — not meaningful yet)" in win_rate_line

@@ -1733,7 +1733,7 @@ def print_report(
             f"(backtest {bt_win_rate:.0%})" if bt_win_rate is not None else "",
             flag=_flag(wr, WARN["win_rate_low"], low_is_bad=True))
     elif n_closed > 0:
-        row("Win rate",            f"{pos['win_rate']:.0%}" if pos["win_rate"] else "n/a",
+        row("Win rate",            f"{pos['win_rate']:.0%}" if pos["win_rate"] is not None else "n/a",
             f"(only {n_closed} trade(s) — not meaningful yet)")
     else:
         row("Win rate",            "n/a", "(no closed positions today)")
