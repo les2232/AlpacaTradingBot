@@ -22,6 +22,10 @@ from tradeos.runtime_paths import (
     resolve_database_path,
 )
 from tradeos.execution_lock import ExecutionLock
+from tradeos.strategy_contract import (
+    CanonicalResolvedPromotedStrategy,
+    ContractValidationError,
+)
 
 
 PROJECT_ROOT = TRADEOS_REPOSITORY_ROOT
@@ -30,6 +34,8 @@ LOG_ROOT = PROJECT_ROOT / "logs"
 DEFAULT_DASHBOARD_PORT = 8501
 DASHBOARD_READY_TIMEOUT_SECONDS = 15.0
 STARTUP_ARTIFACT_PATH_ENV = "TRADEOS_STARTUP_ARTIFACT_PATH"
+STARTUP_CONFIG_SCHEMA_NAME = "tradeos.runtime_startup_config"
+STARTUP_CONFIG_SCHEMA_VERSION = 1
 ALLOW_UNAPPROVED_RUNTIME_ENV = "TRADEOS_ALLOW_UNAPPROVED_RUNTIME"
 ALLOW_BASELINE_MISMATCH_ENV = "TRADEOS_ALLOW_BASELINE_MISMATCH"
 PAPER_SHADOW_CONFIG_PATH = PROJECT_ROOT / "config" / "paper_shadow_config.json"
@@ -55,6 +61,23 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "reconcile",
         help="Read broker/local safety state without submitting or modifying orders.",
+    )
+    readiness_parser = subparsers.add_parser(
+        "verify-readiness",
+        help=(
+            "Run the fixed complete offline suite and attest it to the current "
+            "worktree and paper-shadow config."
+        ),
+    )
+    readiness_parser.add_argument(
+        "--config",
+        default=str(PAPER_SHADOW_CONFIG_PATH),
+        help="Repository-local runtime config to bind (defaults to paper shadow).",
+    )
+    readiness_parser.add_argument(
+        "--evidence-dir",
+        default=None,
+        help="Optional readiness evidence directory.",
     )
 
     repair_parser = subparsers.add_parser(
@@ -183,6 +206,80 @@ def _startup_artifact_path(started_at_utc: str) -> Path:
 
 def _startup_artifact_latest_path() -> Path:
     return _startup_artifact_dir() / "startup_config.json"
+
+
+def _write_new_startup_artifact(path: Path, text: str) -> None:
+    """Create a versioned startup artifact without permitting replacement."""
+
+    with path.open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _replace_startup_alias_atomically(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        _write_new_startup_artifact(temporary, text)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validated_runtime_strategy_payload(
+    config: object,
+    evidence: object,
+) -> tuple[dict[str, object], str]:
+    """Revalidate producer evidence against the exact config being persisted."""
+
+    if not isinstance(evidence, dict):
+        raise ContractValidationError("Runtime strategy evidence must be an object.")
+    raw_envelope = evidence.get("canonical_strategy_contract")
+    raw_canonical_json = evidence.get("canonical_strategy_json")
+    raw_sha256 = evidence.get("canonical_strategy_sha256")
+    raw_contract = evidence.get("contract")
+    if not isinstance(raw_contract, CanonicalResolvedPromotedStrategy):
+        raise ContractValidationError(
+            "Runtime strategy evidence is missing its validated contract object."
+        )
+    if type(raw_canonical_json) is not str:
+        raise ContractValidationError(
+            "Runtime strategy evidence canonical_strategy_json must be text."
+        )
+    if type(raw_sha256) is not str or len(raw_sha256) != 64:
+        raise ContractValidationError(
+            "Runtime strategy evidence canonical_strategy_sha256 is invalid."
+        )
+    materialized = CanonicalResolvedPromotedStrategy.from_payload(raw_envelope)  # type: ignore[arg-type]
+    serialized = CanonicalResolvedPromotedStrategy.from_json(raw_canonical_json)
+    expected = CanonicalResolvedPromotedStrategy.from_bot_config(config)
+    expected_sha256 = expected.sha256()
+    if (
+        materialized.sha256() != expected_sha256
+        or serialized.sha256() != expected_sha256
+        or raw_contract.sha256() != expected_sha256
+        or raw_sha256 != expected_sha256
+        or evidence.get("symbols") != list(expected.symbols)
+        or evidence.get("symbol_strategy_modes")
+        != expected.promoted_values["symbol_strategy_modes"]
+    ):
+        raise ContractValidationError(
+            "Runtime strategy evidence does not match the final effective BotConfig."
+        )
+    return expected.to_canonical_dict(), expected_sha256
+
+
+def _validated_sha256_identity(value: object) -> str | None:
+    """Return only canonical lowercase SHA-256 text; reject every coercion."""
+
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return None
+    return value
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -440,14 +537,115 @@ def _persist_startup_config(
     preview: bool,
     *,
     session_id: str,
+    strategy_evidence: object,
     database_path: Path | None = None,
     launch_mode: str | None = None,
     execution_enabled: bool | None = None,
 ) -> Path:
     config = getattr(details, "config")
+    if type(session_id) is not str or not session_id.strip() or session_id != session_id.strip():
+        raise ValueError("session_id must be nonblank text without surrounding whitespace")
+    canonical_strategy_contract, canonical_strategy_sha256 = (
+        _validated_runtime_strategy_payload(config, strategy_evidence)
+    )
+    baseline_valid = getattr(details, "baseline_valid_for_comparison", None) is True
+    execution_context_matches_pointer_live = getattr(
+        details,
+        "execution_context_matches_pointer_live",
+        None,
+    )
+    if (
+        execution_context_matches_pointer_live is not None
+        and type(execution_context_matches_pointer_live) is not bool
+    ):
+        raise ValueError(
+            "execution_context_matches_pointer_live must be boolean or null."
+        )
+    raw_execution_context_errors = getattr(
+        details,
+        "execution_context_validation_errors",
+        (),
+    )
+    if not isinstance(raw_execution_context_errors, (list, tuple)) or any(
+        type(error) is not str or not error.strip()
+        for error in raw_execution_context_errors
+    ):
+        raise ValueError(
+            "execution_context_validation_errors must contain only nonblank text."
+        )
+    execution_context_validation_errors = tuple(raw_execution_context_errors)
+    if baseline_valid and (
+        execution_context_matches_pointer_live is not True
+        or execution_context_validation_errors
+    ):
+        raise ValueError(
+            "A valid promoted baseline requires an exact, error-free pointer-live "
+            "execution-context match."
+        )
+    raw_runtime_config_sha256 = getattr(details, "runtime_config_sha256", None)
+    runtime_config_sha256 = _validated_sha256_identity(raw_runtime_config_sha256)
+    if raw_runtime_config_sha256 is not None and runtime_config_sha256 is None:
+        raise ValueError("runtime_config_sha256 must be a lowercase SHA-256 digest.")
+    effective_runtime_binding_valid = getattr(
+        details,
+        "effective_runtime_binding_valid",
+        None,
+    )
+    if (
+        effective_runtime_binding_valid is not None
+        and type(effective_runtime_binding_valid) is not bool
+    ):
+        raise ValueError("effective_runtime_binding_valid must be boolean or null.")
+    raw_effective_binding_errors = getattr(
+        details,
+        "effective_runtime_binding_errors",
+        (),
+    )
+    if not isinstance(raw_effective_binding_errors, (list, tuple)) or any(
+        type(error) is not str or not error.strip()
+        for error in raw_effective_binding_errors
+    ):
+        raise ValueError(
+            "effective_runtime_binding_errors must contain only nonblank text."
+        )
+    effective_runtime_binding_errors = tuple(raw_effective_binding_errors)
+    if baseline_valid and (
+        runtime_config_sha256 is None
+        or effective_runtime_binding_valid is not True
+        or effective_runtime_binding_errors
+    ):
+        raise ValueError(
+            "A valid promoted baseline requires exact first-read runtime bytes and "
+            "an error-free effective runtime binding."
+        )
+    research_generation_sha256 = _validated_sha256_identity(
+        getattr(details, "research_generation_sha256", None)
+    )
+    promotion_bundle_sha256 = _validated_sha256_identity(
+        getattr(details, "promotion_bundle_sha256", None)
+    )
+    research_source_content_sha256 = _validated_sha256_identity(
+        getattr(details, "research_source_content_sha256", None)
+    )
+    if baseline_valid and (
+        research_generation_sha256 is None
+        or promotion_bundle_sha256 is None
+        or research_source_content_sha256 is None
+    ):
+        raise ValueError(
+            "A valid promoted baseline requires exact research generation, bundle, "
+            "and source SHA-256 identities."
+        )
+    if not baseline_valid:
+        research_generation_sha256 = None
+        promotion_bundle_sha256 = None
+        research_source_content_sha256 = None
     resolved_database_path = resolve_database_path(database_path)
     started_at_utc = _utcnow_iso()
     payload = {
+        "artifact_schema_name": STARTUP_CONFIG_SCHEMA_NAME,
+        "artifact_schema_version": STARTUP_CONFIG_SCHEMA_VERSION,
+        "artifact_type": "startup_config",
         "session_id": session_id,
         "started_at_utc": started_at_utc,
         "launch_mode": launch_mode or ("preview" if preview else "live"),
@@ -463,14 +661,27 @@ def _persist_startup_config(
         "symbols": list(getattr(config, "symbols", [])),
         "symbol_count": len(list(getattr(config, "symbols", []))),
         "runtime_config_path": getattr(details, "runtime_config_path", None),
+        "runtime_config_sha256": runtime_config_sha256,
         "runtime_overrides": list(getattr(details, "overridden_fields", ()) or ()),
         "runtime_config_approved": getattr(details, "runtime_config_approved", None),
         "runtime_config_rejection_reasons": list(getattr(details, "runtime_config_rejection_reasons", ()) or ()),
+        "expected_account_fingerprint": getattr(details, "expected_account_fingerprint", None),
         "broker_environment": getattr(details, "broker_environment", None),
         "broker_submission_policy": getattr(details, "submission_policy", None),
         "dashboard_mode": getattr(details, "dashboard_mode", None),
         "baseline_valid_for_comparison": getattr(details, "baseline_valid_for_comparison", None),
         "baseline_validation_errors": list(getattr(details, "baseline_validation_errors", ()) or ()),
+        "execution_context_matches_pointer_live": execution_context_matches_pointer_live,
+        "execution_context_validation_errors": list(
+            execution_context_validation_errors
+        ),
+        "effective_runtime_binding_valid": effective_runtime_binding_valid,
+        "effective_runtime_binding_errors": list(
+            effective_runtime_binding_errors
+        ),
+        "research_generation_sha256": research_generation_sha256,
+        "promotion_bundle_sha256": promotion_bundle_sha256,
+        "research_source_content_sha256": research_source_content_sha256,
         "max_usd_per_trade": float(getattr(config, "max_usd_per_trade", 0.0) or 0.0),
         "max_symbol_exposure_usd": float(getattr(config, "max_symbol_exposure_usd", 0.0) or 0.0),
         "max_open_positions": int(getattr(config, "max_open_positions", 0) or 0),
@@ -497,6 +708,13 @@ def _persist_startup_config(
         "block_trading_until_resync": bool(getattr(config, "block_trading_until_resync", False)),
         "assert_feed_on_startup": bool(getattr(config, "assert_feed_on_startup", False)),
         "log_bar_components": bool(getattr(config, "log_bar_components", False)),
+        "canonical_strategy_contract": canonical_strategy_contract,
+        "canonical_strategy_sha256": canonical_strategy_sha256,
+        "canonical_strategy_schema_name": CanonicalResolvedPromotedStrategy.schema_name,
+        "canonical_strategy_schema_version": CanonicalResolvedPromotedStrategy.schema_version,
+        "canonical_strategy_symbol_order_semantics": (
+            CanonicalResolvedPromotedStrategy.symbol_order_semantics
+        ),
         "resync_status": None,
         "resync_started_at_utc": None,
         "resync_completed_at_utc": None,
@@ -508,11 +726,11 @@ def _persist_startup_config(
         "gate_allows_entries": None,
         "gate_allows_exits": None,
     }
-    artifact_text = json.dumps(payload, indent=2)
+    artifact_text = json.dumps(payload, indent=2, allow_nan=False)
     artifact_path = _startup_artifact_path(started_at_utc)
-    artifact_path.write_text(artifact_text, encoding="utf-8")
-    latest_path = _startup_artifact_latest_path()
-    latest_path.write_text(artifact_text, encoding="utf-8")
+    _write_new_startup_artifact(artifact_path, artifact_text)
+    latest_path = artifact_path.parent / "startup_config.json"
+    _replace_startup_alias_atomically(latest_path, artifact_text)
     print(f"Persisted startup config: {artifact_path}")
     return artifact_path
 
@@ -569,7 +787,13 @@ def _validate_runtime_config_approval(details: object, preview: bool) -> None:
         return
     approved = getattr(details, "runtime_config_approved", None)
     runtime_path = getattr(details, "runtime_config_path", None)
-    if approved is True or (approved is None and not runtime_path):
+    if not runtime_path:
+        raise RuntimeError(
+            "Refusing to start live trading without an explicit approved runtime config "
+            "artifact. Environment-only configuration cannot inherit approval from the "
+            "promoted baseline."
+        )
+    if approved is True:
         return
     if os.getenv(ALLOW_UNAPPROVED_RUNTIME_ENV, "").strip().lower() in {"1", "true", "yes"}:
         print(
@@ -592,12 +816,176 @@ def _validate_runtime_config_approval(details: object, preview: bool) -> None:
     )
 
 
-def _attach_baseline_validation(details: object) -> object:
-    _, source = load_backtest_baseline(PROJECT_ROOT)
-    baseline_valid = source.get("valid_for_comparison", True)
-    baseline_errors = tuple(
-        str(item) for item in source.get("validation_errors", []) if str(item).strip()
-    )
+def _attach_baseline_validation(
+    details: object,
+    *,
+    strategy_evidence: object | None = None,
+) -> object:
+    runtime_path = getattr(details, "runtime_config_path", None)
+    research_generation_sha256: str | None = None
+    promotion_bundle_sha256: str | None = None
+    research_source_content_sha256: str | None = None
+    execution_context_matches_pointer_live = False
+    execution_context_validation_errors: tuple[str, ...] = ()
+    effective_runtime_binding_valid = False
+    effective_runtime_binding_errors: tuple[str, ...] = ()
+    if not runtime_path:
+        baseline_valid = False
+        baseline_errors = (
+            "explicit runtime config artifact is required; environment-only configuration "
+            "cannot inherit promoted baseline validation",
+        )
+        execution_context_validation_errors = (
+            "explicit runtime config artifact is required for pointer-live "
+            "execution-context comparison",
+        )
+        effective_runtime_binding_errors = (
+            "explicit runtime config artifact is required for effective runtime binding",
+        )
+    else:
+        first_read_sha256 = _validated_sha256_identity(
+            getattr(details, "runtime_config_sha256", None)
+        )
+        preflight_errors: list[str] = []
+        if first_read_sha256 is None:
+            preflight_errors.append(
+                "first-read runtime config SHA-256 is missing or invalid"
+            )
+        try:
+            _, effective_canonical_sha256 = _validated_runtime_strategy_payload(
+                getattr(details, "config"),
+                strategy_evidence,
+            )
+        except (AttributeError, ContractValidationError, TypeError, ValueError) as exc:
+            effective_canonical_sha256 = None
+            preflight_errors.append(
+                f"effective runtime canonical evidence is missing or invalid ({exc})"
+            )
+        if preflight_errors:
+            baseline_valid = False
+            baseline_errors = tuple(preflight_errors)
+            effective_runtime_binding_errors = tuple(preflight_errors)
+            execution_context_validation_errors = (
+                "pointer-live execution-context comparison was not attempted because "
+                "effective runtime binding inputs are invalid",
+            )
+        else:
+            _, source = load_backtest_baseline(
+                PROJECT_ROOT,
+                runtime_config_path=runtime_path,
+                expected_runtime_config_sha256=first_read_sha256,
+                effective_runtime_config=getattr(details, "config"),
+                effective_canonical_strategy_sha256=effective_canonical_sha256,
+            )
+            baseline_valid = source.get("valid_for_comparison") is True
+            baseline_errors = tuple(
+                str(item)
+                for item in source.get("validation_errors", [])
+                if str(item).strip()
+            )
+            if not baseline_valid and not baseline_errors:
+                baseline_errors = ("baseline validity metadata is missing or invalid",)
+            if baseline_valid and baseline_errors:
+                baseline_valid = False
+
+            raw_context_errors = source.get("execution_context_validation_errors")
+            if isinstance(raw_context_errors, (list, tuple)) and all(
+                type(error) is str and bool(error.strip())
+                for error in raw_context_errors
+            ):
+                execution_context_validation_errors = tuple(raw_context_errors)
+            elif raw_context_errors in (None, [], ()):
+                execution_context_validation_errors = ()
+            else:
+                execution_context_validation_errors = (
+                    "execution-context validation errors metadata is malformed",
+                )
+            execution_context_matches_pointer_live = (
+                source.get("execution_context_matches_pointer_live") is True
+                and not execution_context_validation_errors
+            )
+            if not execution_context_matches_pointer_live:
+                if not execution_context_validation_errors:
+                    execution_context_validation_errors = (
+                        "pointer-live execution-context match metadata is missing or invalid",
+                    )
+                baseline_valid = False
+                baseline_errors = tuple(
+                    dict.fromkeys(
+                        (*baseline_errors, *execution_context_validation_errors)
+                    )
+                )
+
+            raw_binding_errors = source.get("effective_runtime_binding_errors")
+            if isinstance(raw_binding_errors, (list, tuple)) and all(
+                type(error) is str and bool(error.strip())
+                for error in raw_binding_errors
+            ):
+                effective_runtime_binding_errors = tuple(raw_binding_errors)
+            elif raw_binding_errors in (None, [], ()):
+                effective_runtime_binding_errors = ()
+            else:
+                effective_runtime_binding_errors = (
+                    "effective runtime binding errors metadata is malformed",
+                )
+            selected_sha256 = _validated_sha256_identity(
+                source.get("selected_runtime_config_sha256")
+            )
+            if selected_sha256 != first_read_sha256:
+                effective_runtime_binding_errors = tuple(
+                    dict.fromkeys(
+                        (
+                            *effective_runtime_binding_errors,
+                            "selected runtime bytes do not match the first-read runtime config",
+                        )
+                    )
+                )
+            effective_runtime_binding_valid = (
+                source.get("effective_runtime_binding_valid") is True
+                and selected_sha256 == first_read_sha256
+                and not effective_runtime_binding_errors
+            )
+            if not effective_runtime_binding_valid:
+                if not effective_runtime_binding_errors:
+                    effective_runtime_binding_errors = (
+                        "effective runtime binding metadata is missing or invalid",
+                    )
+                baseline_valid = False
+                baseline_errors = tuple(
+                    dict.fromkeys(
+                        (*baseline_errors, *effective_runtime_binding_errors)
+                    )
+                )
+
+            if baseline_valid:
+                research_generation_sha256 = _validated_sha256_identity(
+                    source.get("research_generation_sha256")
+                )
+                promotion_bundle_sha256 = _validated_sha256_identity(
+                    source.get("promotion_bundle_sha256")
+                )
+                research_source_content_sha256 = _validated_sha256_identity(
+                    source.get("research_source_content_sha256")
+                )
+                identity_errors: list[str] = []
+                if research_generation_sha256 is None:
+                    identity_errors.append(
+                        "baseline research generation SHA-256 is missing or invalid"
+                    )
+                if promotion_bundle_sha256 is None:
+                    identity_errors.append(
+                        "baseline promotion bundle SHA-256 is missing or invalid"
+                    )
+                if research_source_content_sha256 is None:
+                    identity_errors.append(
+                        "baseline research source content SHA-256 is missing or invalid"
+                    )
+                if identity_errors:
+                    baseline_valid = False
+                    baseline_errors = (*baseline_errors, *identity_errors)
+                    research_generation_sha256 = None
+                    promotion_bundle_sha256 = None
+                    research_source_content_sha256 = None
     if dataclasses.is_dataclass(details):
         field_names = {field.name for field in dataclasses.fields(details)}
         updates: dict[str, object] = {}
@@ -605,19 +993,64 @@ def _attach_baseline_validation(details: object) -> object:
             updates["baseline_valid_for_comparison"] = baseline_valid
         if "baseline_validation_errors" in field_names:
             updates["baseline_validation_errors"] = baseline_errors
+        if "execution_context_matches_pointer_live" in field_names:
+            updates["execution_context_matches_pointer_live"] = (
+                execution_context_matches_pointer_live
+            )
+        if "execution_context_validation_errors" in field_names:
+            updates["execution_context_validation_errors"] = (
+                execution_context_validation_errors
+            )
+        if "effective_runtime_binding_valid" in field_names:
+            updates["effective_runtime_binding_valid"] = (
+                effective_runtime_binding_valid
+            )
+        if "effective_runtime_binding_errors" in field_names:
+            updates["effective_runtime_binding_errors"] = (
+                effective_runtime_binding_errors
+            )
+        if "research_generation_sha256" in field_names:
+            updates["research_generation_sha256"] = research_generation_sha256
+        if "promotion_bundle_sha256" in field_names:
+            updates["promotion_bundle_sha256"] = promotion_bundle_sha256
+        if "research_source_content_sha256" in field_names:
+            updates["research_source_content_sha256"] = research_source_content_sha256
         if updates:
             return dataclasses.replace(details, **updates)
         return details
     setattr(details, "baseline_valid_for_comparison", baseline_valid)
     setattr(details, "baseline_validation_errors", baseline_errors)
+    setattr(
+        details,
+        "execution_context_matches_pointer_live",
+        execution_context_matches_pointer_live,
+    )
+    setattr(
+        details,
+        "execution_context_validation_errors",
+        execution_context_validation_errors,
+    )
+    setattr(
+        details,
+        "effective_runtime_binding_valid",
+        effective_runtime_binding_valid,
+    )
+    setattr(
+        details,
+        "effective_runtime_binding_errors",
+        effective_runtime_binding_errors,
+    )
+    setattr(details, "research_generation_sha256", research_generation_sha256)
+    setattr(details, "promotion_bundle_sha256", promotion_bundle_sha256)
+    setattr(details, "research_source_content_sha256", research_source_content_sha256)
     return details
 
 
 def _validate_runtime_baseline(details: object, preview: bool) -> None:
     if preview:
         return
-    valid = getattr(details, "baseline_valid_for_comparison", True)
-    if valid is not False:
+    valid = getattr(details, "baseline_valid_for_comparison", None)
+    if valid is True:
         return
     if os.getenv(ALLOW_BASELINE_MISMATCH_ENV, "").strip().lower() in {"1", "true", "yes"}:
         print(
@@ -635,10 +1068,53 @@ def _validate_runtime_baseline(details: object, preview: bool) -> None:
     )
 
 
+def _require_repository_readiness(config_path: Path = PAPER_SHADOW_CONFIG_PATH) -> Path:
+    """Require fresh full-suite evidence before starting durable paper shadow."""
+
+    from tradeos.readiness import DEFAULT_EVIDENCE_DIR, select_latest_valid_evidence
+
+    selection = select_latest_valid_evidence(
+        DEFAULT_EVIDENCE_DIR,
+        config_path=config_path,
+        repo_root=PROJECT_ROOT,
+    )
+    if selection.evidence is None:
+        rejected = tuple(selection.rejected)
+        detail = "no readiness evidence exists"
+        if rejected:
+            _, reason = rejected[0]
+            detail = f"newest evidence was rejected: {reason}"
+        raise RuntimeError(
+            "Refusing to start paper shadow without fresh, current, complete "
+            f"offline-suite readiness evidence ({detail}). Run "
+            "`python -m tradeos verify-readiness` after all code and config changes."
+        )
+    return selection.evidence.path
+
+
+def _run_verify_readiness(args: argparse.Namespace) -> int:
+    from tradeos.readiness import ReadinessError, run_full_suite_readiness
+
+    try:
+        evidence = run_full_suite_readiness(
+            config_path=args.config,
+            repo_root=PROJECT_ROOT,
+            evidence_dir=args.evidence_dir,
+        )
+    except ReadinessError as exc:
+        print(f"READINESS_BLOCKED: {exc}")
+        return 2
+    print(f"READINESS_PASSED: {evidence.path}")
+    return 0
+
+
 def _run_live(preview: bool, *, paper_shadow: bool = False) -> int:
     load_dotenv(PROJECT_ROOT / ".env")
     database_path = resolve_database_path()
     print(f"Database authority: {database_path}")
+    if paper_shadow:
+        evidence_path = _require_repository_readiness()
+        print(f"Repository readiness evidence: {evidence_path}")
     live_lock = contextlib.nullcontext()
     execution_lock = contextlib.nullcontext()
     writer_mode = not preview or paper_shadow
@@ -655,8 +1131,15 @@ def _run_live(preview: bool, *, paper_shadow: bool = False) -> int:
             with live_lock:
                 import trading_bot
 
-                details = _attach_baseline_validation(trading_bot.load_config_details())
+                details = trading_bot.load_config_details()
                 config = details.config
+                strategy_evidence = (
+                    trading_bot.build_runtime_canonical_strategy_evidence(config)
+                )
+                details = _attach_baseline_validation(
+                    details,
+                    strategy_evidence=strategy_evidence,
+                )
                 mode = "paper-shadow" if paper_shadow else ("preview" if preview else "live")
                 session_id = (
                     f"{mode}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
@@ -685,6 +1168,7 @@ def _run_live(preview: bool, *, paper_shadow: bool = False) -> int:
                         details,
                         preview=preview or paper_shadow,
                         session_id=session_id,
+                        strategy_evidence=strategy_evidence,
                         database_path=database_path,
                         launch_mode=mode,
                         execution_enabled=execute_orders,
@@ -866,6 +1350,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_live(preview=True, paper_shadow=True)
     if args.command == "reconcile":
         return _run_reconcile()
+    if args.command == "verify-readiness":
+        return _run_verify_readiness(args)
     if args.command == "repair-local-state":
         return _run_repair_local_state(args)
     if args.command == "dashboard":

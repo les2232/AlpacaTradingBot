@@ -144,6 +144,13 @@ def test_drift_summary_html_renders_operator_alerts() -> None:
     assert "Observed: 0.80 per symbol/day" in html
 
 
+def test_drift_summary_html_never_claims_validated_profile_without_evidence() -> None:
+    html = dashboard._drift_summary_html(None)
+
+    assert html == ""
+    assert "within the validated profile" not in html
+
+
 def test_last_cycle_summary_surfaces_evaluation_errors() -> None:
     report = SimpleNamespace(
         processed_bar=True,
@@ -249,6 +256,35 @@ def test_status_overview_reports_degraded_resync(monkeypatch) -> None:
     assert title == "Degraded"
     assert tone == "warn"
     assert "exits-only" in copy
+
+
+def test_status_overview_never_reports_running_when_snapshot_metadata_is_unbound(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        dashboard,
+        "_is_past_session_flatten_deadline",
+        lambda now_utc=None: False,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "_live_bot_process_health",
+        lambda: ("running", "Live TradeOS process detected."),
+    )
+    state = SimpleNamespace(
+        startup_config=None,
+        last_cycle_report=SimpleNamespace(processed_bar=True, skip_reason=""),
+        has_persisted_snapshot=True,
+        snapshot=SimpleNamespace(timestamp_utc="2026-08-17T14:45:00+00:00"),
+        feed_status="persisted bar fresh (0s late)",
+    )
+
+    title, tone, copy = dashboard._status_overview(state)
+
+    assert title in {"Metadata Unbound", "Metadata Unavailable"}
+    assert title != "Running"
+    assert tone in {"warn", "err"}
+    assert "metadata" in copy.lower()
 
 
 def test_build_operator_header_summary_includes_runtime_and_resync_cues(monkeypatch) -> None:

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import Mock
 from uuid import uuid4
+import hashlib
 import json
 import os
 
@@ -803,13 +804,37 @@ def test_perform_startup_resync_recovers_recent_fill() -> None:
     assert ("fill-1", 2.0) in bot._logged_fills
 
 
-def test_update_startup_artifact_with_resync_writes_gate_state() -> None:
-    artifact_dir = Path.cwd() / f"test_resync_artifact_{uuid4().hex}"
+def test_update_startup_artifact_with_resync_creates_immutable_revision(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "resync"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / "startup_config.20260422T130000Z.json"
-    artifact_path.write_text(json.dumps({"session_id": "session-test"}), encoding="utf-8")
+    config = trading_bot.BotConfig(
+        symbols=["AMD"],
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=3,
+        max_daily_loss_usd=300.0,
+        sma_bars=20,
+        bar_timeframe_minutes=15,
+        strategy_mode="mean_reversion",
+    )
+    evidence = trading_bot.build_runtime_canonical_strategy_evidence(config)
+    source_payload = {
+        "artifact_schema_name": trading_bot.STARTUP_CONFIG_SCHEMA_NAME,
+        "artifact_schema_version": trading_bot.STARTUP_CONFIG_SCHEMA_VERSION,
+        "artifact_type": "startup_config",
+        "session_id": "session-test",
+        "symbols": ["AMD"],
+        "canonical_strategy_contract": evidence["canonical_strategy_contract"],
+        "canonical_strategy_sha256": evidence["canonical_strategy_sha256"],
+    }
+    artifact_path.write_text(json.dumps(source_payload, indent=2), encoding="utf-8")
+    source_bytes = artifact_path.read_bytes()
 
     bot = _build_resync_bot(latest_run=None, latest_symbols=[], order_history=[], lifecycle_events=[])
+    bot.runtime_strategy_evidence = evidence
     result = trading_bot.ResyncResult(
         status=trading_bot.ResyncStatus.DEGRADED,
         started_at_utc="2026-04-22T13:00:00+00:00",
@@ -822,24 +847,25 @@ def test_update_startup_artifact_with_resync_writes_gate_state() -> None:
     previous = os.environ.get(trading_bot.STARTUP_ARTIFACT_PATH_ENV)
     os.environ[trading_bot.STARTUP_ARTIFACT_PATH_ENV] = str(artifact_path)
     try:
-        bot._update_startup_artifact_with_resync(result)
-        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        revision_path = bot._update_startup_artifact_with_resync(result)
+        assert revision_path is not None
+        payload = json.loads(revision_path.read_text(encoding="utf-8"))
         latest_payload = json.loads((artifact_dir / "startup_config.json").read_text(encoding="utf-8"))
+        assert artifact_path.read_bytes() == source_bytes
+        assert revision_path.name.startswith("startup_resync.")
         assert payload["resync_status"] == "RESYNC_DEGRADED"
         assert payload["gate_allows_entries"] is False
         assert payload["gate_allows_exits"] is True
         assert payload["resync_reason_codes"] == ["RESYNC_LOOKBACK_INSUFFICIENT"]
+        assert payload["source_startup_artifact_name"] == artifact_path.name
+        assert payload["source_startup_sha256"] == hashlib.sha256(source_bytes).hexdigest()
         assert latest_payload == payload
+        assert list(artifact_dir.glob("startup_config.*.json")) == [artifact_path]
     finally:
         if previous is None:
             os.environ.pop(trading_bot.STARTUP_ARTIFACT_PATH_ENV, None)
         else:
             os.environ[trading_bot.STARTUP_ARTIFACT_PATH_ENV] = previous
-        for child in sorted(artifact_dir.rglob("*"), reverse=True):
-            if child.is_file():
-                child.unlink()
-            else:
-                child.rmdir()
 
 
 def test_evaluate_symbol_does_not_log_trend_filter_reject_when_mr_trend_filter_disabled() -> None:
@@ -943,7 +969,11 @@ def test_load_config_details_loads_dotenv_before_base_config(monkeypatch) -> Non
         return True
 
     monkeypatch.setattr(trading_bot, "load_dotenv", fake_load_dotenv)
-    monkeypatch.setattr(trading_bot, "_load_runtime_config_payload", lambda: (None, None, None))
+    monkeypatch.setattr(
+        trading_bot,
+        "_load_runtime_config_payload",
+        lambda: (None, None, None, None),
+    )
 
     details = trading_bot.load_config_details()
 
@@ -1059,6 +1089,10 @@ def test_apply_runtime_config_accepts_live_safety_controls() -> None:
         base,
         runtime_path=trading_bot.Path("config/live_config.json"),
         runtime={
+            "max_usd_per_trade": 250.0,
+            "max_symbol_exposure_usd": 500.0,
+            "max_open_positions": 4,
+            "max_daily_loss_usd": 350.0,
             "ml_lookback_bars": 400,
             "breakout_max_stop_pct": 0.01,
             "sma_stop_pct": 0.02,
@@ -1069,6 +1103,10 @@ def test_apply_runtime_config_accepts_live_safety_controls() -> None:
         },
     )
 
+    assert config.max_usd_per_trade == 250.0
+    assert config.max_symbol_exposure_usd == 500.0
+    assert config.max_open_positions == 4
+    assert config.max_daily_loss_usd == 350.0
     assert config.ml_lookback_bars == 400
     assert config.breakout_max_stop_pct == 0.01
     assert config.sma_stop_pct == 0.02
@@ -1076,6 +1114,10 @@ def test_apply_runtime_config_accepts_live_safety_controls() -> None:
     assert config.max_price_deviation_bps == 10.0
     assert config.max_data_delay_seconds == 30
     assert config.max_live_price_age_seconds == 5
+    assert "max_usd_per_trade" in changed
+    assert "max_symbol_exposure_usd" in changed
+    assert "max_open_positions" in changed
+    assert "max_daily_loss_usd" in changed
     assert "ml_lookback_bars" in changed
     assert "breakout_max_stop_pct" in changed
     assert "sma_stop_pct" in changed

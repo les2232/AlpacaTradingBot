@@ -15,21 +15,25 @@ Read these first:
 
 ## Main Modes
 
-### Live or preview trading
+### Controlled runtime modes
 
-- `tradeos live`
-  Runs the live bot with normal execution behavior.
+- `tradeos live` and `tradeos paper`
+  These are order-capable commands that can submit paper broker orders. They are outside the monitoring and no-submit workflow.
 - `tradeos preview`
   Runs the same runtime path with execution disabled.
-- `.\start_dashboard.ps1`
-  Preferred operator launcher. Starts or safely reuses the live bot, then starts a dashboard on a verified free port.
+- `tradeos paper-shadow`
+  Runs the named paper-shadow profile with broker submission denied. Use it only as a manually supervised no-submit session.
+- `.\start_dashboard.ps1 -PaperShadow`
+  Explicitly starts a supervised no-submit paper-shadow session, then starts the read-only dashboard on a verified free port.
 
 ### Monitoring
 
 - `tradeos dashboard`
   Starts the Streamlit dashboard directly.
+- `.\start_dashboard.ps1`
+  Starts only the read-only dashboard by default; it does not start a trading or shadow process.
 - `.\start_dashboard.ps1 -DashboardOnly`
-  Opens monitoring without starting a live bot.
+  Explicit dashboard-only form of the default launcher behavior.
 
 Streamlit is now the only supported UI surface in the repository.
 
@@ -89,7 +93,7 @@ Keep active trading settings in [`config/live_config.json`](config/live_config.j
 ```powershell
 tradeos --help
 tradeos preview
-tradeos live
+tradeos paper-shadow
 tradeos dashboard
 tradeos backtest --dataset datasets\YOUR_DATASET --strategy-mode sma
 tradeos snapshot --symbols AAPL MSFT NVDA --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z --timeframe 15Min --feed iex

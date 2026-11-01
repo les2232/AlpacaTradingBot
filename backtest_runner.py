@@ -1,17 +1,30 @@
 import argparse
+from collections.abc import Mapping, Sequence
+import hashlib
 import json
 import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import perf_counter
 from typing import Any
 
 import pandas as pd
 
-from dataset_integrity import load_verified_manifest
-from ml.model_artifact import ModelArtifactError, load_model_payload
+from dataset_integrity import DatasetIntegrityError, file_sha256, load_verified_manifest
+from ml.model_artifact import (
+    LoadedModelArtifact,
+    ModelArtifactError,
+    load_model_payload_with_evidence,
+)
+from tradeos.strategy_contract import (
+    PROMOTED_STRATEGY_FIELDS,
+    RUNTIME_FIXED_STRATEGY_ASSUMPTIONS,
+    CanonicalResolvedPromotedStrategy,
+    ContractValidationError,
+    validate_runtime_fixed_strategy_values,
+)
 
 from strategy import (
     BOLLINGER_EXIT_CHOICES,
@@ -105,7 +118,42 @@ DEFAULT_ML_LOOKBACK_BARS = 320
 DEFAULT_ML_RETRAIN_EVERY_BARS = 15
 DEFAULT_ML_PROBABILITY_BUY = 0.55
 DEFAULT_ML_PROBABILITY_SELL = 0.45
+# Historical backtests used 0.0 for these three fields, silently disabling
+# filters that live execution enables by default.  Canonical strategy schema
+# v1 aligns unsupplied backtests with the authoritative StrategyConfig and
+# BotConfig defaults so research and live resolution have the same behavior.
+DEFAULT_VWAP_Z_ENTRY_THRESHOLD = 1.5
+DEFAULT_MIN_ATR_PERCENTILE = 20.0
+DEFAULT_MAX_ADX_THRESHOLD = 25.0
 OFFLINE_MODEL_PATH = Path(__file__).resolve().parent / "ml" / "models" / "logistic_latest.pkl"
+MODEL_EXECUTION_EVIDENCE_SCHEMA_NAME = "tradeos.backtest_model_execution_evidence"
+MODEL_EXECUTION_EVIDENCE_SCHEMA_VERSION = 1
+MODEL_EXECUTION_EVIDENCE_JSON_COLUMN = "model_execution_evidence_json"
+MODEL_EXECUTION_EVIDENCE_SHA256_COLUMN = "model_execution_evidence_sha256"
+_MODEL_EXECUTION_EVIDENCE_FIELDS = frozenset(
+    {
+        "schema_name",
+        "schema_version",
+        "used",
+        "model_path",
+        "model_sha256",
+        "sidecar_path",
+        "sidecar_declared_sha256",
+        "sidecar_sha256",
+        "feature_columns",
+        "training_metadata",
+        "training_dataset_identity",
+    }
+)
+_TRAINING_DATASET_IDENTITY_FIELDS = frozenset(
+    {
+        "dataset_reference",
+        "dataset_id",
+        "manifest_sha256",
+        "bars_sha256",
+        "snapshot_sha256",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -130,10 +178,10 @@ class BacktestConfig:
     mean_reversion_stop_pct: float = 0.0
     mean_reversion_trend_filter: bool = False
     mean_reversion_trend_slope_filter: bool = False
-    vwap_z_entry_threshold: float = 0.0
+    vwap_z_entry_threshold: float = DEFAULT_VWAP_Z_ENTRY_THRESHOLD
     vwap_z_stop_atr_multiple: float = 2.0
-    min_atr_percentile: float = 0.0
-    max_adx_threshold: float = 0.0
+    min_atr_percentile: float = DEFAULT_MIN_ATR_PERCENTILE
+    max_adx_threshold: float = DEFAULT_MAX_ADX_THRESHOLD
     trend_pullback_min_adx: float = 20.0
     trend_pullback_min_slope: float = 0.0
     trend_pullback_entry_threshold: float = 0.0015
@@ -184,6 +232,77 @@ class BacktestConfig:
     ml_retrain_every_bars: int = DEFAULT_ML_RETRAIN_EVERY_BARS
     ml_probability_buy: float = DEFAULT_ML_PROBABILITY_BUY
     ml_probability_sell: float = DEFAULT_ML_PROBABILITY_SELL
+
+
+_BACKTEST_RESOLUTION_SELECTORS = frozenset(
+    {
+        "strategy_mode",
+        "sma_bars",
+        "symbol_strategy_modes",
+        "bar_timeframe_minutes",
+    }
+)
+
+
+def build_backtest_canonical_strategy_evidence(
+    *,
+    symbols: Sequence[str],
+    bar_timeframe_minutes: int,
+    sma_bars: int,
+    strategy_mode: str,
+    symbol_strategy_modes: Mapping[str, str],
+    strategy_values: Mapping[str, object],
+    runtime_fixed_strategy_values: Mapping[str, object],
+) -> dict[str, object]:
+    """Build the canonical identity for an already-resolved backtest.
+
+    This is the pure producer boundary shared by ``run_backtest`` and focused
+    acceptance tests.  ``strategy_values`` contains the promoted values other
+    than the four explicitly supplied selectors.  No defaults are inferred at
+    this boundary, and the research-only fixed values must prove exact live
+    parity through ``from_research_resolution``.
+    """
+
+    if not isinstance(strategy_values, Mapping):
+        raise ContractValidationError("strategy_values must be an object mapping.")
+    duplicated_selectors = set(strategy_values) & _BACKTEST_RESOLUTION_SELECTORS
+    if duplicated_selectors:
+        raise ContractValidationError(
+            "strategy_values must not duplicate resolved selectors: "
+            f"{sorted(duplicated_selectors)!r}."
+        )
+
+    promoted_values = dict(strategy_values)
+    promoted_values.update(
+        {
+            "strategy_mode": strategy_mode,
+            "sma_bars": sma_bars,
+            "symbol_strategy_modes": dict(symbol_strategy_modes),
+            "bar_timeframe_minutes": bar_timeframe_minutes,
+        }
+    )
+    contract = CanonicalResolvedPromotedStrategy.from_research_resolution(
+        symbols,
+        promoted_values,
+        runtime_fixed_strategy_values,
+    )
+    fixed_values = {
+        name: runtime_fixed_strategy_values[name]
+        for name, _expected in RUNTIME_FIXED_STRATEGY_ASSUMPTIONS
+    }
+    canonical_json = contract.canonical_json()
+    canonical_sha256 = contract.sha256()
+    return {
+        "contract": contract,
+        "symbols": list(contract.symbols),
+        "promoted_values": contract.promoted_values,
+        "symbol_strategy_modes": contract.promoted_values[
+            "symbol_strategy_modes"
+        ],
+        "runtime_fixed_strategy_values": fixed_values,
+        "canonical_strategy_json": canonical_json,
+        "canonical_strategy_sha256": canonical_sha256,
+    }
 
 
 @dataclass(frozen=True)
@@ -283,6 +402,113 @@ class _BacktestInputs:
     atr_multiple: float
     atr_percentile_threshold: float
     entry_threshold_pct: float
+
+
+def _manifest_bar_timeframe_minutes(manifest: Mapping[str, object]) -> int:
+    raw_timeframe = manifest.get("timeframe")
+    if type(raw_timeframe) is not str or not raw_timeframe.strip():
+        raise ContractValidationError(
+            "Dataset manifest must provide a canonical timeframe for strategy evidence."
+        )
+    normalized = raw_timeframe.strip().lower()
+    suffix_minutes = (
+        ("minutes", 1),
+        ("minute", 1),
+        ("mins", 1),
+        ("min", 1),
+        ("hours", 60),
+        ("hour", 60),
+        ("days", 390),
+        ("day", 390),
+    )
+    for suffix, multiplier in suffix_minutes:
+        if not normalized.endswith(suffix):
+            continue
+        amount_text = normalized[: -len(suffix)].strip()
+        if amount_text.isdigit() and int(amount_text) > 0:
+            return int(amount_text) * multiplier
+    raise ContractValidationError(
+        f"Unsupported dataset timeframe for strategy evidence: {raw_timeframe!r}."
+    )
+
+
+def _common_symbol_strategy_value(
+    *,
+    symbols: Sequence[str],
+    symbol_strategies: Mapping[str, Strategy],
+    field_name: str,
+) -> object:
+    values: list[tuple[str, object]] = []
+    for symbol in symbols:
+        try:
+            value = getattr(symbol_strategies[symbol].config, field_name)
+        except (KeyError, AttributeError) as exc:
+            raise ContractValidationError(
+                f"Resolved backtest strategy is missing {field_name!r} for {symbol!r}."
+            ) from exc
+        values.append((symbol, value))
+    first_symbol, first_value = values[0]
+    mismatches = [
+        (symbol, value)
+        for symbol, value in values[1:]
+        if type(value) is not type(first_value) or value != first_value
+    ]
+    if mismatches:
+        raise ContractValidationError(
+            "Resolved per-symbol strategies disagree on promoted field "
+            f"{field_name!r}; {first_symbol!r}={first_value!r}, "
+            f"mismatches={mismatches!r}."
+        )
+    return first_value
+
+
+def _canonical_strategy_evidence_from_inputs(
+    inputs: _BacktestInputs,
+    *,
+    sma_bars: int,
+) -> dict[str, object]:
+    symbols = list(inputs.symbols)
+    if not symbols:
+        raise ContractValidationError(
+            "Resolved backtest strategy requires at least one active symbol."
+        )
+    if set(inputs.symbol_strategies) != set(symbols) or len(
+        inputs.symbol_strategies
+    ) != len(symbols):
+        raise ContractValidationError(
+            "Resolved symbol strategies must exactly match the active symbol universe."
+        )
+
+    symbol_modes = {
+        symbol: inputs.symbol_strategies[symbol].config.strategy_mode
+        for symbol in symbols
+    }
+    strategy_values = {
+        field_name: _common_symbol_strategy_value(
+            symbols=symbols,
+            symbol_strategies=inputs.symbol_strategies,
+            field_name=field_name,
+        )
+        for field_name in PROMOTED_STRATEGY_FIELDS
+        if field_name not in _BACKTEST_RESOLUTION_SELECTORS
+    }
+    runtime_fixed_values = {
+        field_name: _common_symbol_strategy_value(
+            symbols=symbols,
+            symbol_strategies=inputs.symbol_strategies,
+            field_name=field_name,
+        )
+        for field_name, _expected in RUNTIME_FIXED_STRATEGY_ASSUMPTIONS
+    }
+    return build_backtest_canonical_strategy_evidence(
+        symbols=symbols,
+        bar_timeframe_minutes=_manifest_bar_timeframe_minutes(inputs.manifest),
+        sma_bars=sma_bars,
+        strategy_mode=inputs.strategy_mode,
+        symbol_strategy_modes=symbol_modes,
+        strategy_values=strategy_values,
+        runtime_fixed_strategy_values=runtime_fixed_values,
+    )
 
 
 @dataclass
@@ -399,15 +625,356 @@ def _build_feature_vector(closes: list[float], volumes: list[float], idx: int) -
     ]
 
 
-def _load_offline_model_payload(model_path: Path = OFFLINE_MODEL_PATH) -> dict[str, Any]:
+@dataclass(frozen=True)
+class _ModelExecutionEvidence:
+    canonical_json: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _LoadedOfflineModel:
+    payload: dict[str, Any]
+    execution_evidence: _ModelExecutionEvidence
+
+
+def _normalize_model_evidence_json(value: object, *, field: str) -> object:
+    """Return finite, plain JSON values without discarding model metadata."""
+
+    if value is None or type(value) in {str, bool, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ContractValidationError(f"{field} must be finite.")
+        return 0.0 if value == 0.0 else value
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            converted = item()
+        except (TypeError, ValueError):
+            converted = value
+        if converted is not value:
+            return _normalize_model_evidence_json(converted, field=field)
+    if isinstance(value, Mapping):
+        normalized: dict[str, object] = {}
+        for key, child in value.items():
+            if type(key) is not str:
+                raise ContractValidationError(f"{field} keys must be strings.")
+            normalized[key] = _normalize_model_evidence_json(
+                child,
+                field=f"{field}.{key}",
+            )
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _normalize_model_evidence_json(child, field=f"{field}[{index}]")
+            for index, child in enumerate(value)
+        ]
+    raise ContractValidationError(
+        f"{field} contains unsupported value type {type(value).__name__}."
+    )
+
+
+def _reject_model_evidence_duplicate_pairs(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ContractValidationError(
+                f"Model execution evidence contains duplicate field {key!r}."
+            )
+        result[key] = value
+    return result
+
+
+def _reject_model_evidence_nonfinite(token: str) -> None:
+    raise ContractValidationError(
+        f"Model execution evidence contains non-finite number {token!r}."
+    )
+
+
+def _strict_model_evidence_json(text: str, *, field: str) -> object:
+    if type(text) is not str:
+        raise ContractValidationError(f"{field} must be JSON text.")
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_model_evidence_duplicate_pairs,
+            parse_constant=_reject_model_evidence_nonfinite,
+        )
+    except json.JSONDecodeError as exc:
+        raise ContractValidationError(f"{field} is malformed JSON: {exc.msg}.") from exc
+
+
+def _canonical_model_execution_evidence(
+    payload: Mapping[str, object],
+) -> _ModelExecutionEvidence:
+    normalized = _normalize_model_evidence_json(
+        payload,
+        field="model_execution_evidence",
+    )
+    if not isinstance(normalized, dict):
+        raise ContractValidationError("Model execution evidence must be an object.")
+    try:
+        canonical_json = json.dumps(
+            normalized,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ContractValidationError(
+            "Model execution evidence must be finite canonical JSON."
+        ) from exc
+    return _ModelExecutionEvidence(
+        canonical_json=canonical_json,
+        sha256=hashlib.sha256(canonical_json.encode("utf-8")).hexdigest(),
+    )
+
+
+def _require_model_sha256(value: object, *, field: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise ContractValidationError(f"{field} must be a lowercase SHA-256 digest.")
+    return value
+
+
+def _safe_repo_relative_path(path: Path, *, repo_root: Path, field: str) -> str:
+    try:
+        resolved_root = Path(repo_root).resolve(strict=True)
+        resolved_path = Path(path).resolve(strict=True)
+        relative = resolved_path.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise ContractValidationError(
+            f"{field} must resolve to an existing path within the repository."
+        ) from exc
+    value = relative.as_posix()
+    pure = PurePosixPath(value)
+    if not value or value == "." or pure.is_absolute() or ".." in pure.parts:
+        raise ContractValidationError(f"{field} must be a safe repo-relative path.")
+    return value
+
+
+def _load_training_dataset_identity(
+    dataset_value: object,
+    *,
+    repo_root: Path,
+) -> tuple[dict[str, str], str]:
+    if type(dataset_value) is not str or not dataset_value.strip():
+        raise ContractValidationError(
+            "Offline model training metadata must declare a nonblank dataset path."
+        )
+    raw_path = Path(dataset_value.strip())
+    dataset_path = raw_path if raw_path.is_absolute() else Path(repo_root) / raw_path
+    dataset_reference = _safe_repo_relative_path(
+        dataset_path,
+        repo_root=repo_root,
+        field="model training dataset",
+    )
+    dataset_path = Path(repo_root).resolve(strict=True) / PurePosixPath(dataset_reference)
+    if not dataset_path.is_dir():
+        raise ContractValidationError(
+            "Offline model training dataset must resolve to a repository directory."
+        )
+    manifest_path = dataset_path / "manifest.json"
+    bars_path = dataset_path / "bars.parquet"
+    if not manifest_path.is_file() or not bars_path.is_file():
+        raise ContractValidationError(
+            "Offline model training dataset requires manifest.json and bars.parquet."
+        )
+    try:
+        manifest_raw = manifest_path.read_bytes()
+        manifest_text = manifest_raw.decode("utf-8")
+        manifest = json.loads(
+            manifest_text,
+            object_pairs_hook=_reject_model_evidence_duplicate_pairs,
+            parse_constant=_reject_model_evidence_nonfinite,
+        )
+        verified_manifest = load_verified_manifest(dataset_path)
+        manifest_raw_after_verification = manifest_path.read_bytes()
+    except (OSError, UnicodeError, json.JSONDecodeError, DatasetIntegrityError) as exc:
+        raise ContractValidationError(
+            "Offline model training dataset integrity verification failed."
+        ) from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest != verified_manifest
+        or manifest_raw != manifest_raw_after_verification
+    ):
+        raise ContractValidationError(
+            "Offline model training dataset manifest is not one stable strict JSON object."
+        )
+
+    dataset_id = manifest.get("dataset_id")
+    if type(dataset_id) is not str or not dataset_id.strip():
+        raise ContractValidationError(
+            "Offline model training dataset manifest must declare dataset_id."
+        )
+    if dataset_id != dataset_path.name:
+        raise ContractValidationError(
+            "Offline model training dataset_id must match its directory name."
+        )
+    bars_sha256 = _require_model_sha256(
+        manifest.get("bars_sha256"),
+        field="model training dataset bars_sha256",
+    )
+    snapshot_sha256 = _require_model_sha256(
+        manifest.get("snapshot_sha256"),
+        field="model training dataset snapshot_sha256",
+    )
+    try:
+        observed_bars_sha256 = file_sha256(bars_path)
+    except OSError as exc:
+        raise ContractValidationError(
+            "Offline model training dataset bars are unreadable."
+        ) from exc
+    if observed_bars_sha256 != bars_sha256:
+        raise ContractValidationError(
+            "Offline model training dataset bars changed during provenance capture."
+        )
+    return (
+        {
+            "dataset_reference": dataset_reference,
+            "dataset_id": dataset_id,
+            "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+            "bars_sha256": bars_sha256,
+            "snapshot_sha256": snapshot_sha256,
+        },
+        dataset_reference,
+    )
+
+
+def _unused_model_execution_evidence() -> _ModelExecutionEvidence:
+    return _canonical_model_execution_evidence(
+        {
+            "schema_name": MODEL_EXECUTION_EVIDENCE_SCHEMA_NAME,
+            "schema_version": MODEL_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+            "used": False,
+            "model_path": None,
+            "model_sha256": None,
+            "sidecar_path": None,
+            "sidecar_declared_sha256": None,
+            "sidecar_sha256": None,
+            "feature_columns": [],
+            "training_metadata": {},
+            "training_dataset_identity": None,
+        }
+    )
+
+
+def _used_model_execution_evidence(
+    loaded: LoadedModelArtifact,
+    *,
+    model_path: Path,
+    repo_root: Path,
+) -> _ModelExecutionEvidence:
+    if (
+        loaded.sidecar_declared_sha256 is None
+        or loaded.sidecar_sha256 is None
+    ):
+        raise ContractValidationError(
+            "ML/hybrid backtests require a verified model SHA-256 sidecar."
+        )
+    model_sha256 = _require_model_sha256(
+        loaded.model_sha256,
+        field="executed model SHA-256",
+    )
+    sidecar_declared_sha256 = _require_model_sha256(
+        loaded.sidecar_declared_sha256,
+        field="model sidecar declaration",
+    )
+    sidecar_sha256 = _require_model_sha256(
+        loaded.sidecar_sha256,
+        field="model sidecar SHA-256",
+    )
+    if sidecar_declared_sha256 != model_sha256:
+        raise ContractValidationError(
+            "Model sidecar declaration does not match the executed model bytes."
+        )
+
+    model_reference = _safe_repo_relative_path(
+        model_path,
+        repo_root=repo_root,
+        field="executed model path",
+    )
+    sidecar_path = Path(model_path).with_suffix(Path(model_path).suffix + ".sha256")
+    sidecar_reference = _safe_repo_relative_path(
+        sidecar_path,
+        repo_root=repo_root,
+        field="executed model sidecar path",
+    )
+    feature_columns = loaded.payload.get("feature_cols")
+    if (
+        not isinstance(feature_columns, (list, tuple))
+        or not feature_columns
+        or any(type(column) is not str or not column for column in feature_columns)
+        or len(set(feature_columns)) != len(feature_columns)
+    ):
+        raise ContractValidationError(
+            "Executed model feature columns must be nonempty and unique."
+        )
+    metadata = loaded.payload.get("metadata")
+    if not isinstance(metadata, Mapping) or not metadata:
+        raise ContractValidationError(
+            "ML/hybrid backtests require explicit model training metadata."
+        )
+    training_dataset_identity, dataset_reference = _load_training_dataset_identity(
+        metadata.get("dataset"),
+        repo_root=repo_root,
+    )
+    normalized_metadata = _normalize_model_evidence_json(
+        metadata,
+        field="model training metadata",
+    )
+    if not isinstance(normalized_metadata, dict):
+        raise ContractValidationError("Model training metadata must be an object.")
+    # Remove machine-specific absolute paths while preserving the exact dataset
+    # identity separately and making the retained metadata portable.
+    normalized_metadata["dataset"] = dataset_reference
+
+    return _canonical_model_execution_evidence(
+        {
+            "schema_name": MODEL_EXECUTION_EVIDENCE_SCHEMA_NAME,
+            "schema_version": MODEL_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+            "used": True,
+            "model_path": model_reference,
+            "model_sha256": model_sha256,
+            "sidecar_path": sidecar_reference,
+            "sidecar_declared_sha256": sidecar_declared_sha256,
+            "sidecar_sha256": sidecar_sha256,
+            "feature_columns": list(feature_columns),
+            "training_metadata": normalized_metadata,
+            "training_dataset_identity": training_dataset_identity,
+        }
+    )
+
+
+def _load_offline_model_payload(
+    model_path: Path = OFFLINE_MODEL_PATH,
+    *,
+    repo_root: Path | None = None,
+) -> _LoadedOfflineModel:
     if not model_path.exists():
         raise RuntimeError(
             f"Offline ML model not found at {model_path}. "
             "Train it first so ML and HYBRID backtests can use the saved model."
         )
     try:
-        return load_model_payload(model_path)
-    except ModelArtifactError as exc:
+        loaded = load_model_payload_with_evidence(model_path)
+        execution_evidence = _used_model_execution_evidence(
+            loaded,
+            model_path=model_path,
+            repo_root=repo_root or Path(__file__).resolve().parent,
+        )
+        return _LoadedOfflineModel(
+            payload=loaded.payload,
+            execution_evidence=execution_evidence,
+        )
+    except (ModelArtifactError, ContractValidationError) as exc:
         raise RuntimeError(str(exc)) from exc
 
 
@@ -644,7 +1211,12 @@ def _load_filtered_dataset(
     return df, manifest, active_symbols
 
 
-def _prepare_symbol_data(symbol: str, sdf: pd.DataFrame) -> PreparedSymbolData:
+def _prepare_symbol_data(
+    symbol: str,
+    sdf: pd.DataFrame,
+    *,
+    source_bar_minutes: int,
+) -> PreparedSymbolData:
     sdf = sdf.sort_values("timestamp").reset_index(drop=True).copy()
     timestamps = [pd.Timestamp(ts) for ts in sdf["timestamp"].tolist()]
     timestamps_et = [ts.tz_convert("America/New_York") for ts in timestamps]
@@ -674,7 +1246,7 @@ def _prepare_symbol_data(symbol: str, sdf: pd.DataFrame) -> PreparedSymbolData:
         bullish_regime=calculate_hourly_regime_series(
             timestamps,
             closes,
-            source_bar_minutes=15,
+            source_bar_minutes=source_bar_minutes,
             sma_period=REGIME_SMA_PERIOD,
         ),
         opening_range_high=opening_range_high,
@@ -684,13 +1256,22 @@ def _prepare_symbol_data(symbol: str, sdf: pd.DataFrame) -> PreparedSymbolData:
     )
 
 
-def _prepare_symbol_data_map(df: pd.DataFrame, symbols: list[str]) -> dict[str, PreparedSymbolData]:
+def _prepare_symbol_data_map(
+    df: pd.DataFrame,
+    symbols: list[str],
+    *,
+    source_bar_minutes: int,
+) -> dict[str, PreparedSymbolData]:
     prepared: dict[str, PreparedSymbolData] = {}
     for symbol in symbols:
         sdf = df[df["symbol"] == symbol]
         if sdf.empty:
             raise ValueError(f"Dataset has no rows for symbol {symbol}")
-        prepared[symbol] = _prepare_symbol_data(symbol, sdf)
+        prepared[symbol] = _prepare_symbol_data(
+            symbol,
+            sdf,
+            source_bar_minutes=source_bar_minutes,
+        )
     return prepared
 
 
@@ -1051,10 +1632,10 @@ def _prepare_backtest_inputs(
     bb_min_mid_slope: float = 0.0,
     bb_trend_filter: bool = False,
     bb_exit_mode: str = BOLLINGER_EXIT_MIDDLE_BAND,
-    vwap_z_entry_threshold: float = 0.0,
+    vwap_z_entry_threshold: float = DEFAULT_VWAP_Z_ENTRY_THRESHOLD,
     vwap_z_stop_atr_multiple: float = 2.0,
-    min_atr_percentile: float = 0.0,
-    max_adx_threshold: float = 0.0,
+    min_atr_percentile: float = DEFAULT_MIN_ATR_PERCENTILE,
+    max_adx_threshold: float = DEFAULT_MAX_ADX_THRESHOLD,
     trend_pullback_min_adx: float = 20.0,
     trend_pullback_min_slope: float = 0.0,
     trend_pullback_entry_threshold: float = 0.0015,
@@ -1411,36 +1992,30 @@ def _initialize_simulation_state(
     bb_breakout_down_arrs: dict[str, list[bool | None]] = {}
     bb_volume_confirm_arrs: dict[str, list[bool | None]] = {}
 
+    source_bar_minutes = _manifest_bar_timeframe_minutes(inputs.manifest)
+    prepared_symbols = _prepare_symbol_data_map(
+        df,
+        symbols,
+        source_bar_minutes=source_bar_minutes,
+    )
     for symbol in symbols:
         sdf = df[df["symbol"] == symbol].sort_values("timestamp").reset_index(drop=True)
+        prepared = prepared_symbols[symbol]
         symbols_dfs[symbol] = sdf
-        close_arrs[symbol] = sdf["close"].tolist()
-        high_arrs[symbol] = sdf["high"].tolist()
-        low_arrs[symbol] = sdf["low"].tolist()
-        volume_arrs[symbol] = sdf["volume"].tolist()
-        high_arrs_sym = high_arrs[symbol]
-        low_arrs_sym = low_arrs[symbol]
-        timestamp_arrs_sym = [pd.Timestamp(ts) for ts in sdf["timestamp"].tolist()]
-        timestamp_str_arrs[symbol] = [str(ts) for ts in timestamp_arrs_sym]
-        day_key_arrs[symbol] = [ts.tz_convert("America/New_York").normalize() for ts in timestamp_arrs_sym]
-        is_eod_arrs[symbol] = [
-            idx + 1 >= len(day_key_arrs[symbol]) or day_key_arrs[symbol][idx + 1] != day_key_arrs[symbol][idx]
-            for idx in range(len(day_key_arrs[symbol]))
-        ]
-        atr_pct_arrs[symbol] = calculate_atr_pct_values(high_arrs_sym, low_arrs_sym, close_arrs[symbol])
-        atr_percentile_arrs[symbol] = calculate_atr_percentile_series(
-            timestamp_arrs_sym, high_arrs_sym, low_arrs_sym, close_arrs[symbol],
-        )
-        bullish_regime_arrs[symbol] = calculate_hourly_regime_series(
-            timestamp_arrs_sym, close_arrs[symbol], source_bar_minutes=15, sma_period=REGIME_SMA_PERIOD,
-        )
-        opening_range_high_arrs[symbol], opening_range_low_arrs[symbol] = calculate_opening_range_series(
-            timestamp_arrs_sym, high_arrs_sym, low_arrs_sym,
-        )
-        vwap_arrs[symbol] = calculate_vwap_series(
-            timestamp_arrs_sym, high_arrs_sym, low_arrs_sym, close_arrs[symbol], volume_arrs[symbol],
-        )
-        adx_arrs[symbol] = calculate_adx_series(high_arrs_sym, low_arrs_sym, close_arrs[symbol])
+        close_arrs[symbol] = prepared.closes
+        high_arrs[symbol] = prepared.highs
+        low_arrs[symbol] = prepared.lows
+        volume_arrs[symbol] = prepared.volumes
+        timestamp_str_arrs[symbol] = prepared.timestamp_strings
+        day_key_arrs[symbol] = prepared.day_keys
+        is_eod_arrs[symbol] = prepared.is_eod
+        atr_pct_arrs[symbol] = prepared.atr_pct
+        atr_percentile_arrs[symbol] = prepared.atr_percentile
+        bullish_regime_arrs[symbol] = prepared.bullish_regime
+        opening_range_high_arrs[symbol] = prepared.opening_range_high
+        opening_range_low_arrs[symbol] = prepared.opening_range_low
+        vwap_arrs[symbol] = prepared.vwap
+        adx_arrs[symbol] = prepared.adx
         bb_features = calculate_bollinger_squeeze_features(
             close_arrs[symbol],
             volume_arrs[symbol],
@@ -2204,10 +2779,10 @@ def run_backtest(
     ml_retrain_every_bars: int = DEFAULT_ML_RETRAIN_EVERY_BARS,
     ml_probability_buy: float = DEFAULT_ML_PROBABILITY_BUY,
     ml_probability_sell: float = DEFAULT_ML_PROBABILITY_SELL,
-    vwap_z_entry_threshold: float = 0.0,
+    vwap_z_entry_threshold: float = DEFAULT_VWAP_Z_ENTRY_THRESHOLD,
     vwap_z_stop_atr_multiple: float = 2.0,
-    min_atr_percentile: float = 0.0,
-    max_adx_threshold: float = 0.0,
+    min_atr_percentile: float = DEFAULT_MIN_ATR_PERCENTILE,
+    max_adx_threshold: float = DEFAULT_MAX_ADX_THRESHOLD,
     trend_pullback_min_adx: float = 20.0,
     trend_pullback_min_slope: float = 0.0,
     trend_pullback_entry_threshold: float = 0.0015,
@@ -2325,6 +2900,10 @@ def run_backtest(
         wick_fade_target_atr_multiple=wick_fade_target_atr_multiple,
         wick_fade_max_hold_bars=wick_fade_max_hold_bars,
     )
+    canonical_strategy_evidence = _canonical_strategy_evidence_from_inputs(
+        inputs,
+        sma_bars=sma_bars,
+    )
     load_seconds = perf_counter() - load_start
 
     prep_start = perf_counter()
@@ -2336,7 +2915,15 @@ def run_backtest(
         for strategy in inputs.symbol_strategies.values()
     )
     model_load_start = perf_counter()
-    offline_model_payload = _load_offline_model_payload() if uses_ml else None
+    loaded_offline_model = _load_offline_model_payload() if uses_ml else None
+    offline_model_payload = (
+        loaded_offline_model.payload if loaded_offline_model is not None else None
+    )
+    model_execution_evidence = (
+        loaded_offline_model.execution_evidence
+        if loaded_offline_model is not None
+        else _unused_model_execution_evidence()
+    )
     model_load_seconds = perf_counter() - model_load_start
 
     ml_precompute_start = perf_counter()
@@ -2475,7 +3062,24 @@ def run_backtest(
         f"finalize={timing['finalize']:.3f}s "
         f"total={timing['total']:.3f}s"
     )
-    results["sma_bars"] = sma_bars
+    promoted_values = canonical_strategy_evidence["promoted_values"]
+    if not isinstance(promoted_values, Mapping):
+        raise RuntimeError("Canonical backtest evidence lost its promoted mapping.")
+    results.update(promoted_values)
+    results["symbols"] = list(canonical_strategy_evidence["symbols"])
+    results["runtime_fixed_strategy_values"] = dict(
+        canonical_strategy_evidence["runtime_fixed_strategy_values"]
+    )
+    results["canonical_strategy_json"] = canonical_strategy_evidence[
+        "canonical_strategy_json"
+    ]
+    results["canonical_strategy_sha256"] = canonical_strategy_evidence[
+        "canonical_strategy_sha256"
+    ]
+    results[MODEL_EXECUTION_EVIDENCE_JSON_COLUMN] = (
+        model_execution_evidence.canonical_json
+    )
+    results[MODEL_EXECUTION_EVIDENCE_SHA256_COLUMN] = model_execution_evidence.sha256
     return results
 
 
@@ -2483,24 +3087,247 @@ def run_backtest(
 # CLI helpers
 # ---------------------------------------------------------------------------
 
+def _validate_model_execution_relative_path(value: object, *, field: str) -> str:
+    if type(value) is not str or not value:
+        raise ContractValidationError(f"{field} must be a nonblank repo-relative path.")
+    pure = PurePosixPath(value)
+    if (
+        pure.is_absolute()
+        or ".." in pure.parts
+        or pure.as_posix() != value
+        or "\\" in value
+        or (pure.parts and ":" in pure.parts[0])
+        or value == "."
+    ):
+        raise ContractValidationError(f"{field} must be a safe repo-relative path.")
+    return value
+
+
+def _validate_model_execution_evidence(
+    result_dict: Mapping[str, object],
+    *,
+    contract: CanonicalResolvedPromotedStrategy,
+) -> dict[str, object]:
+    raw_json = result_dict[MODEL_EXECUTION_EVIDENCE_JSON_COLUMN]
+    raw_sha256 = result_dict[MODEL_EXECUTION_EVIDENCE_SHA256_COLUMN]
+    if type(raw_json) is not str:
+        raise ContractValidationError(
+            f"{MODEL_EXECUTION_EVIDENCE_JSON_COLUMN} must be a string."
+        )
+    if type(raw_sha256) is not str:
+        raise ContractValidationError(
+            f"{MODEL_EXECUTION_EVIDENCE_SHA256_COLUMN} must be a string."
+        )
+    parsed = _strict_model_evidence_json(
+        raw_json,
+        field=MODEL_EXECUTION_EVIDENCE_JSON_COLUMN,
+    )
+    normalized = _normalize_model_evidence_json(
+        parsed,
+        field="model_execution_evidence",
+    )
+    if not isinstance(normalized, dict) or set(normalized) != _MODEL_EXECUTION_EVIDENCE_FIELDS:
+        raise ContractValidationError("Model execution evidence fields must be exact.")
+    canonical = _canonical_model_execution_evidence(normalized)
+    if raw_json != canonical.canonical_json:
+        raise ContractValidationError(
+            "Model execution evidence must use exact compact canonical JSON."
+        )
+    if raw_sha256 != canonical.sha256:
+        raise ContractValidationError(
+            "model_execution_evidence_sha256 does not match its exact JSON."
+        )
+    if (
+        normalized["schema_name"] != MODEL_EXECUTION_EVIDENCE_SCHEMA_NAME
+        or type(normalized["schema_version"]) is not int
+        or normalized["schema_version"] != MODEL_EXECUTION_EVIDENCE_SCHEMA_VERSION
+        or type(normalized["used"]) is not bool
+        or type(normalized["feature_columns"]) is not list
+        or type(normalized["training_metadata"]) is not dict
+    ):
+        raise ContractValidationError("Model execution evidence schema is invalid.")
+
+    expected_used = any(
+        mode in (STRATEGY_MODE_ML, STRATEGY_MODE_HYBRID)
+        for mode in contract.promoted_values["symbol_strategy_modes"].values()
+    )
+    if normalized["used"] is not expected_used:
+        raise ContractValidationError(
+            "Model execution evidence used flag contradicts the resolved symbol modes."
+        )
+    if normalized["used"] is False:
+        nullable_fields = (
+            "model_path",
+            "model_sha256",
+            "sidecar_path",
+            "sidecar_declared_sha256",
+            "sidecar_sha256",
+            "training_dataset_identity",
+        )
+        if (
+            any(normalized[field] is not None for field in nullable_fields)
+            or normalized["feature_columns"]
+            or normalized["training_metadata"]
+        ):
+            raise ContractValidationError(
+                "Unused model evidence must use explicit empty and null values."
+            )
+        return normalized
+
+    model_path = _validate_model_execution_relative_path(
+        normalized["model_path"],
+        field="model execution model_path",
+    )
+    sidecar_path = _validate_model_execution_relative_path(
+        normalized["sidecar_path"],
+        field="model execution sidecar_path",
+    )
+    if sidecar_path != f"{model_path}.sha256":
+        raise ContractValidationError(
+            "Model execution sidecar_path must identify the executed model sidecar."
+        )
+    model_sha256 = _require_model_sha256(
+        normalized["model_sha256"],
+        field="model execution model_sha256",
+    )
+    sidecar_declared_sha256 = _require_model_sha256(
+        normalized["sidecar_declared_sha256"],
+        field="model execution sidecar_declared_sha256",
+    )
+    _require_model_sha256(
+        normalized["sidecar_sha256"],
+        field="model execution sidecar_sha256",
+    )
+    if sidecar_declared_sha256 != model_sha256:
+        raise ContractValidationError(
+            "Model sidecar declaration does not match the executed model bytes."
+        )
+    feature_columns = normalized["feature_columns"]
+    if (
+        not feature_columns
+        or any(type(column) is not str or not column for column in feature_columns)
+        or len(set(feature_columns)) != len(feature_columns)
+    ):
+        raise ContractValidationError(
+            "Used model evidence feature_columns must be nonempty and unique."
+        )
+    training_metadata = normalized["training_metadata"]
+    if not training_metadata:
+        raise ContractValidationError(
+            "Used model evidence requires explicit training_metadata."
+        )
+    training_dataset = normalized["training_dataset_identity"]
+    if (
+        type(training_dataset) is not dict
+        or set(training_dataset) != _TRAINING_DATASET_IDENTITY_FIELDS
+    ):
+        raise ContractValidationError(
+            "Model training dataset identity fields must be exact."
+        )
+    dataset_reference = _validate_model_execution_relative_path(
+        training_dataset["dataset_reference"],
+        field="model training dataset_reference",
+    )
+    dataset_id = training_dataset["dataset_id"]
+    if type(dataset_id) is not str or not dataset_id:
+        raise ContractValidationError(
+            "Model training dataset_id must be nonblank."
+        )
+    if PurePosixPath(dataset_reference).name != dataset_id:
+        raise ContractValidationError(
+            "Model training dataset_id must match dataset_reference."
+        )
+    for field in ("manifest_sha256", "bars_sha256", "snapshot_sha256"):
+        _require_model_sha256(
+            training_dataset[field],
+            field=f"model training {field}",
+        )
+    metadata_dataset = training_metadata.get("dataset")
+    if metadata_dataset is not None and metadata_dataset != dataset_reference:
+        raise ContractValidationError(
+            "Model training metadata dataset contradicts training_dataset_identity."
+        )
+    return normalized
+
+
+def _validate_backtest_result_strategy_evidence(result_dict: Mapping[str, object]) -> None:
+    evidence_fields = (
+        "symbols",
+        "runtime_fixed_strategy_values",
+        "canonical_strategy_json",
+        "canonical_strategy_sha256",
+        MODEL_EXECUTION_EVIDENCE_JSON_COLUMN,
+        MODEL_EXECUTION_EVIDENCE_SHA256_COLUMN,
+        *PROMOTED_STRATEGY_FIELDS,
+    )
+    missing = [name for name in evidence_fields if name not in result_dict]
+    if missing:
+        raise ContractValidationError(
+            "Backtest result is missing canonical strategy evidence: "
+            f"{missing!r}."
+        )
+
+    canonical_json = result_dict["canonical_strategy_json"]
+    if type(canonical_json) is not str:
+        raise ContractValidationError("canonical_strategy_json must be a string.")
+    contract = CanonicalResolvedPromotedStrategy.from_json(canonical_json)
+    if canonical_json != contract.canonical_json():
+        raise ContractValidationError(
+            "canonical_strategy_json must use the exact compact canonical serialization."
+        )
+
+    canonical_sha256 = result_dict["canonical_strategy_sha256"]
+    if type(canonical_sha256) is not str or canonical_sha256 != contract.sha256():
+        raise ContractValidationError(
+            "canonical_strategy_sha256 does not match canonical_strategy_json."
+        )
+
+    symbols = result_dict["symbols"]
+    if type(symbols) is not list or tuple(symbols) != contract.symbols:
+        raise ContractValidationError(
+            "Backtest result symbols do not match the canonical ordered universe."
+        )
+
+    validate_runtime_fixed_strategy_values(
+        result_dict["runtime_fixed_strategy_values"]  # type: ignore[arg-type]
+    )
+    expected_promoted = contract.promoted_values
+    for name in PROMOTED_STRATEGY_FIELDS:
+        actual = result_dict[name]
+        expected = expected_promoted[name]
+        if name == "symbol_strategy_modes":
+            if (
+                type(actual) is not dict
+                or tuple(actual) != contract.symbols
+                or actual != expected
+            ):
+                raise ContractValidationError(
+                    "Backtest result symbol_strategy_modes does not match the "
+                    "canonical full effective map."
+                )
+        elif type(actual) is not type(expected) or actual != expected:
+            raise ContractValidationError(
+                f"Backtest result field {name!r} does not match canonical_strategy_json."
+            )
+    _validate_model_execution_evidence(result_dict, contract=contract)
+
+
 def extract_clean_columns(result_dict: dict) -> dict:
+    _validate_backtest_result_strategy_evidence(result_dict)
     clean_cols = [
         "regime", "start_date", "end_date",
-        "strategy_mode", "time_window_mode", "regime_filter_enabled", "threshold_mode",
-        "entry_threshold_pct", "atr_multiple", "atr_percentile_threshold", "sma_bars", "orb_filter_mode",
-        "breakout_exit_style", "breakout_tight_stop_fraction", "mean_reversion_exit_style", "mean_reversion_max_atr_percentile",
-        "trend_pullback_exit_style", "trend_pullback_hold_bars", "trend_pullback_take_profit_pct",
+        # Lossless canonical research identity.  The compact envelope is the
+        # authoritative serialized representation; the ordered symbols,
+        # fixed assumptions, and all 65 flat promoted fields remain available
+        # to existing sweep/report consumers.
+        "symbols",
+        "runtime_fixed_strategy_values",
+        "canonical_strategy_json",
+        "canonical_strategy_sha256",
+        MODEL_EXECUTION_EVIDENCE_JSON_COLUMN,
+        MODEL_EXECUTION_EVIDENCE_SHA256_COLUMN,
+        *PROMOTED_STRATEGY_FIELDS,
         "trend_pullback_research_exit_fill",
-        "momentum_breakout_lookback_bars", "momentum_breakout_entry_buffer_pct",
-        "momentum_breakout_min_adx", "momentum_breakout_min_slope", "momentum_breakout_min_atr_percentile",
-        "momentum_breakout_exit_style", "momentum_breakout_hold_bars",
-        "momentum_breakout_stop_pct", "momentum_breakout_take_profit_pct",
-        "volatility_expansion_lookback_bars", "volatility_expansion_entry_buffer_pct",
-        "volatility_expansion_max_atr_percentile", "volatility_expansion_trend_filter",
-        "volatility_expansion_min_slope", "volatility_expansion_use_volume_confirm",
-        "volatility_expansion_exit_style", "volatility_expansion_hold_bars",
-        "volatility_expansion_stop_pct", "volatility_expansion_take_profit_pct",
-        "ml_probability_buy", "ml_probability_sell",
         "total_return_pct", "max_drawdown_pct",
         "total_trades", "total_buy_candidates", "skipped_trades",
         "competing_timestamps", "max_concurrent_positions",
@@ -2512,7 +3339,11 @@ def extract_clean_columns(result_dict: dict) -> dict:
         "timing_load_seconds", "timing_precompute_seconds", "timing_model_load_seconds",
         "timing_ml_precompute_seconds", "timing_simulate_seconds", "timing_finalize_seconds", "timing_total_seconds",
     ]
-    cleaned = {k: result_dict[k] for k in clean_cols if k in result_dict}
+    cleaned = {
+        key: result_dict[key]
+        for key in dict.fromkeys(clean_cols)
+        if key in result_dict
+    }
     timing = result_dict.get("timing_seconds")
     if timing:
         cleaned.update({
@@ -3787,8 +4618,8 @@ def main() -> None:
     parser.add_argument(
         "--vwap-z-entry-threshold",
         type=float,
-        default=0.0,
-        help="VWAP z-score magnitude required to trigger entry (default: 0 = disabled, e.g. 2.0).",
+        default=DEFAULT_VWAP_Z_ENTRY_THRESHOLD,
+        help="VWAP z-score magnitude required to trigger entry (default: 1.5, matching live).",
     )
     parser.add_argument(
         "--vwap-z-stop-atr-multiple",
@@ -3799,14 +4630,14 @@ def main() -> None:
     parser.add_argument(
         "--min-atr-percentile",
         type=float,
-        default=0.0,
-        help="Skip entry if ATR percentile is below this threshold (default: 0 = disabled, e.g. 30).",
+        default=DEFAULT_MIN_ATR_PERCENTILE,
+        help="Skip entry if ATR percentile is below this threshold (default: 20, matching live).",
     )
     parser.add_argument(
         "--max-adx-threshold",
         type=float,
-        default=0.0,
-        help="Skip entry if ADX is above this threshold (default: 0 = disabled, e.g. 25).",
+        default=DEFAULT_MAX_ADX_THRESHOLD,
+        help="Skip entry if ADX is above this threshold (default: 25, matching live).",
     )
     parser.add_argument("--trend-pullback-min-adx", type=float, default=20.0,
                         help="Trend pullback: minimum ADX required for trend confirmation.")

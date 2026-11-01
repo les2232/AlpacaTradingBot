@@ -3,6 +3,7 @@ import hashlib
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any
 
 import pandas as pd
@@ -16,6 +17,7 @@ from dataset_integrity import write_immutable_dataset
 
 
 DATASET_ROOT = Path("datasets")
+_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z0-9.-]*$")
 CODE_HASH_FILES = (
     "dataset_snapshotter.py",
     "trading_bot.py",
@@ -74,6 +76,34 @@ def parse_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def format_utc_z(value: datetime) -> str:
+    """Serialize one aware instant using the repository's canonical UTC spelling."""
+    if value.tzinfo is None:
+        raise ValueError("UTC timestamps must be timezone-aware.")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def normalize_symbol_sequence(raw_symbols: list[object]) -> list[str]:
+    """Normalize symbols without changing their contract-significant order."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for index, raw_symbol in enumerate(raw_symbols):
+        if type(raw_symbol) is not str:
+            raise ValueError(f"Symbol at index {index} must be a string.")
+        symbol = raw_symbol.strip().upper()
+        if not symbol:
+            raise ValueError(f"Symbol at index {index} must not be blank.")
+        if not _SYMBOL_PATTERN.fullmatch(symbol):
+            raise ValueError(f"Symbol at index {index} has invalid characters: {symbol!r}")
+        if symbol in seen:
+            raise ValueError(f"Duplicate normalized symbol: {symbol}")
+        seen.add(symbol)
+        normalized.append(symbol)
+    if not normalized:
+        raise ValueError("At least one symbol is required.")
+    return normalized
 
 
 def parse_timeframe(value: str) -> TimeFrame:
@@ -138,16 +168,38 @@ def build_dataset_id(
     feed: str,
     code_hash: str,
 ) -> str:
-    sorted_syms = sorted(symbols)
-    symbols_key = "-".join(sorted_syms)
+    ordered_symbols = normalize_symbol_sequence(list(symbols))
+    symbols_key = "-".join(ordered_symbols)
     # Windows MAX_PATH is 260 chars; hash the symbol list when it would exceed safe limits.
     if len(symbols_key) > 100:
         sym_hash = hashlib.sha256(symbols_key.encode()).hexdigest()[:8]
-        symbols_key = f"{len(sorted_syms)}syms_{sym_hash}"
+        symbols_key = f"{len(ordered_symbols)}syms_{sym_hash}"
     timeframe_key = timeframe_text.replace(" ", "")
     start_key = start.strftime("%Y%m%dT%H%M%SZ")
     end_key = end.strftime("%Y%m%dT%H%M%SZ")
     return f"{symbols_key}__{timeframe_key}__{start_key}__{end_key}__{feed}__{code_hash}"
+
+
+def sort_dataset_by_symbol_order(dataset: pd.DataFrame, symbols: list[str]) -> pd.DataFrame:
+    """Sort bars by the caller's canonical symbol order, then timestamp."""
+    if dataset.empty:
+        return dataset.reset_index(drop=True)
+    ordered_symbols = normalize_symbol_sequence(list(symbols))
+    order = {symbol: index for index, symbol in enumerate(ordered_symbols)}
+    observed = set(dataset["symbol"].astype(str))
+    unexpected = sorted(observed - set(order))
+    if unexpected:
+        raise ValueError(f"Dataset contains symbols outside the requested universe: {unexpected}")
+    order_column = "__tradeos_symbol_order"
+    if order_column in dataset.columns:
+        raise ValueError(f"Dataset contains reserved column: {order_column}")
+    sortable = dataset.copy()
+    sortable[order_column] = sortable["symbol"].map(order)
+    return (
+        sortable.sort_values([order_column, "timestamp"])
+        .drop(columns=[order_column])
+        .reset_index(drop=True)
+    )
 
 
 def fetch_bars(
@@ -207,8 +259,7 @@ def fetch_bars(
         )
 
     dataset = pd.DataFrame(rows)
-    dataset = dataset.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
-    return dataset
+    return sort_dataset_by_symbol_order(dataset, symbols)
 
 
 def align_symbols_on_shared_timestamps(dataset: pd.DataFrame, symbols: list[str]) -> pd.DataFrame:
@@ -222,7 +273,7 @@ def align_symbols_on_shared_timestamps(dataset: pd.DataFrame, symbols: list[str]
     )
     shared_timestamps = timestamp_counts[timestamp_counts == len(symbols)].index
     aligned = dataset[dataset["timestamp"].isin(shared_timestamps)].copy()
-    return aligned.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    return sort_dataset_by_symbol_order(aligned, symbols)
 
 
 def compute_symbol_row_counts(dataset: pd.DataFrame, symbols: list[str]) -> dict[str, int]:
@@ -251,7 +302,6 @@ def build_symbol_retention_report(
                 "percent_retained": percent_retained,
             }
         )
-    report.sort(key=lambda row: (row["percent_retained"], row["rows_after_alignment"], row["symbol"]))
     return report
 
 
@@ -267,18 +317,19 @@ def write_dataset(
 def main() -> None:
     load_dotenv(Path.cwd() / ".env")
 
-    api_key = os.getenv("ALPACA_API_KEY")
-    api_secret = os.getenv("ALPACA_API_SECRET")
-    if not api_key or not api_secret:
-        raise RuntimeError("Missing Alpaca credentials. Set ALPACA_API_KEY and ALPACA_API_SECRET in .env.")
-
     args = parse_args()
     repo_root = Path.cwd()
     output_root = Path(args.output_dir)
 
-    symbols = sorted({symbol.strip().upper() for symbol in args.symbols if symbol.strip()})
-    if not symbols:
-        raise RuntimeError("At least one symbol is required.")
+    try:
+        symbols = normalize_symbol_sequence(list(args.symbols))
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    api_key = os.getenv("ALPACA_API_KEY")
+    api_secret = os.getenv("ALPACA_API_SECRET")
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing Alpaca credentials. Set ALPACA_API_KEY and ALPACA_API_SECRET in .env.")
 
     start = parse_datetime(args.start)
     end = parse_datetime(args.end)
@@ -325,11 +376,11 @@ def main() -> None:
 
     manifest = {
         "dataset_id": dataset_id,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "created_at_utc": format_utc_z(datetime.now(timezone.utc)),
         "symbols": symbols,
         "timeframe": args.timeframe,
-        "start_utc": start.isoformat(),
-        "end_utc": end.isoformat(),
+        "start_utc": format_utc_z(start),
+        "end_utc": format_utc_z(end),
         "feed": args.feed.lower(),
         "feed_warning": (
             "IEX is single-exchange data and can distort volume-sensitive intraday research."
@@ -372,7 +423,15 @@ def main() -> None:
         print("warning=alignment retained less than 90% of rows")
         if args.align_mode == "shared":
             print("worst_symbols_for_shared_alignment:")
-            for row in symbol_retention_report[:3]:
+            worst_symbols = sorted(
+                symbol_retention_report,
+                key=lambda row: (
+                    row["percent_retained"],
+                    row["rows_after_alignment"],
+                    row["symbol"],
+                ),
+            )
+            for row in worst_symbols[:3]:
                 print(
                     f"{row['symbol']}: before={row['rows_before_alignment']}, "
                     f"after={row['rows_after_alignment']}, retained={row['percent_retained']:.2f}%"

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,11 +15,14 @@ from storage import BotStorage
 from symbol_state import format_symbol_list, normalize_symbols, symbols_match
 from tradeos.runtime_paths import (
     DATABASE_PATH_ENV,
-    DEFAULT_DATABASE_FILENAME,
     resolve_database_path,
     resolve_explicit_database_path,
     resolve_log_root,
 )
+
+
+_UTC_MIN = datetime.min.replace(tzinfo=timezone.utc)
+_ACCOUNT_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -315,78 +320,157 @@ def _latest_log_dir() -> Path | None:
     return day_dirs[-1] if day_dirs else None
 
 
-def _startup_config_from_payload(payload: dict[str, object], artifact_path: Path | None = None) -> PersistedStartupConfig | None:
+def _startup_config_from_payload(
+    payload: dict[str, object],
+    artifact_path: Path | None = None,
+    *,
+    authoritative_database_path: Path | None = None,
+) -> PersistedStartupConfig | None:
     if not isinstance(payload, dict):
         return None
-    symbols = normalize_symbols(payload.get("symbols", []))
-    raw_db_path = payload.get("db_path", DEFAULT_DATABASE_FILENAME)
-    db_path = "" if raw_db_path is None else str(raw_db_path)
-    return PersistedStartupConfig(
-        session_id=str(payload.get("session_id", "")) or None,
-        started_at_utc=str(payload.get("started_at_utc", "")) or None,
-        launch_mode=str(payload.get("launch_mode", "")),
-        execution_enabled=bool(payload.get("execution_enabled", False)),
-        paper=bool(payload.get("paper", False)),
-        account_mode=str(payload.get("account_mode", "")),
-        strategy_mode=str(payload.get("strategy_mode", "")),
-        bar_timeframe_minutes=int(payload.get("bar_timeframe_minutes", 0) or 0),
-        sma_bars=int(payload.get("sma_bars", 0) or 0),
-        symbols=symbols,
-        symbol_count=int(payload.get("symbol_count", len(symbols)) or len(symbols)),
-        runtime_config_path=str(payload.get("runtime_config_path", "")) or None,
-        runtime_overrides=tuple(str(item) for item in payload.get("runtime_overrides", []) if str(item)),
-        max_usd_per_trade=float(payload.get("max_usd_per_trade", 0.0) or 0.0),
-        max_symbol_exposure_usd=float(payload.get("max_symbol_exposure_usd", 0.0) or 0.0),
-        max_open_positions=int(payload.get("max_open_positions", 0) or 0),
-        max_daily_loss_usd=float(payload.get("max_daily_loss_usd", 0.0) or 0.0),
-        max_orders_per_minute=int(payload.get("max_orders_per_minute", 0) or 0),
-        max_price_deviation_bps=float(payload.get("max_price_deviation_bps", 0.0) or 0.0),
-        max_live_price_age_seconds=int(payload.get("max_live_price_age_seconds", 0) or 0),
-        max_data_delay_seconds=int(payload.get("max_data_delay_seconds", 0) or 0),
-        ml_lookback_bars=int(payload.get("ml_lookback_bars", 0) or 0),
-        breakout_max_stop_pct=float(payload.get("breakout_max_stop_pct", 0.0) or 0.0),
-        sma_stop_pct=float(payload.get("sma_stop_pct", 0.0) or 0.0),
-        mean_reversion_exit_style=str(payload.get("mean_reversion_exit_style", "") or ""),
-        mean_reversion_max_atr_percentile=float(payload.get("mean_reversion_max_atr_percentile", 0.0) or 0.0),
-        mean_reversion_trend_filter=bool(payload.get("mean_reversion_trend_filter", False)),
-        mean_reversion_trend_slope_filter=bool(payload.get("mean_reversion_trend_slope_filter", False)),
-        mean_reversion_stop_pct=float(payload.get("mean_reversion_stop_pct", 0.0) or 0.0),
-        db_path=db_path,
-        historical_feed=str(payload.get("historical_feed", "") or ""),
-        live_feed=str(payload.get("live_feed", "") or ""),
-        latest_bar_feed=str(payload.get("latest_bar_feed", "") or ""),
-        bar_build_mode=str(payload.get("bar_build_mode", "") or ""),
-        apply_updated_bars=bool(payload.get("apply_updated_bars", False)),
-        post_bar_reconcile_poll=bool(payload.get("post_bar_reconcile_poll", False)),
-        block_trading_until_resync=bool(payload.get("block_trading_until_resync", False)),
-        assert_feed_on_startup=bool(payload.get("assert_feed_on_startup", False)),
-        log_bar_components=bool(payload.get("log_bar_components", False)),
-        resync_status=str(payload.get("resync_status", "")) or None,
-        resync_started_at_utc=str(payload.get("resync_started_at_utc", "")) or None,
-        resync_completed_at_utc=str(payload.get("resync_completed_at_utc", "")) or None,
-        resync_reason_codes=tuple(
-            str(item) for item in payload.get("resync_reason_codes", []) if str(item)
-        ),
-        gate_allows_entries=payload.get("gate_allows_entries")
-        if isinstance(payload.get("gate_allows_entries"), bool)
-        else None,
-        gate_allows_exits=payload.get("gate_allows_exits")
-        if isinstance(payload.get("gate_allows_exits"), bool)
-        else None,
-        runtime_config_approved=payload.get("runtime_config_approved")
-        if isinstance(payload.get("runtime_config_approved"), bool)
-        else None,
-        runtime_config_rejection_reasons=tuple(
-            str(item) for item in payload.get("runtime_config_rejection_reasons", []) if str(item)
-        ),
-        baseline_valid_for_comparison=payload.get("baseline_valid_for_comparison")
-        if isinstance(payload.get("baseline_valid_for_comparison"), bool)
-        else None,
-        baseline_validation_errors=tuple(
-            str(item) for item in payload.get("baseline_validation_errors", []) if str(item)
-        ),
-        artifact_path=str(artifact_path) if artifact_path is not None else None,
-    )
+
+    def required_text(field_name: str) -> str:
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} must be a nonempty string")
+        return value.strip()
+
+    def optional_bool(field_name: str, default: bool = False) -> bool:
+        if field_name not in payload or payload[field_name] is None:
+            return default
+        value = payload[field_name]
+        if type(value) is not bool:
+            raise ValueError(f"{field_name} must be a boolean")
+        return value
+
+    def optional_bool_or_none(field_name: str) -> bool | None:
+        if field_name not in payload or payload[field_name] is None:
+            return None
+        value = payload[field_name]
+        if type(value) is not bool:
+            raise ValueError(f"{field_name} must be a boolean or null")
+        return value
+
+    def optional_text_list(field_name: str) -> tuple[str, ...]:
+        value = payload.get(field_name, [])
+        if value is None:
+            return ()
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise ValueError(f"{field_name} must be a list of strings")
+        return tuple(item.strip() for item in value if item.strip())
+
+    try:
+        session_id = required_text("session_id")
+        started_at_utc = required_text("started_at_utc")
+        if _parse_iso_utc(started_at_utc) is None:
+            raise ValueError("started_at_utc must be a timezone-aware ISO timestamp")
+        launch_mode = required_text("launch_mode")
+        account_mode = required_text("account_mode")
+        strategy_mode = required_text("strategy_mode")
+
+        execution_enabled = payload.get("execution_enabled")
+        paper = payload.get("paper")
+        if type(execution_enabled) is not bool or type(paper) is not bool:
+            raise ValueError("execution_enabled and paper must be booleans")
+        normalized_account_mode = account_mode.lower()
+        if paper and normalized_account_mode != "paper":
+            raise ValueError("paper metadata must use account_mode=paper")
+        if not paper and normalized_account_mode not in {"live", "live-account"}:
+            raise ValueError("non-paper metadata must identify a live account mode")
+
+        timeframe = payload.get("bar_timeframe_minutes")
+        if type(timeframe) is not int or timeframe <= 0:
+            raise ValueError("bar_timeframe_minutes must be a positive integer")
+
+        raw_symbols = payload.get("symbols")
+        if not isinstance(raw_symbols, list) or any(
+            not isinstance(item, str) for item in raw_symbols
+        ):
+            raise ValueError("symbols must be a list of strings")
+        symbols = normalize_symbols(raw_symbols)
+        symbol_count = payload.get("symbol_count")
+        if (
+            not symbols
+            or len(symbols) != len(raw_symbols)
+            or type(symbol_count) is not int
+            or symbol_count != len(symbols)
+        ):
+            raise ValueError("symbols must be nonempty and match symbol_count")
+
+        raw_db_path = required_text("db_path")
+        database_path = resolve_database_path(raw_db_path)
+        expected_database_path = authoritative_database_path
+        if expected_database_path is None:
+            expected_database_path = (
+                resolve_explicit_database_path() or resolve_database_path()
+            )
+        if (
+            os.path.normcase(str(database_path))
+            != os.path.normcase(str(expected_database_path))
+            or not database_path.is_file()
+        ):
+            raise ValueError("db_path does not match the existing database authority")
+
+        return PersistedStartupConfig(
+            session_id=session_id,
+            started_at_utc=started_at_utc,
+            launch_mode=launch_mode,
+            execution_enabled=execution_enabled,
+            paper=paper,
+            account_mode=account_mode,
+            strategy_mode=strategy_mode,
+            bar_timeframe_minutes=timeframe,
+            sma_bars=int(payload.get("sma_bars", 0) or 0),
+            symbols=symbols,
+            symbol_count=symbol_count,
+            runtime_config_path=str(payload.get("runtime_config_path", "") or "").strip() or None,
+            runtime_overrides=optional_text_list("runtime_overrides"),
+            max_usd_per_trade=float(payload.get("max_usd_per_trade", 0.0) or 0.0),
+            max_symbol_exposure_usd=float(payload.get("max_symbol_exposure_usd", 0.0) or 0.0),
+            max_open_positions=int(payload.get("max_open_positions", 0) or 0),
+            max_daily_loss_usd=float(payload.get("max_daily_loss_usd", 0.0) or 0.0),
+            max_orders_per_minute=int(payload.get("max_orders_per_minute", 0) or 0),
+            max_price_deviation_bps=float(payload.get("max_price_deviation_bps", 0.0) or 0.0),
+            max_live_price_age_seconds=int(payload.get("max_live_price_age_seconds", 0) or 0),
+            max_data_delay_seconds=int(payload.get("max_data_delay_seconds", 0) or 0),
+            ml_lookback_bars=int(payload.get("ml_lookback_bars", 0) or 0),
+            breakout_max_stop_pct=float(payload.get("breakout_max_stop_pct", 0.0) or 0.0),
+            sma_stop_pct=float(payload.get("sma_stop_pct", 0.0) or 0.0),
+            mean_reversion_exit_style=str(payload.get("mean_reversion_exit_style", "") or ""),
+            mean_reversion_max_atr_percentile=float(payload.get("mean_reversion_max_atr_percentile", 0.0) or 0.0),
+            mean_reversion_trend_filter=optional_bool("mean_reversion_trend_filter"),
+            mean_reversion_trend_slope_filter=optional_bool("mean_reversion_trend_slope_filter"),
+            mean_reversion_stop_pct=float(payload.get("mean_reversion_stop_pct", 0.0) or 0.0),
+            db_path=str(database_path),
+            historical_feed=str(payload.get("historical_feed", "") or ""),
+            live_feed=str(payload.get("live_feed", "") or ""),
+            latest_bar_feed=str(payload.get("latest_bar_feed", "") or ""),
+            bar_build_mode=str(payload.get("bar_build_mode", "") or ""),
+            apply_updated_bars=optional_bool("apply_updated_bars"),
+            post_bar_reconcile_poll=optional_bool("post_bar_reconcile_poll"),
+            block_trading_until_resync=optional_bool("block_trading_until_resync"),
+            assert_feed_on_startup=optional_bool("assert_feed_on_startup"),
+            log_bar_components=optional_bool("log_bar_components"),
+            resync_status=str(payload.get("resync_status", "") or "") or None,
+            resync_started_at_utc=str(payload.get("resync_started_at_utc", "") or "") or None,
+            resync_completed_at_utc=str(payload.get("resync_completed_at_utc", "") or "") or None,
+            resync_reason_codes=optional_text_list("resync_reason_codes"),
+            gate_allows_entries=optional_bool_or_none("gate_allows_entries"),
+            gate_allows_exits=optional_bool_or_none("gate_allows_exits"),
+            runtime_config_approved=optional_bool_or_none("runtime_config_approved"),
+            runtime_config_rejection_reasons=optional_text_list(
+                "runtime_config_rejection_reasons"
+            ),
+            baseline_valid_for_comparison=optional_bool_or_none(
+                "baseline_valid_for_comparison"
+            ),
+            baseline_validation_errors=optional_text_list(
+                "baseline_validation_errors"
+            ),
+            artifact_path=str(artifact_path) if artifact_path is not None else None,
+        )
+    except (OSError, TypeError, ValueError, OverflowError):
+        return None
 
 
 def _load_latest_jsonl_event(path: Path, event_name: str | None = None) -> dict[str, object] | None:
@@ -430,9 +514,13 @@ def _payload_matches_session(
     ended_before_utc: str | None = None,
 ) -> bool:
     if session_id:
-        payload_session_id = str(payload.get("session_id", "")) or None
-        if payload_session_id:
-            return payload_session_id == session_id
+        payload_session_value = payload.get("session_id")
+        if not isinstance(payload_session_value, str):
+            return False
+        payload_session_id = payload_session_value.strip()
+        if not payload_session_id:
+            return False
+        return payload_session_id == session_id
 
     payload_ts = (
         str(payload.get("ts", "")) or None
@@ -573,24 +661,49 @@ def _load_feed_status(
 
 
 def _load_startup_configs() -> list[PersistedStartupConfig]:
-    log_dir = _latest_log_dir()
-    if log_dir is None:
+    log_root = _log_root()
+    if not log_root.exists():
         return []
-    startup_paths = sorted(log_dir.glob("startup_config.*.json"), key=lambda path: path.name)
-    if not startup_paths:
-        legacy_path = log_dir / "startup_config.json"
-        if legacy_path.exists():
-            startup_paths = [legacy_path]
+    authoritative_database_path = (
+        resolve_explicit_database_path() or resolve_database_path()
+    )
     startup_configs: list[PersistedStartupConfig] = []
-    for path in startup_paths:
+    try:
+        day_dirs = sorted(
+            (path for path in log_root.iterdir() if _is_session_log_dir(path)),
+            key=lambda path: path.name,
+        )
+    except OSError:
+        return []
+    for log_dir in day_dirs:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            startup_paths = sorted(
+                log_dir.glob("startup_config.*.json"), key=lambda path: path.name
+            )
+        except OSError:
             continue
-        config = _startup_config_from_payload(payload, artifact_path=path)
-        if config is not None:
-            startup_configs.append(config)
-    startup_configs.sort(key=lambda item: _parse_iso_utc(item.started_at_utc) or datetime.min)
+        if not startup_paths:
+            legacy_path = log_dir / "startup_config.json"
+            if legacy_path.is_file():
+                startup_paths = [legacy_path]
+        for path in startup_paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            config = _startup_config_from_payload(
+                payload,
+                artifact_path=path,
+                authoritative_database_path=authoritative_database_path,
+            )
+            if config is not None:
+                startup_configs.append(config)
+    startup_configs.sort(
+        key=lambda item: (
+            _parse_iso_utc(item.started_at_utc) or _UTC_MIN,
+            item.artifact_path or "",
+        )
+    )
     return startup_configs
 
 
@@ -621,9 +734,154 @@ def _parse_iso_utc(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
         return None
+
+
+def _strict_decimal(value: object, *, nonnegative: bool = False) -> Decimal | None:
+    if type(value) is not str or not value.strip():
+        return None
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation:
+        return None
+    if not parsed.is_finite() or (nonnegative and parsed < 0):
+        return None
+    return parsed
+
+
+def _strict_quantity_map(
+    value: object,
+    *,
+    nonnegative: bool,
+) -> dict[str, Decimal] | None:
+    if type(value) is not dict:
+        return None
+    normalized: dict[str, Decimal] = {}
+    for raw_symbol, raw_quantity in value.items():
+        if type(raw_symbol) is not str:
+            return None
+        symbol = raw_symbol.strip().upper()
+        quantity = _strict_decimal(raw_quantity, nonnegative=nonnegative)
+        if not symbol or symbol != raw_symbol or quantity is None:
+            return None
+        normalized[symbol] = quantity
+    return normalized
+
+
+def _valid_position_records(value: object) -> bool:
+    required = {"symbol", "qty", "managed", "reason"}
+    if type(value) is not list:
+        return False
+    seen: set[str] = set()
+    for item in value:
+        if type(item) is not dict or set(item) != required:
+            return False
+        symbol = item.get("symbol")
+        reason = item.get("reason")
+        if (
+            type(symbol) is not str
+            or not symbol
+            or symbol != symbol.strip().upper()
+            or symbol in seen
+            or type(item.get("managed")) is not bool
+            or type(reason) is not str
+            or not reason.strip()
+            or _strict_decimal(item.get("qty")) is None
+        ):
+            return False
+        seen.add(symbol)
+    return True
+
+
+def _valid_order_records(value: object) -> bool:
+    required = {
+        "order_id",
+        "client_order_id",
+        "symbol",
+        "side",
+        "status",
+        "qty",
+        "filled_qty",
+        "remaining_qty",
+        "managed",
+        "reason",
+    }
+    if type(value) is not list:
+        return False
+    seen: set[str] = set()
+    for item in value:
+        if type(item) is not dict or set(item) != required:
+            return False
+        order_id = item.get("order_id")
+        symbol = item.get("symbol")
+        quantities = {
+            key: _strict_decimal(item.get(key), nonnegative=True)
+            for key in ("qty", "filled_qty", "remaining_qty")
+        }
+        if (
+            type(order_id) is not str
+            or not order_id.strip()
+            or order_id in seen
+            or type(item.get("client_order_id")) is not str
+            or type(symbol) is not str
+            or not symbol
+            or symbol != symbol.strip().upper()
+            or str(item.get("side", "")).lower() not in {"buy", "sell"}
+            or type(item.get("status")) is not str
+            or not str(item.get("status")).strip()
+            or type(item.get("managed")) is not bool
+            or type(item.get("reason")) is not str
+            or not str(item.get("reason")).strip()
+            or any(quantity is None for quantity in quantities.values())
+        ):
+            return False
+        if quantities["filled_qty"] + quantities["remaining_qty"] != quantities["qty"]:
+            return False
+        seen.add(order_id)
+    return True
+
+
+def _canonical_record_multiset(value: list[object]) -> tuple[str, ...]:
+    return tuple(
+        sorted(json.dumps(item, sort_keys=True, separators=(",", ":")) for item in value)
+    )
+
+
+def _load_paper_shadow_account_fingerprint(config_path: Path) -> str:
+    """Load the non-secret expected account binding from the named profile."""
+
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("paper-shadow config is missing or malformed") from exc
+    if type(payload) is not dict:
+        raise ValueError("paper-shadow config must be a JSON object")
+    launch = payload.get("launch")
+    if type(launch) is not dict:
+        raise ValueError("paper-shadow config launch metadata is missing or invalid")
+    expected_launch_values = {
+        "profile": "paper_shadow",
+        "broker_environment": "paper",
+        "submission_policy": "deny",
+        "dashboard_mode": "read_only",
+    }
+    for field_name, expected_value in expected_launch_values.items():
+        value = launch.get(field_name)
+        if type(value) is not str or value != expected_value:
+            raise ValueError(
+                f"paper-shadow config launch field {field_name} is invalid"
+            )
+    fingerprint = launch.get("expected_account_fingerprint")
+    if type(fingerprint) is not str or not _ACCOUNT_FINGERPRINT_RE.fullmatch(
+        fingerprint
+    ):
+        raise ValueError("paper-shadow expected account fingerprint is invalid")
+    return fingerprint
 
 
 def _build_broker_safety_panel_state(
@@ -633,6 +891,8 @@ def _build_broker_safety_panel_state(
     now_utc: datetime | None = None,
     max_age_seconds: float = 300.0,
     artifact_failure_reason: str | None = None,
+    repository_readiness_reasons: tuple[str, ...] = (),
+    expected_account_fingerprint: str | None = None,
 ) -> BrokerSafetyPanelState:
     """Project persisted reconciliation and lock data into a fail-closed view."""
 
@@ -650,9 +910,22 @@ def _build_broker_safety_panel_state(
         lock_label = str(observed_lock_state)
 
     lock_reasons = ["trading_lock_status_unknown"] if observed_lock_state == "unknown" else []
+    account_binding_reasons: list[str] = []
+    if (
+        type(expected_account_fingerprint) is not str
+        or not _ACCOUNT_FINGERPRINT_RE.fullmatch(expected_account_fingerprint)
+    ):
+        account_binding_reasons.append(
+            "expected_account_fingerprint_missing_or_invalid"
+        )
+    external_reasons = [
+        *lock_reasons,
+        *repository_readiness_reasons,
+        *account_binding_reasons,
+    ]
 
     def blocked_unknown(reason: str) -> BrokerSafetyPanelState:
-        reasons = tuple(dict.fromkeys([reason, *lock_reasons]))
+        reasons = tuple(dict.fromkeys([reason, *external_reasons]))
         return BrokerSafetyPanelState(
             environment="unknown",
             account_id_masked="unknown",
@@ -677,6 +950,8 @@ def _build_broker_safety_panel_state(
     required_text = (
         "environment",
         "account_id_masked",
+        "account_fingerprint",
+        "account_status",
         "checked_at_utc",
         "automation_readiness",
         "result",
@@ -686,13 +961,19 @@ def _build_broker_safety_panel_state(
         "unmanaged_positions",
         "managed_orders",
         "unmanaged_orders",
+        "current_broker_positions",
+        "current_open_pending_orders",
+        "ambiguous_intents",
         "state_mismatches",
         "blocking_reasons",
     )
+    required_dicts = ("local_positions", "pending_buy_qty", "pending_sell_qty")
     malformed = any(
         not isinstance(payload.get(key), str) or not str(payload.get(key)).strip()
         for key in required_text
-    ) or any(not isinstance(payload.get(key), list) for key in required_lists)
+    ) or any(type(payload.get(key)) is not list for key in required_lists)
+    malformed = malformed or any(type(payload.get(key)) is not dict for key in required_dicts)
+    malformed = malformed or type(payload.get("reconciliation_succeeded")) is not bool
     raw_reasons = payload.get("blocking_reasons")
     raw_mismatches = payload.get("state_mismatches")
     if isinstance(raw_reasons, list) and any(
@@ -700,6 +981,32 @@ def _build_broker_safety_panel_state(
     ):
         malformed = True
     if isinstance(raw_mismatches, list) and any(not isinstance(item, str) for item in raw_mismatches):
+        malformed = True
+    raw_ambiguous_intents = payload.get("ambiguous_intents")
+    if isinstance(raw_ambiguous_intents, list) and any(
+        type(item) is not str or not item.strip() for item in raw_ambiguous_intents
+    ):
+        malformed = True
+    current_positions = payload.get("current_broker_positions")
+    managed_positions = payload.get("managed_positions")
+    unmanaged_positions = payload.get("unmanaged_positions")
+    current_orders = payload.get("current_open_pending_orders")
+    managed_orders = payload.get("managed_orders")
+    unmanaged_orders = payload.get("unmanaged_orders")
+    if not all(
+        _valid_position_records(value)
+        for value in (current_positions, managed_positions, unmanaged_positions)
+    ):
+        malformed = True
+    if not all(
+        _valid_order_records(value)
+        for value in (current_orders, managed_orders, unmanaged_orders)
+    ):
+        malformed = True
+    local_positions = _strict_quantity_map(payload.get("local_positions"), nonnegative=False)
+    pending_buy_qty = _strict_quantity_map(payload.get("pending_buy_qty"), nonnegative=True)
+    pending_sell_qty = _strict_quantity_map(payload.get("pending_sell_qty"), nonnegative=True)
+    if local_positions is None or pending_buy_qty is None or pending_sell_qty is None:
         malformed = True
     if malformed:
         return blocked_unknown("reconciliation_artifact_malformed")
@@ -715,6 +1022,8 @@ def _build_broker_safety_panel_state(
 
     environment = str(payload["environment"]).strip().lower()
     account_id_masked = str(payload["account_id_masked"]).strip()
+    account_fingerprint = str(payload["account_fingerprint"]).strip()
+    account_status = str(payload["account_status"]).strip().lower()
     readiness = str(payload["automation_readiness"]).strip().lower()
     result = str(payload["result"]).strip()
     managed_positions = payload["managed_positions"]
@@ -724,7 +1033,54 @@ def _build_broker_safety_panel_state(
     state_mismatches = payload["state_mismatches"]
 
     reasons = [str(item).strip() for item in raw_reasons]
-    reasons.extend(lock_reasons)
+    reasons.extend(external_reasons)
+    consistency_failed = False
+    if _canonical_record_multiset(current_positions) != _canonical_record_multiset(
+        [*managed_positions, *unmanaged_positions]
+    ):
+        consistency_failed = True
+    if _canonical_record_multiset(current_orders) != _canonical_record_multiset(
+        [*managed_orders, *unmanaged_orders]
+    ):
+        consistency_failed = True
+    if any(item["managed"] is not True for item in managed_positions) or any(
+        item["managed"] is not False for item in unmanaged_positions
+    ):
+        consistency_failed = True
+    if any(item["managed"] is not True for item in managed_orders) or any(
+        item["managed"] is not False for item in unmanaged_orders
+    ):
+        consistency_failed = True
+
+    broker_quantities = {
+        str(item["symbol"]): _strict_decimal(item["qty"])
+        for item in current_positions
+    }
+    derived_buy: dict[str, Decimal] = {}
+    derived_sell: dict[str, Decimal] = {}
+    for item in current_orders:
+        target = derived_buy if str(item["side"]).lower() == "buy" else derived_sell
+        symbol = str(item["symbol"])
+        target[symbol] = target.get(symbol, Decimal("0")) + Decimal(
+            str(item["remaining_qty"])
+        )
+    normalized_pending_buy = {
+        key: value for key, value in pending_buy_qty.items() if value != 0
+    }
+    normalized_pending_sell = {
+        key: value for key, value in pending_sell_qty.items() if value != 0
+    }
+    if derived_buy != normalized_pending_buy or derived_sell != normalized_pending_sell:
+        consistency_failed = True
+    derived_state_mismatch = any(
+        (broker_quantities.get(symbol) or Decimal("0"))
+        != local_positions.get(symbol, Decimal("0"))
+        for symbol in set(broker_quantities) | set(local_positions)
+    )
+    if derived_state_mismatch and not state_mismatches:
+        consistency_failed = True
+    if consistency_failed:
+        reasons.append("reconciliation_metadata_inconsistent")
     stale = age_seconds > max_age_seconds
     if age_seconds < -30.0:
         stale = True
@@ -735,12 +1091,24 @@ def _build_broker_safety_panel_state(
         reasons.append("environment_not_positively_paper")
     if account_id_masked.lower() in {"", "unknown", "none", "n/a"}:
         reasons.append("account_identity_unknown")
+    if not _ACCOUNT_FINGERPRINT_RE.fullmatch(account_fingerprint):
+        reasons.append("reconciliation_account_fingerprint_invalid")
+    elif (
+        type(expected_account_fingerprint) is str
+        and _ACCOUNT_FINGERPRINT_RE.fullmatch(expected_account_fingerprint)
+        and account_fingerprint != expected_account_fingerprint
+    ):
+        reasons.append("reconciliation_account_fingerprint_mismatch")
+    if account_status != "active":
+        reasons.append("broker_account_not_active")
     if unmanaged_positions:
         reasons.append("unmanaged_positions_present")
     if unmanaged_orders:
         reasons.append("unmanaged_orders_present")
     if state_mismatches:
         reasons.append("broker_local_state_mismatch")
+    if payload["ambiguous_intents"]:
+        reasons.append("ambiguous_intents_present")
     if readiness != "ready":
         reasons.append("persisted_reconciliation_not_ready")
     if result != "SAFE_FOR_PAPER_AUTOMATION":
@@ -772,6 +1140,8 @@ def load_broker_safety_panel_state(
     *,
     now_utc: datetime | None = None,
     max_age_seconds: float = 300.0,
+    readiness_config_path: Path | None = None,
+    readiness_evidence_dir: Path | None = None,
 ) -> BrokerSafetyPanelState:
     """Load only persisted/redacted safety state; never create a broker client."""
 
@@ -792,12 +1162,42 @@ def load_broker_safety_panel_state(
     except Exception:
         lock_status = None
 
+    repository_readiness_reasons: tuple[str, ...] = ()
+    expected_account_fingerprint: str | None = None
+    try:
+        from tradeos.readiness import DEFAULT_EVIDENCE_DIR, select_latest_valid_evidence
+
+        selected_config = readiness_config_path or (
+            Path(__file__).resolve().parent / "config" / "paper_shadow_config.json"
+        )
+        expected_account_fingerprint = _load_paper_shadow_account_fingerprint(
+            selected_config
+        )
+        selection = select_latest_valid_evidence(
+            readiness_evidence_dir or DEFAULT_EVIDENCE_DIR,
+            config_path=selected_config,
+            repo_root=Path(__file__).resolve().parent,
+            now_utc=now_utc,
+        )
+        if selection.evidence is None:
+            repository_readiness_reasons = (
+                "repository_readiness_evidence_missing_or_invalid",
+            )
+            if selection.rejected:
+                repository_readiness_reasons += (
+                    f"repository_readiness_rejected:{selection.rejected[0][1]}",
+                )
+    except Exception:
+        repository_readiness_reasons = ("repository_readiness_check_failed",)
+
     return _build_broker_safety_panel_state(
         payload,
         lock_status,
         now_utc=now_utc,
         max_age_seconds=max_age_seconds,
         artifact_failure_reason=artifact_failure_reason,
+        repository_readiness_reasons=repository_readiness_reasons,
+        expected_account_fingerprint=expected_account_fingerprint,
     )
 
 
@@ -823,6 +1223,12 @@ def _build_session_warnings(
     warnings: list[str] = []
 
     if startup_config is None:
+        if has_persisted_snapshot:
+            return (
+                "The latest persisted database session has no matching validated "
+                "startup metadata. The dashboard is showing that session's saved "
+                "state without applying unrelated startup metadata.",
+            )
         return ()
     latest_started_at = _parse_iso_utc(latest_startup_config.started_at_utc) if latest_startup_config is not None else None
     selected_started_at = _parse_iso_utc(startup_config.started_at_utc)
@@ -868,6 +1274,7 @@ def _select_startup_config_for_session(
     has_persisted_snapshot: bool,
     last_cycle_report: PersistedCycleReport | None,
     latest_run_session_id: str | None = None,
+    latest_run_environment: object | None = None,
 ) -> PersistedStartupConfig | None:
     if not startup_configs:
         return None
@@ -877,8 +1284,39 @@ def _select_startup_config_for_session(
             for config in startup_configs
             if (config.session_id or "") == latest_run_session_id
         ]
-        if matching:
-            return max(matching, key=lambda item: _parse_iso_utc(item.started_at_utc) or datetime.min)
+        if len(matching) == 1:
+            selected = matching[0]
+            if has_persisted_snapshot:
+                if not isinstance(latest_run_environment, str):
+                    return None
+                persisted_environment = latest_run_environment.strip().lower()
+                config_environment = "paper" if selected.paper else "live"
+                if persisted_environment != config_environment:
+                    return None
+                raw_persisted_symbols = [item.symbol for item in snapshot.symbols]
+                if any(
+                    not isinstance(symbol, str) or not symbol.strip()
+                    for symbol in raw_persisted_symbols
+                ):
+                    return None
+                persisted_symbols = [
+                    symbol.strip().upper() for symbol in raw_persisted_symbols
+                ]
+                if (
+                    len(persisted_symbols) != selected.symbol_count
+                    or len(set(persisted_symbols)) != len(persisted_symbols)
+                    or not symbols_match(selected.symbols, persisted_symbols)
+                ):
+                    return None
+            return selected
+        # A persisted session identifier is authoritative. Timestamp proximity is
+        # not provenance: falling through here can bind a later failed/test launch
+        # to an unrelated database run and hide the actual saved state.
+        return None
+    if has_persisted_snapshot:
+        # A persisted run without a usable session identifier is also unbound.
+        # Do not infer provenance from timestamps for legacy or partial rows.
+        return None
     target_timestamps: list[datetime] = []
     if has_persisted_snapshot:
         snapshot_dt = _parse_iso_utc(snapshot.timestamp_utc)
@@ -920,8 +1358,8 @@ def _select_startup_config_for_session(
             if start_dt is not None and start_dt <= latest_target
         ]
         if eligible:
-            return max(eligible, key=lambda item: _parse_iso_utc(item.started_at_utc) or datetime.min)
-    return max(startup_configs, key=lambda item: _parse_iso_utc(item.started_at_utc) or datetime.min)
+            return max(eligible, key=lambda item: _parse_iso_utc(item.started_at_utc) or _UTC_MIN)
+    return max(startup_configs, key=lambda item: _parse_iso_utc(item.started_at_utc) or _UTC_MIN)
 
 def _build_snapshot(storage: BotStorage, session_id: str | None = None) -> tuple[PersistedBotSnapshot, bool]:
     latest_run = storage.get_latest_run(session_id=session_id)
@@ -1713,31 +2151,69 @@ def load_dashboard_state() -> DashboardState:
     storage = BotStorage(db_path, read_only=True)
     latest_run = storage.get_latest_run()
     latest_snapshot, has_latest_snapshot = _build_snapshot(storage)
+    latest_run_session_value = (
+        latest_run.get("session_id") if latest_run is not None else None
+    )
+    latest_run_session_id = (
+        latest_run_session_value.strip()
+        if isinstance(latest_run_session_value, str)
+        and latest_run_session_value.strip()
+        else None
+    )
+    latest_run_environment = (
+        latest_run.get("environment") if latest_run is not None else None
+    )
     startup_config = _select_startup_config_for_session(
         startup_configs=startup_configs,
         snapshot=latest_snapshot,
         has_persisted_snapshot=has_latest_snapshot,
         last_cycle_report=None,
-        latest_run_session_id=str(latest_run.get("session_id", "")) or None if latest_run is not None else None,
+        latest_run_session_id=latest_run_session_id,
+        latest_run_environment=latest_run_environment,
     )
-    session_id = startup_config.session_id if startup_config is not None else None
-    session_started_at = startup_config.started_at_utc if startup_config is not None else None
+    session_id = (
+        startup_config.session_id
+        if startup_config is not None
+        else latest_run_session_id
+    )
+    session_started_at = (
+        startup_config.started_at_utc
+        if startup_config is not None
+        else (
+            str(latest_run.get("timestamp_utc", "")) or None
+            if latest_run is not None
+            else None
+        )
+    )
     session_ended_before = _next_startup_started_at(startup_configs, startup_config)
-    last_cycle_report = _load_latest_cycle_report(
-        session_id=session_id,
-        started_at_utc=session_started_at,
-        ended_before_utc=session_ended_before,
-    )
-    feed_status = _load_feed_status(
-        session_id=session_id,
-        started_at_utc=session_started_at,
-        ended_before_utc=session_ended_before,
-    )
-    session_id = startup_config.session_id if startup_config is not None else None
+    has_session_scope = session_id is not None
+    if has_session_scope:
+        last_cycle_report = _load_latest_cycle_report(
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        )
+        feed_status = _load_feed_status(
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        )
+    else:
+        last_cycle_report = None
+        feed_status = "session metadata unavailable"
     snapshot, has_persisted_snapshot = _build_snapshot(storage, session_id=session_id)
-    recent_orders = _load_recent_orders(storage, session_id=session_id)
+    recent_orders = (
+        _load_recent_orders(storage, session_id=session_id)
+        if has_session_scope
+        else []
+    )
     ignored_snapshot_symbols: tuple[str, ...] = ()
     symbol_state_status = "no_runtime_config"
+    if (
+        startup_config is None
+        and has_persisted_snapshot
+    ):
+        symbol_state_status = "unmatched_runtime_metadata_snapshot_preserved"
     if startup_config is not None:
         symbol_state_status = "cleared_runtime_symbol_state"
         latest_symbols = tuple(normalize_symbols(item.symbol for item in latest_snapshot.symbols))
@@ -1755,43 +2231,60 @@ def load_dashboard_state() -> DashboardState:
         last_cycle_report=last_cycle_report,
         ignored_snapshot_symbols=ignored_snapshot_symbols,
     )
-    latest_signal_rows = _load_latest_signal_rows(
-        session_id=session_id,
-        started_at_utc=session_started_at,
-        ended_before_utc=session_ended_before,
-    )
-    latest_cycle_risk_checks = _load_latest_cycle_risk_checks(
-        last_cycle_report,
-        session_id=session_id,
-        started_at_utc=session_started_at,
-        ended_before_utc=session_ended_before,
-    )
-    session_block_reason_counts = _load_session_block_reason_counts(
-        session_id=session_id,
-        started_at_utc=session_started_at,
-        ended_before_utc=session_ended_before,
-    )
-    session_first_prices = storage.get_session_first_prices(session_id=session_id)
-    recent_narrations = _load_recent_narrations(
-        session_id=session_id,
-        started_at_utc=session_started_at,
-        ended_before_utc=session_ended_before,
-    )
-    recent_near_misses = _load_recent_near_misses(
-        session_id=session_id,
-        started_at_utc=session_started_at,
-        ended_before_utc=session_ended_before,
-    )
     _strategy_mode = startup_config.strategy_mode if startup_config is not None else None
-    drilldown_candidates = _load_drilldown_candidates(
-        _strategy_mode,
-        session_id=session_id,
-        started_at_utc=session_started_at,
-        ended_before_utc=session_ended_before,
-    )
+    if has_session_scope:
+        latest_signal_rows = _load_latest_signal_rows(
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        )
+        latest_cycle_risk_checks = _load_latest_cycle_risk_checks(
+            last_cycle_report,
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        )
+        session_block_reason_counts = _load_session_block_reason_counts(
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        )
+        session_first_prices = storage.get_session_first_prices(
+            session_id=session_id
+        )
+        recent_narrations = _load_recent_narrations(
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        )
+        recent_near_misses = _load_recent_near_misses(
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        )
+        drilldown_candidates = _load_drilldown_candidates(
+            _strategy_mode,
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        )
+        recent_activity = _load_recent_activity(
+            session_id=session_id,
+            started_at_utc=session_started_at,
+            ended_before_utc=session_ended_before,
+        )
+    else:
+        latest_signal_rows = ()
+        latest_cycle_risk_checks = ()
+        session_block_reason_counts = ()
+        session_first_prices = {}
+        recent_narrations = ()
+        recent_near_misses = ()
+        drilldown_candidates = ()
+        recent_activity = ()
     log_dir = _latest_log_dir()
     drift_report = None
-    if log_dir is not None:
+    if log_dir is not None and has_session_scope:
         signal_events = list(
             _load_jsonl_events(
                 log_dir / "signals.jsonl",
@@ -1828,12 +2321,13 @@ def load_dashboard_state() -> DashboardState:
                 ended_before_utc=session_ended_before,
             )
         )
-        drift_report = build_drift_report(
-            signal_events=signal_events,
-            bar_events=bar_events,
-            risk_events=risk_events,
-            position_events=position_events,
-        )
+        if signal_events or bar_events or risk_events or position_events:
+            drift_report = build_drift_report(
+                signal_events=signal_events,
+                bar_events=bar_events,
+                risk_events=risk_events,
+                position_events=position_events,
+            )
     return DashboardState(
         startup_config=startup_config,
         storage=storage,
@@ -1855,10 +2349,6 @@ def load_dashboard_state() -> DashboardState:
         recent_narrations=recent_narrations,
         recent_near_misses=recent_near_misses,
         drilldown_candidates=drilldown_candidates,
-        recent_activity=_load_recent_activity(
-            session_id=session_id,
-            started_at_utc=session_started_at,
-            ended_before_utc=session_ended_before,
-        ),
+        recent_activity=recent_activity,
         drift_report=drift_report,
     )

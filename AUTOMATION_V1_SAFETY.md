@@ -102,18 +102,22 @@ It is capped to that value and is never called by EOD or kill-switch automatic
 flattening.  Unmanaged shorts require a separate human-directed recovery action;
 there is no automatic liquidation or gate bypass.
 
-## Manual paper restart checklist
+## Manual supervised no-submit shadow checklist
 
 1. Confirm `.env` says `ALPACA_PAPER=true`.
 2. Independently verify the intended paper account and configure its exact ID
    as `ALPACA_EXPECTED_ACCOUNT_ID` without copying it into logs or tickets.
-3. Confirm no older Automation V1 process is expected to be order-capable.
+3. Confirm no older Automation V1 or paper-shadow process is running.
 4. Run `python -m tradeos reconcile`.
 5. Review the masked account suffix, account status, broker positions, pending
    quantities, managed/unmanaged classifications, mismatches, and blockers.
 6. Continue only when the final line is exactly
    `SAFE_FOR_PAPER_AUTOMATION` and the reconciliation is current.
-7. Start one paper runtime with `python -m tradeos paper`.
+7. For a manually supervised no-submit observation session only, start one
+   shadow runtime with `python -m tradeos paper-shadow`. This mode denies broker
+   submission. Do not substitute `tradeos live` or `tradeos paper`; both are
+   order-capable.
 8. Confirm the dashboard shows the execution lock held, a current successful
    reconciliation, no unmanaged exposure, and readiness `ready`.
-9. If startup or a submission is ambiguous, stop and reconcile; do not retry.
+9. Keep the shadow session supervised and stop it when observation is complete.
+10. If startup or a submission is ambiguous, stop and reconcile; do not retry.

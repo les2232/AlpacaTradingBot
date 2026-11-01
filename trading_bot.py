@@ -4,6 +4,8 @@ import math
 import threading
 import time
 import json
+import hashlib
+import sys
 from decimal import Decimal
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -11,9 +13,16 @@ from datetime import time as dt_time
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 import pandas as pd
 import pytz
 from dotenv import load_dotenv
+
+if __name__ == "__main__":
+    # Keep `python trading_bot.py` on the same module identity used by the CLI
+    # and contract drift checker; otherwise Python would import this file a
+    # second time under the name `trading_bot`.
+    sys.modules.setdefault("trading_bot", sys.modules[__name__])
 
 try:
     from ml.predict import to_ml_signal as offline_to_ml_signal
@@ -50,6 +59,11 @@ from tradeos.runtime_paths import (
     resolve_log_root,
 )
 from tradeos.brokers import AlpacaBroker, BrokerBar, BrokerOrder, BrokerPosition
+from tradeos.strategy_contract import (
+    CanonicalResolvedPromotedStrategy,
+    ContractValidationError,
+    assert_source_models_match_contract,
+)
 from symbol_state import (
     format_symbol_list,
     normalize_symbols,
@@ -399,6 +413,35 @@ class BotConfig:
     broker_backend: str = "alpaca"
 
 
+def build_runtime_canonical_strategy_evidence(
+    config: BotConfig,
+) -> dict[str, object]:
+    """Build pure, versioned strategy evidence without broker, storage, or file I/O."""
+
+    assert_source_models_match_contract()
+    resolved_contract = CanonicalResolvedPromotedStrategy.from_bot_config(config)
+    canonical_strategy_contract = resolved_contract.to_canonical_dict()
+    # Validate the materialized envelope too, so callers never persist a merely
+    # constructible object whose serialized representation was not checked.
+    round_tripped = CanonicalResolvedPromotedStrategy.from_payload(
+        canonical_strategy_contract
+    )
+    canonical_strategy_sha256 = round_tripped.sha256()
+    if canonical_strategy_sha256 != resolved_contract.sha256():
+        raise ContractValidationError(
+            "Canonical runtime strategy changed during envelope round-trip."
+        )
+    promoted_values = resolved_contract.promoted_values
+    return {
+        "contract": resolved_contract,
+        "canonical_strategy_contract": canonical_strategy_contract,
+        "canonical_strategy_json": resolved_contract.canonical_json(),
+        "canonical_strategy_sha256": canonical_strategy_sha256,
+        "symbols": list(resolved_contract.symbols),
+        "symbol_strategy_modes": promoted_values["symbol_strategy_modes"],
+    }
+
+
 @dataclass(frozen=True)
 class RuntimeConfigDetails:
     config: BotConfig
@@ -406,8 +449,16 @@ class RuntimeConfigDetails:
     overridden_fields: tuple[str, ...]
     runtime_config_approved: bool | None
     runtime_config_rejection_reasons: tuple[str, ...]
+    runtime_config_sha256: str | None = None
     baseline_valid_for_comparison: bool | None = None
     baseline_validation_errors: tuple[str, ...] = ()
+    execution_context_matches_pointer_live: bool | None = None
+    execution_context_validation_errors: tuple[str, ...] = ()
+    effective_runtime_binding_valid: bool | None = None
+    effective_runtime_binding_errors: tuple[str, ...] = ()
+    research_generation_sha256: str | None = None
+    promotion_bundle_sha256: str | None = None
+    research_source_content_sha256: str | None = None
     launch_profile: str | None = None
     broker_environment: str | None = None
     submission_policy: str | None = None
@@ -540,6 +591,52 @@ _SESSION_ENTRY_END   = dt_time(15, 45)  # no new entries after this
 _SESSION_FLATTEN_AT  = dt_time(15, 55)  # forced EOD flatten deadline
 DEFAULT_RUNTIME_CONFIG_PATH = TRADEOS_REPOSITORY_ROOT / "config" / "live_config.json"
 STARTUP_ARTIFACT_PATH_ENV = "TRADEOS_STARTUP_ARTIFACT_PATH"
+STARTUP_CONFIG_SCHEMA_NAME = "tradeos.runtime_startup_config"
+STARTUP_CONFIG_SCHEMA_VERSION = 1
+STARTUP_RESYNC_REVISION_SCHEMA_NAME = "tradeos.runtime_startup_resync_revision"
+STARTUP_RESYNC_REVISION_SCHEMA_VERSION = 1
+
+
+def _strict_json_object(text: str) -> dict[str, Any]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError(f"duplicate JSON field {key!r}")
+            parsed[key] = value
+        return parsed
+
+    def reject_nonfinite(token: str) -> None:
+        raise ValueError(f"non-finite JSON number {token!r}")
+
+    payload = json.loads(
+        text,
+        object_pairs_hook=reject_duplicates,
+        parse_constant=reject_nonfinite,
+    )
+    if not isinstance(payload, dict):
+        raise ValueError("JSON payload must be an object")
+    return payload
+
+
+def _write_new_evidence_file(path: Path, text: str) -> None:
+    """Create an immutable evidence file, failing on any name collision."""
+
+    with path.open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _replace_json_alias_atomically(path: Path, text: str) -> None:
+    """Replace a movable alias without exposing a partial JSON document."""
+
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        _write_new_evidence_file(temporary, text)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _safe_float(value: str | None, default: float) -> float:
@@ -862,7 +959,12 @@ def _coerce_runtime_bool(runtime: dict[str, Any], key: str) -> bool:
     raise RuntimeError(f"Runtime config field {key!r} must be a boolean, got {value!r}.")
 
 
-def _load_runtime_config_payload() -> tuple[Path | None, dict[str, Any] | None, dict[str, Any] | None]:
+def _load_runtime_config_payload() -> tuple[
+    Path | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    str | None,
+]:
     runtime_path = Path(
         os.getenv("BOT_RUNTIME_CONFIG_PATH", str(DEFAULT_RUNTIME_CONFIG_PATH))
     ).expanduser()
@@ -870,11 +972,16 @@ def _load_runtime_config_payload() -> tuple[Path | None, dict[str, Any] | None, 
         runtime_path = TRADEOS_REPOSITORY_ROOT / runtime_path
     runtime_path = runtime_path.resolve(strict=False)
     if not runtime_path.exists():
-        return None, None, None
+        return None, None, None, None
 
     try:
-        payload = json.loads(runtime_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        raw_bytes = runtime_path.read_bytes()
+        payload = _strict_json_object(raw_bytes.decode("utf-8", errors="strict"))
+    except OSError as exc:
+        raise RuntimeError(f"Runtime config is unreadable: {runtime_path}") from exc
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"Runtime config is not valid UTF-8: {runtime_path}") from exc
+    except (json.JSONDecodeError, ValueError) as exc:
         raise RuntimeError(f"Runtime config is not valid JSON: {runtime_path}") from exc
 
     if not isinstance(payload, dict):
@@ -884,7 +991,7 @@ def _load_runtime_config_payload() -> tuple[Path | None, dict[str, Any] | None, 
     if not isinstance(runtime, dict):
         raise RuntimeError(f"Runtime config field 'runtime' must be a JSON object: {runtime_path}")
 
-    return runtime_path, runtime, payload
+    return runtime_path, runtime, payload, hashlib.sha256(raw_bytes).hexdigest()
 
 
 def _apply_runtime_config(
@@ -931,6 +1038,18 @@ def _apply_runtime_config(
     ):
         if key in runtime or key in data_parity:
             overrides[key] = _coerce_runtime_bool({key: data_parity.get(key, runtime.get(key))}, key)
+    for key in (
+        "max_usd_per_trade",
+        "max_symbol_exposure_usd",
+        "max_daily_loss_usd",
+    ):
+        if key in runtime and runtime[key] is not None:
+            overrides[key] = _coerce_runtime_float(runtime, key)
+    if "max_open_positions" in runtime and runtime["max_open_positions"] is not None:
+        overrides["max_open_positions"] = _coerce_runtime_int(
+            runtime,
+            "max_open_positions",
+        )
     if "bar_timeframe_minutes" in runtime:
         overrides["bar_timeframe_minutes"] = _coerce_runtime_int(runtime, "bar_timeframe_minutes")
     if "strategy_mode" in runtime:
@@ -1243,7 +1362,9 @@ def _load_base_config() -> BotConfig:
 def load_config_details() -> RuntimeConfigDetails:
     load_dotenv(TRADEOS_REPOSITORY_ROOT / ".env")
     base_config = _load_base_config()
-    runtime_path, runtime, payload = _load_runtime_config_payload()
+    runtime_path, runtime, payload, runtime_config_sha256 = (
+        _load_runtime_config_payload()
+    )
     config, changed_fields = _apply_runtime_config(base_config, runtime_path, runtime)
     runtime_config_approved: bool | None = None
     runtime_config_rejection_reasons: tuple[str, ...] = ()
@@ -1294,6 +1415,7 @@ def load_config_details() -> RuntimeConfigDetails:
         overridden_fields=changed_fields,
         runtime_config_approved=runtime_config_approved,
         runtime_config_rejection_reasons=runtime_config_rejection_reasons,
+        runtime_config_sha256=runtime_config_sha256,
         launch_profile=launch_profile,
         broker_environment=broker_environment,
         submission_policy=submission_policy,
@@ -1320,6 +1442,10 @@ class TradeOSBot:
             raise RuntimeError(
                 "Automation V1 is paper-only; refusing to initialize a live broker client."
             )
+        # This is the last in-process boundary before either a broker client or
+        # storage can be constructed.  Direct callers therefore receive the
+        # same strict identity validation as CLI launches.
+        self.runtime_strategy_evidence = build_runtime_canonical_strategy_evidence(config)
         load_dotenv(TRADEOS_REPOSITORY_ROOT / ".env")
         self._session_started_at = datetime.now(timezone.utc)
         self._submission_enabled = submission_enabled is True
@@ -1624,19 +1750,82 @@ class TradeOSBot:
         self._update_startup_artifact_with_resync(result)
         return result
 
-    def _update_startup_artifact_with_resync(self, result: ResyncResult) -> None:
+    def _update_startup_artifact_with_resync(
+        self,
+        result: ResyncResult,
+    ) -> Path | None:
+        """Finalize startup evidence without modifying its versioned source artifact."""
+
         artifact_path_raw = os.getenv(STARTUP_ARTIFACT_PATH_ENV, "").strip()
         if not artifact_path_raw:
-            return
+            return None
         artifact_path = Path(artifact_path_raw)
-        if not artifact_path.exists():
-            return
+        if (
+            artifact_path.name == "startup_config.json"
+            or not artifact_path.name.startswith("startup_config.")
+            or not artifact_path.name.endswith(".json")
+        ):
+            logger.error(
+                "Refusing startup resync finalization for a non-versioned artifact: %s",
+                artifact_path,
+            )
+            return None
         try:
-            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        if not isinstance(payload, dict):
-            return
+            source_bytes = artifact_path.read_bytes()
+            source_text = source_bytes.decode("utf-8")
+            payload = _strict_json_object(source_text)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            logger.error("Unable to validate immutable startup artifact: %s", exc)
+            return None
+
+        session_id = getattr(self, "session_id", None)
+        persisted_session_id = payload.get("session_id")
+        if (
+            type(session_id) is not str
+            or not session_id.strip()
+            or type(persisted_session_id) is not str
+            or not persisted_session_id.strip()
+            or persisted_session_id != session_id
+        ):
+            logger.error(
+                "Refusing startup resync finalization because session binding is missing or mismatched."
+            )
+            return None
+        if (
+            payload.get("artifact_schema_name") != STARTUP_CONFIG_SCHEMA_NAME
+            or type(payload.get("artifact_schema_version")) is not int
+            or payload.get("artifact_schema_version") != STARTUP_CONFIG_SCHEMA_VERSION
+            or payload.get("artifact_type") != "startup_config"
+        ):
+            logger.error("Refusing startup resync finalization for an unknown startup schema.")
+            return None
+
+        try:
+            canonical_contract = CanonicalResolvedPromotedStrategy.from_payload(
+                payload.get("canonical_strategy_contract")  # type: ignore[arg-type]
+            )
+        except (ContractValidationError, TypeError) as exc:
+            logger.error("Refusing startup resync finalization: %s", exc)
+            return None
+        canonical_sha256 = payload.get("canonical_strategy_sha256")
+        runtime_evidence = getattr(self, "runtime_strategy_evidence", None)
+        runtime_canonical_sha256 = (
+            runtime_evidence.get("canonical_strategy_sha256")
+            if isinstance(runtime_evidence, dict)
+            else None
+        )
+        if (
+            type(canonical_sha256) is not str
+            or canonical_sha256 != canonical_contract.sha256()
+            or type(runtime_canonical_sha256) is not str
+            or canonical_sha256 != runtime_canonical_sha256
+            or payload.get("symbols") != list(canonical_contract.symbols)
+        ):
+            logger.error(
+                "Refusing startup resync finalization because canonical strategy identity is inconsistent."
+            )
+            return None
+
         payload["resync_status"] = result.status.value
         payload["resync_started_at_utc"] = result.started_at_utc
         payload["resync_completed_at_utc"] = result.completed_at_utc
@@ -1654,10 +1843,54 @@ class TradeOSBot:
         ]
         payload["gate_allows_entries"] = result.gate_allows_entries
         payload["gate_allows_exits"] = result.gate_allows_exits
-        artifact_text = json.dumps(payload, indent=2)
-        artifact_path.write_text(artifact_text, encoding="utf-8")
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        revision_created_at_utc = datetime.now(timezone.utc).isoformat()
+        payload["revision_schema_name"] = STARTUP_RESYNC_REVISION_SCHEMA_NAME
+        payload["revision_schema_version"] = STARTUP_RESYNC_REVISION_SCHEMA_VERSION
+        payload["revision_type"] = "startup_resync_finalization"
+        payload["revision_created_at_utc"] = revision_created_at_utc
+        payload["source_startup_artifact_name"] = artifact_path.name
+        payload["source_startup_sha256"] = source_sha256
+        try:
+            artifact_text = json.dumps(payload, indent=2, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            logger.error("Unable to serialize startup resync finalization: %s", exc)
+            return None
+
+        revision_stamp = "".join(
+            character
+            for character in (result.completed_at_utc or revision_created_at_utc)
+            if character.isalnum()
+        )
+        session_token = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+        revision_path = artifact_path.parent / (
+            f"startup_resync.{revision_stamp}.{session_token}.{uuid4().hex[:8]}.json"
+        )
+        try:
+            _write_new_evidence_file(revision_path, artifact_text)
+        except OSError as exc:
+            logger.error("Unable to create immutable startup resync finalization: %s", exc)
+            return None
+
+        # If the bound source changed concurrently, retain the immutable revision
+        # for audit but do not promote it through the movable alias.
+        try:
+            current_source_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            logger.error("Unable to re-verify startup source before alias update: %s", exc)
+            return revision_path
+        if current_source_sha256 != source_sha256:
+            logger.error(
+                "Startup source changed during resync finalization; alias was not updated."
+            )
+            return revision_path
+
         latest_path = artifact_path.parent / "startup_config.json"
-        latest_path.write_text(artifact_text, encoding="utf-8")
+        try:
+            _replace_json_alias_atomically(latest_path, artifact_text)
+        except OSError as exc:
+            logger.error("Unable to atomically update startup alias: %s", exc)
+        return revision_path
 
     def _local_resync_context(self) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         environment, account_fingerprint_value = (

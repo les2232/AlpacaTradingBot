@@ -300,6 +300,7 @@ class ReconciliationReport:
             "checked_at_utc": self.checked_at_utc,
             "environment": self.environment,
             "account_id_masked": self.account_id_masked,
+            "account_fingerprint": self.account_fingerprint,
             "account_status": self.account_status,
             "reconciliation_succeeded": self.reconciliation_succeeded,
             "current_broker_positions": [position_payload(item) for item in self.broker_positions],

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import csv
+import hashlib
 import json
+import math
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from daily_report import DEFAULT_BACKTEST, WARN, load_backtest_baseline
-
-
-DEFAULT_RESEARCH_DRIFT_PROFILE_PATH = Path("results") / "drift_profile.json"
+from tradeos.research_bundle import load_verified_promotion_pointer
 
 
 @dataclass(frozen=True)
@@ -79,10 +78,11 @@ class DriftReport:
 
 def _safe_float(value: Any) -> float | None:
     try:
-        if value is None or value == "":
+        if value is None or value == "" or isinstance(value, bool):
             return None
-        return float(value)
-    except (TypeError, ValueError):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    except (OverflowError, TypeError, ValueError):
         return None
 
 
@@ -95,69 +95,252 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
-def _load_json_file(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(f"duplicate JSON field {key!r}")
+        payload[key] = value
+    return payload
+
+
+def _reject_nonfinite_json_number(token: str) -> None:
+    raise ValueError(f"non-finite JSON number {token!r}")
+
+
+def _canonical_sha256(value: object) -> str | None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
         return None
+    return value
+
+
+def _strict_finite_number(value: object, *, field: str) -> float:
+    if type(value) not in {int, float}:
+        raise ValueError(f"{field} must be a JSON number")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
+        numeric = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field} must be finite") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"{field} must be finite")
+    return numeric
 
 
-def _normalize_mix(value: Any) -> tuple[tuple[str, float], ...]:
-    if not isinstance(value, dict):
+def _load_pointer_bound_json(
+    repo_root: Path,
+    reference: object,
+) -> dict[str, Any]:
+    if not isinstance(reference, dict) or set(reference) != {"path", "sha256"}:
+        raise ValueError("drift projection reference fields are not exact")
+    relative_path = reference["path"]
+    expected_sha256 = _canonical_sha256(reference["sha256"])
+    if type(relative_path) is not str or not relative_path:
+        raise ValueError("drift projection path is missing or invalid")
+    pure_path = PurePosixPath(relative_path)
+    if (
+        pure_path.is_absolute()
+        or ".." in pure_path.parts
+        or pure_path.as_posix() != relative_path
+    ):
+        raise ValueError("drift projection path is not safe repo-relative POSIX text")
+    if expected_sha256 is None:
+        raise ValueError("drift projection SHA-256 is missing or invalid")
+
+    root = Path(repo_root).resolve(strict=True)
+    try:
+        path = (root / pure_path).resolve(strict=True)
+        path.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise ValueError("drift projection path escapes the repository") from exc
+    if not path.is_file():
+        raise ValueError("drift projection target is not a file")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("drift projection bytes do not match the commit pointer")
+    try:
+        payload = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_nonfinite_json_number,
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("drift projection is not strict UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("drift projection must contain an object")
+    return payload
+
+
+def _validated_mix(value: object, *, field: str) -> tuple[tuple[str, float], ...]:
+    if value is None:
         return ()
-    pairs: list[tuple[str, float]] = []
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object or null")
+    normalized: list[tuple[str, float]] = []
     for key, raw in value.items():
-        numeric = _safe_float(raw)
-        if not key or numeric is None:
-            continue
-        if numeric > 1.0:
-            numeric = numeric / 100.0
-        pairs.append((str(key), numeric))
-    return tuple(sorted(pairs, key=lambda item: (-item[1], item[0])))
+        if type(key) is not str or not key:
+            raise ValueError(f"{field} contains an invalid entry")
+        numeric = _strict_finite_number(raw, field=f"{field}.{key}")
+        ratio = numeric / 100.0 if numeric > 1.0 else numeric
+        if not 0.0 <= ratio <= 1.0:
+            raise ValueError(f"{field} contains an out-of-range ratio")
+        normalized.append((key, ratio))
+    return tuple(sorted(normalized, key=lambda item: (-item[1], item[0])))
 
 
-def _find_latest_hybrid_research_profile(results_dir: Path) -> tuple[tuple[tuple[str, float], ...], str | None]:
-    candidates = sorted(
-        results_dir.rglob("hybrid_bb_mr_research_top.csv"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+def _load_verified_drift_overlay(
+    repo_root: Path,
+    baseline: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    generation_sha256 = _canonical_sha256(source.get("research_generation_sha256"))
+    bundle_sha256 = _canonical_sha256(source.get("promotion_bundle_sha256"))
+    if source.get("valid_for_comparison") is not True:
+        raise ValueError("daily baseline is not valid for comparison")
+    if generation_sha256 is None or bundle_sha256 is None:
+        raise ValueError("daily baseline promotion identities are missing or invalid")
+
+    root = Path(repo_root).resolve(strict=True)
+    pointer = load_verified_promotion_pointer(
+        root / "results" / "promotion_current.json",
+        repo_root=root,
     )
-    for candidate in candidates:
-        try:
-            with candidate.open("r", encoding="utf-8", newline="") as handle:
-                reader = csv.DictReader(handle)
-                row = next(reader, None)
-        except OSError:
-            continue
-        if not isinstance(row, dict):
-            continue
-        mr_share = _safe_float(row.get("mr_branch_trade_share_pct"))
-        bb_share = _safe_float(row.get("bb_branch_trade_share_pct"))
-        mix: list[tuple[str, float]] = []
-        if mr_share is not None:
-            mix.append(("mean_reversion", mr_share / 100.0 if mr_share > 1.0 else mr_share))
-        if bb_share is not None:
-            mix.append(("bollinger_breakout", bb_share / 100.0 if bb_share > 1.0 else bb_share))
-        if mix:
-            return tuple(sorted(mix, key=lambda item: (-item[1], item[0]))), str(candidate)
-    return (), None
+    pointer_payload = pointer.payload
+    bundle_reference = pointer_payload.get("bundle")
+    artifacts = pointer_payload.get("artifacts")
+    if not isinstance(bundle_reference, dict) or not isinstance(artifacts, dict):
+        raise ValueError("promotion pointer references are missing or invalid")
+    if (
+        pointer_payload.get("research_generation_sha256") != generation_sha256
+        or bundle_reference.get("bundle_sha256") != bundle_sha256
+    ):
+        raise ValueError("daily baseline and promotion pointer identities disagree")
+
+    overlay = _load_pointer_bound_json(root, artifacts.get("drift_profile"))
+    if (
+        overlay.get("research_generation_sha256") != generation_sha256
+        or overlay.get("bundle_sha256") != bundle_sha256
+        or overlay.get("bundle_path") != bundle_reference.get("path")
+        or overlay.get("approved") is not True
+    ):
+        raise ValueError("drift projection promotion identity or approval is invalid")
+
+    context = overlay.get("context")
+    performance = overlay.get("performance")
+    metrics = overlay.get("metrics")
+    if not isinstance(context, dict) or not isinstance(performance, dict) or not isinstance(metrics, dict):
+        raise ValueError("drift projection context, performance, or metrics is invalid")
+    strategy_mode = context.get("strategy_mode")
+    symbol_count = context.get("symbol_count")
+    timeframe = context.get("bar_timeframe_minutes")
+    if (
+        type(strategy_mode) is not str
+        or not strategy_mode
+        or type(symbol_count) is not int
+        or symbol_count <= 0
+        or type(timeframe) is not int
+        or timeframe <= 0
+        or context.get("stable") is not True
+        or type(context.get("market_regime")) is not str
+        or not context.get("market_regime")
+    ):
+        raise ValueError("drift projection approval context is invalid")
+    expected_symbols = _safe_int(baseline.get("symbols"))
+    expected_bars_per_day = _safe_int(baseline.get("bars_per_day"))
+    if (
+        symbol_count != expected_symbols
+        or max(1, int((6.5 * 60) / timeframe)) != expected_bars_per_day
+    ):
+        raise ValueError("drift projection context contradicts the daily baseline")
+
+    trades_per_day = _strict_finite_number(
+        performance.get("trades_per_day"),
+        field="performance.trades_per_day",
+    )
+    overlay_win_rate = _strict_finite_number(
+        performance.get("win_rate"),
+        field="performance.win_rate",
+    )
+    baseline_buy_rate = _safe_float(baseline.get("signal_rate_per_symbol_per_day"))
+    baseline_win_rate = _safe_float(baseline.get("win_rate"))
+    if (
+        trades_per_day < 0
+        or baseline_buy_rate is None
+        or baseline_win_rate is None
+        or trades_per_day / symbol_count != baseline_buy_rate
+        or (overlay_win_rate / 100.0 if overlay_win_rate > 1.0 else overlay_win_rate)
+        != baseline_win_rate
+    ):
+        raise ValueError("drift projection performance contradicts the daily baseline")
+
+    overlay_buy_rate = _strict_finite_number(
+        metrics.get("buy_signal_rate_per_symbol_per_day"),
+        field="metrics.buy_signal_rate_per_symbol_per_day",
+    )
+    overlay_sell_rate = _strict_finite_number(
+        metrics.get("sell_signal_rate_per_symbol_per_day"),
+        field="metrics.sell_signal_rate_per_symbol_per_day",
+    )
+    overlay_rejection_rate = _strict_finite_number(
+        metrics.get("rejection_rate"),
+        field="metrics.rejection_rate",
+    )
+    baseline_rejection_rate = _safe_float(baseline.get("rejection_rate"))
+    if (
+        overlay_buy_rate != baseline_buy_rate
+        or overlay_sell_rate != baseline_buy_rate
+        or overlay_rejection_rate != baseline_rejection_rate
+    ):
+        raise ValueError("drift projection metrics contradict the daily baseline")
+    avg_bar_age_s = _strict_finite_number(
+        metrics.get("avg_bar_age_s"),
+        field="metrics.avg_bar_age_s",
+    )
+    stale_bar_rate = _strict_finite_number(
+        metrics.get("stale_bar_rate"),
+        field="metrics.stale_bar_rate",
+    )
+    if (
+        avg_bar_age_s < 0
+        or not 0.0 <= stale_bar_rate <= 1.0
+    ):
+        raise ValueError("drift projection bar-quality metrics are invalid")
+    _validated_mix(metrics.get("rejection_breakdown"), field="rejection_breakdown")
+    hybrid_participation = _validated_mix(
+        metrics.get("hybrid_branch_participation"),
+        field="hybrid_branch_participation",
+    )
+    if strategy_mode == "hybrid_bb_mr" and not hybrid_participation:
+        raise ValueError(
+            "hybrid drift projection lacks bound branch participation evidence"
+        )
+    for key, value in performance.items():
+        if value is not None:
+            _strict_finite_number(value, field=f"performance.{key}")
+    return overlay
 
 
 def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
-    root = repo_root or Path(__file__).resolve().parent
+    root = (repo_root or Path(__file__).resolve().parent).resolve(strict=True)
     baseline, source = load_backtest_baseline(root)
-    best_config = _load_json_file(root / "results" / "best_config_latest.json") or {}
-    trade_decision = _load_json_file(root / "results" / "trade_decision.json") or {}
-    overlay = _load_json_file(root / DEFAULT_RESEARCH_DRIFT_PROFILE_PATH)
+    validation_errors = [
+        str(item) for item in source.get("validation_errors", []) if str(item)
+    ]
+    overlay: dict[str, Any] | None = None
+    if source.get("valid_for_comparison") is True:
+        try:
+            overlay = _load_verified_drift_overlay(root, baseline, source)
+        except (OSError, RuntimeError, TypeError, UnicodeError, ValueError) as exc:
+            source["valid_for_comparison"] = False
+            validation_errors.append(
+                f"pointer-bound drift profile is missing or invalid ({exc})"
+            )
 
-    strategy_mode = None
-    if isinstance(best_config.get("config"), dict):
-        strategy_mode = str(best_config["config"].get("strategy_mode", "")) or None
-    if strategy_mode is None and isinstance(trade_decision.get("selected_config"), dict):
-        strategy_mode = str(trade_decision["selected_config"].get("strategy_mode", "")) or None
+    strategy_mode: str | None = None
 
     rejection_breakdown: tuple[tuple[str, float], ...] = ()
     hybrid_branch_participation: tuple[tuple[str, float], ...] = ()
@@ -165,73 +348,40 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
     stale_bar_rate = 0.0
     buy_rate = _safe_float(baseline.get("signal_rate_per_symbol_per_day"))
     sell_rate = buy_rate
-    trade_count_per_day = None
+    symbol_count = _safe_int(baseline.get("symbols"))
+    trade_count_per_day = (
+        buy_rate * symbol_count
+        if buy_rate is not None and symbol_count is not None and symbol_count > 0
+        else None
+    )
     win_rate = _safe_float(baseline.get("win_rate"))
 
     if isinstance(overlay, dict):
         metrics = overlay.get("metrics")
         context = overlay.get("context")
-        performance = overlay.get("performance")
-        approved = overlay.get("approved")
         if isinstance(context, dict):
-            strategy_mode = str(context.get("strategy_mode", "")) or strategy_mode
-            overlay_symbols = _safe_int(context.get("symbol_count"))
-            overlay_bars_per_day = None
-            timeframe = _safe_int(context.get("bar_timeframe_minutes"))
-            if timeframe is not None and timeframe > 0:
-                overlay_bars_per_day = max(1, int((6.5 * 60) / timeframe))
-            if overlay_symbols is not None:
-                baseline["symbols"] = overlay_symbols
-            if overlay_bars_per_day is not None:
-                baseline["bars_per_day"] = overlay_bars_per_day
-        if isinstance(performance, dict):
-            trade_count_per_day = _safe_float(performance.get("trades_per_day"))
-            overlay_win_rate = _safe_float(performance.get("win_rate"))
-            if overlay_win_rate is not None:
-                win_rate = overlay_win_rate / 100.0 if overlay_win_rate > 1.0 else overlay_win_rate
-        if approved is False:
-            source["valid_for_comparison"] = False
-            source["validation_errors"] = list(source.get("validation_errors", [])) + [
-                "drift profile is approved=false"
-            ]
+            strategy_mode = str(context["strategy_mode"])
         if isinstance(metrics, dict):
-            overlay_buy_rate = _safe_float(metrics.get("buy_signal_rate_per_symbol_per_day"))
-            overlay_sell_rate = _safe_float(metrics.get("sell_signal_rate_per_symbol_per_day"))
-            overlay_rejection_rate = _safe_float(metrics.get("rejection_rate"))
-            if overlay_buy_rate is not None:
-                buy_rate = overlay_buy_rate
-            if overlay_sell_rate is not None:
-                sell_rate = overlay_sell_rate
-            if overlay_rejection_rate is not None:
-                baseline["rejection_rate"] = overlay_rejection_rate
-            rejection_breakdown = _normalize_mix(metrics.get("rejection_breakdown"))
-            hybrid_branch_participation = _normalize_mix(metrics.get("hybrid_branch_participation"))
-            avg_bar_age_s = _safe_float(metrics.get("avg_bar_age_s")) or avg_bar_age_s
-            stale_bar_rate = _safe_float(metrics.get("stale_bar_rate"))
-            if stale_bar_rate is None:
-                stale_bar_rate = 0.0
-
-    if strategy_mode == "hybrid_bb_mr" and not hybrid_branch_participation:
-        hybrid_branch_participation, branch_source = _find_latest_hybrid_research_profile(root / "results")
-        if branch_source:
-            source["branch_profile_path"] = branch_source
-
-    if isinstance(best_config.get("performance"), dict):
-        trade_count_per_day = _safe_float(best_config["performance"].get("trades_per_day"))
-        win_rate = _safe_float(best_config["performance"].get("win_rate"))
-        if win_rate is not None and win_rate > 1.0:
-            win_rate = win_rate / 100.0
+            sell_rate = _safe_float(metrics["sell_signal_rate_per_symbol_per_day"])
+            rejection_breakdown = _validated_mix(
+                metrics.get("rejection_breakdown"),
+                field="rejection_breakdown",
+            )
+            hybrid_branch_participation = _validated_mix(
+                metrics.get("hybrid_branch_participation"),
+                field="hybrid_branch_participation",
+            )
+            avg_bar_age_s = _safe_float(metrics["avg_bar_age_s"])
+            stale_bar_rate = _safe_float(metrics["stale_bar_rate"])
 
     source_parts = [str(source.get("mode", "defaults"))]
     if overlay is not None:
-        source_parts.append("drift_profile")
-    if strategy_mode == "hybrid_bb_mr" and hybrid_branch_participation:
-        source_parts.append("hybrid_branch_research")
+        source_parts.append("pointer_drift_profile")
 
     return BaselineProfile(
         source_label="+".join(source_parts),
-        valid_for_comparison=bool(source.get("valid_for_comparison", True)),
-        validation_errors=tuple(str(item) for item in source.get("validation_errors", []) if str(item)),
+        valid_for_comparison=source.get("valid_for_comparison") is True,
+        validation_errors=tuple(validation_errors),
         strategy_mode=strategy_mode,
         symbols=_safe_int(baseline.get("symbols")),
         bars_per_day=_safe_int(baseline.get("bars_per_day")),

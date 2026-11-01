@@ -15,13 +15,27 @@ Requires: pandas
 """
 
 import argparse
+import hashlib
 import json
+import math
 import sys
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pandas as pd
+
+from tradeos.research_bundle import (
+    RISK_EXECUTION_CONTEXT_FIELDS,
+    ResearchBundleValidationError,
+    load_verified_promotion_pointer,
+    validate_risk_execution_context,
+)
+from tradeos.strategy_contract import (
+    CanonicalResolvedPromotedStrategy,
+    ContractValidationError,
+    PROMOTED_STRATEGY_FIELDS,
+)
 
 # ---------------------------------------------------------------------------
 # Backtest expectations
@@ -40,62 +54,157 @@ DEFAULT_BACKTEST: dict[str, Any] = {
 }
 
 
-def _load_json_file(path: Path) -> dict[str, Any] | None:
+# Backward-compatible name for report/drift consumers.  The explicit, frozen,
+# versioned definition lives in tradeos.strategy_contract.
+PROMOTED_RUNTIME_FIELDS: tuple[str, ...] = PROMOTED_STRATEGY_FIELDS
+
+
+# These execution-affecting values intentionally remain outside the canonical
+# strategy hash, but an operational baseline is comparable only when the
+# selected runtime carries the exact context committed in the pointer-bound
+# live projection.  Keeping this surface explicit makes additions fail closed.
+EXECUTION_CONTEXT_FIELDS: tuple[str, ...] = (
+    "historical_feed",
+    "live_feed",
+    "latest_bar_feed",
+    "bar_build_mode",
+    "apply_updated_bars",
+    "post_bar_reconcile_poll",
+    "block_trading_until_resync",
+    "assert_feed_on_startup",
+    "log_bar_components",
+)
+EXECUTION_CONTEXT_COMPARISON_FIELDS: tuple[str, ...] = (
+    *EXECUTION_CONTEXT_FIELDS,
+    *RISK_EXECUTION_CONTEXT_FIELDS,
+)
+_DATA_FEED_VALUES = frozenset({"iex", "sip", "delayed_sip"})
+_BAR_BUILD_MODE_VALUES = frozenset(
+    {"stream_minute_aggregate", "historical_preaggregated"}
+)
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(f"duplicate JSON field {key!r}")
+        payload[key] = value
+    return payload
+
+
+def _reject_nonfinite_json_number(token: str) -> None:
+    raise ValueError(f"non-finite JSON number {token!r}")
+
+
+def _load_json_file_with_sha256(
+    path: Path,
+) -> tuple[dict[str, Any] | None, str | None]:
     if not path.exists():
-        return None
+        return None, None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = path.read_bytes()
+        payload = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_nonfinite_json_number,
+        )
+    except (OSError, UnicodeError, ValueError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def _load_json_file(path: Path) -> dict[str, Any] | None:
+    payload, _sha256 = _load_json_file_with_sha256(path)
+    return payload
+
+
+def _load_pointer_bound_json(
+    repo_root: Path,
+    reference: object,
+) -> tuple[Path, dict[str, Any]]:
+    """Read and parse the exact artifact bytes committed by a promotion pointer."""
+
+    if not isinstance(reference, dict) or set(reference) != {"path", "sha256"}:
+        raise ValueError("promotion artifact reference fields are not exact")
+    relative_path = reference["path"]
+    expected_sha256 = reference["sha256"]
+    if type(relative_path) is not str or not relative_path:
+        raise ValueError("promotion artifact path is missing or invalid")
+    pure_path = PurePosixPath(relative_path)
+    if pure_path.is_absolute() or ".." in pure_path.parts or pure_path.as_posix() != relative_path:
+        raise ValueError("promotion artifact path is not a safe repo-relative path")
+    if (
+        type(expected_sha256) is not str
+        or len(expected_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha256)
+    ):
+        raise ValueError("promotion artifact SHA-256 is missing or invalid")
+
+    root = Path(repo_root).resolve(strict=True)
+    artifact_path = (root / pure_path).resolve(strict=True)
+    try:
+        artifact_path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("promotion artifact path escapes the repository") from exc
+    raw = artifact_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("promotion artifact bytes do not match the commit pointer")
+    try:
+        payload = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_nonfinite_json_number,
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("promotion artifact is not strict UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("promotion artifact must contain an object")
+    return artifact_path, payload
+
+
+def _canonical_sha256(value: object) -> str | None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
         return None
-    return payload if isinstance(payload, dict) else None
+    return value
 
 
 def _to_ratio(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
     try:
         numeric = float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(numeric) or not 0.0 <= numeric <= 100.0:
         return None
     return numeric / 100.0 if numeric > 1.0 else numeric
 
 
-def _to_optional_bool(value: Any) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "1", "yes"}:
-            return True
-        if lowered in {"false", "0", "no"}:
-            return False
-    return None
+def _to_nonnegative_finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric < 0.0:
+        return None
+    return numeric
 
 
 def _normalize_runtime_for_comparison(runtime: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(runtime, dict):
         return {}
     normalized: dict[str, Any] = {}
-    for key in (
-        "strategy_mode",
-        "sma_bars",
-        "entry_threshold_pct",
-        "ml_probability_buy",
-        "ml_probability_sell",
-        "threshold_mode",
-        "atr_multiple",
-        "atr_percentile_threshold",
-        "time_window_mode",
-        "regime_filter_enabled",
-        "orb_filter_mode",
-        "breakout_exit_style",
-        "breakout_tight_stop_fraction",
-        "mean_reversion_exit_style",
-        "mean_reversion_max_atr_percentile",
-        "mean_reversion_trend_filter",
-        "mean_reversion_trend_slope_filter",
-        "mean_reversion_stop_pct",
-        "symbols",
-        "bar_timeframe_minutes",
-    ):
+    for key in PROMOTED_RUNTIME_FIELDS:
         if key not in runtime:
             continue
         value = runtime[key]
@@ -107,94 +216,708 @@ def _normalize_research_config_for_comparison(config: dict[str, Any] | None) -> 
     if not isinstance(config, dict):
         return {}
     normalized: dict[str, Any] = {}
-    for key in (
-        "strategy_mode",
-        "sma_bars",
-        "entry_threshold_pct",
-        "ml_probability_buy",
-        "ml_probability_sell",
-        "threshold_mode",
-        "atr_multiple",
-        "atr_percentile_threshold",
-        "time_window_mode",
-        "regime_filter_enabled",
-        "orb_filter_mode",
-        "breakout_exit_style",
-        "breakout_tight_stop_fraction",
-        "mean_reversion_exit_style",
-        "mean_reversion_max_atr_percentile",
-        "mean_reversion_trend_filter",
-        "mean_reversion_trend_slope_filter",
-        "mean_reversion_stop_pct",
-    ):
+    for key in PROMOTED_RUNTIME_FIELDS:
         if key in config:
             normalized[key] = config[key]
     return normalized
 
 
-def load_backtest_baseline(repo_root: Path | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+def _strict_execution_context(
+    runtime: object,
+    *,
+    label: str,
+) -> dict[str, str | bool | int | float]:
+    if not isinstance(runtime, dict):
+        raise ValueError(f"{label} runtime metadata is missing or invalid")
+    raw_context = runtime.get("data_parity")
+    if not isinstance(raw_context, dict):
+        raise ValueError(f"{label} runtime data_parity is missing or invalid")
+    if set(raw_context) != set(EXECUTION_CONTEXT_FIELDS):
+        missing = [key for key in EXECUTION_CONTEXT_FIELDS if key not in raw_context]
+        unexpected = sorted(set(raw_context) - set(EXECUTION_CONTEXT_FIELDS))
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected " + ", ".join(unexpected))
+        raise ValueError(
+            f"{label} runtime data_parity fields are not exact"
+            + (f" ({'; '.join(details)})" if details else "")
+        )
+
+    context: dict[str, str | bool | int | float] = {}
+    for key in EXECUTION_CONTEXT_FIELDS[:3]:
+        value = raw_context[key]
+        if type(value) is not str or value not in _DATA_FEED_VALUES:
+            raise ValueError(
+                f"{label} runtime data_parity.{key} is missing or invalid"
+            )
+        context[key] = value
+    bar_build_mode = raw_context["bar_build_mode"]
+    if type(bar_build_mode) is not str or bar_build_mode not in _BAR_BUILD_MODE_VALUES:
+        raise ValueError(
+            f"{label} runtime data_parity.bar_build_mode is missing or invalid"
+        )
+    context["bar_build_mode"] = bar_build_mode
+    for key in EXECUTION_CONTEXT_FIELDS[4:]:
+        value = raw_context[key]
+        if type(value) is not bool:
+            raise ValueError(
+                f"{label} runtime data_parity.{key} is missing or invalid"
+            )
+        context[key] = value
+    try:
+        risk_context = validate_risk_execution_context(
+            {field: runtime.get(field) for field in RISK_EXECUTION_CONTEXT_FIELDS}
+        )
+    except ResearchBundleValidationError as exc:
+        raise ValueError(
+            f"{label} runtime risk execution context is missing or invalid ({exc})"
+        ) from exc
+    context.update(risk_context)
+    return context
+
+
+def _strict_runtime_filters(
+    runtime: object,
+    *,
+    label: str,
+) -> dict[str, object]:
+    if not isinstance(runtime, dict):
+        raise ValueError(f"{label} runtime metadata is missing or invalid")
+    raw_symbols = runtime.get("symbols")
+    if (
+        not isinstance(raw_symbols, list)
+        or not raw_symbols
+        or any(type(symbol) is not str or not symbol.strip() for symbol in raw_symbols)
+    ):
+        raise ValueError(f"{label} runtime symbols are missing or invalid")
+    active_symbols = {symbol.strip().upper() for symbol in raw_symbols}
+
+    raw_excluded = runtime.get("excluded_symbols")
+    if raw_excluded is None:
+        excluded_values: list[str] = []
+    elif type(raw_excluded) is str:
+        excluded_values = [
+            value.strip().upper()
+            for value in raw_excluded.split(",")
+            if value.strip()
+        ]
+    elif isinstance(raw_excluded, list) and all(
+        type(value) is str for value in raw_excluded
+    ):
+        excluded_values = [
+            value.strip().upper() for value in raw_excluded if value.strip()
+        ]
+    else:
+        raise ValueError(f"{label} runtime excluded_symbols is invalid")
+    excluded = tuple(sorted(set(excluded_values)))
+    overlap = sorted(active_symbols & set(excluded))
+    if overlap:
+        raise ValueError(
+            f"{label} runtime exclusions remove active canonical symbols {overlap!r}"
+        )
+
+    raw_blackouts = runtime.get("symbol_event_blackouts")
+    if raw_blackouts is None:
+        blackout_values: list[dict[str, str]] = []
+    elif isinstance(raw_blackouts, list):
+        blackout_values = []
+        for index, item in enumerate(raw_blackouts):
+            if not isinstance(item, dict) or not set(item) <= {
+                "symbol",
+                "start_utc",
+                "end_utc",
+                "reason",
+            }:
+                raise ValueError(
+                    f"{label} runtime symbol_event_blackouts[{index}] is invalid"
+                )
+            symbol = item.get("symbol")
+            start_utc = item.get("start_utc")
+            end_utc = item.get("end_utc")
+            reason = item.get("reason", "event_blackout")
+            if (
+                type(symbol) is not str
+                or not symbol.strip()
+                or type(start_utc) is not str
+                or not start_utc.strip()
+                or type(end_utc) is not str
+                or not end_utc.strip()
+                or type(reason) is not str
+                or not reason.strip()
+            ):
+                raise ValueError(
+                    f"{label} runtime symbol_event_blackouts[{index}] is invalid"
+                )
+            blackout_values.append(
+                {
+                    "symbol": symbol.strip().upper(),
+                    "start_utc": start_utc.strip(),
+                    "end_utc": end_utc.strip(),
+                    "reason": reason.strip(),
+                }
+            )
+    else:
+        raise ValueError(f"{label} runtime symbol_event_blackouts is invalid")
+    return {
+        "excluded_symbols": excluded,
+        "symbol_event_blackouts": tuple(
+            tuple(item.items()) for item in blackout_values
+        ),
+    }
+
+
+def _strict_effective_runtime_binding(
+    config: object,
+    *,
+    label: str,
+) -> tuple[
+    CanonicalResolvedPromotedStrategy,
+    dict[str, str | bool | int | float],
+    dict[str, object],
+]:
+    """Normalize the already-resolved in-memory BotConfig without file I/O."""
+
+    try:
+        raw_blackouts = getattr(config, "symbol_event_blackouts")
+        raw_excluded = getattr(config, "excluded_symbols")
+        raw_symbols = getattr(config, "symbols")
+        data_parity = {
+            field: getattr(config, field) for field in EXECUTION_CONTEXT_FIELDS
+        }
+        risk_context = {
+            field: getattr(config, field) for field in RISK_EXECUTION_CONTEXT_FIELDS
+        }
+    except AttributeError as exc:
+        raise ValueError(
+            f"{label} is missing canonical execution or filter fields"
+        ) from exc
+    if not isinstance(raw_blackouts, (list, tuple)):
+        raise ValueError(f"{label} symbol_event_blackouts is invalid")
+    blackout_payloads: list[dict[str, object]] = []
+    for index, item in enumerate(raw_blackouts):
+        if isinstance(item, dict):
+            values = {
+                key: item.get(key)
+                for key in ("symbol", "start_utc", "end_utc", "reason")
+            }
+        else:
+            try:
+                values = {
+                    key: getattr(item, key)
+                    for key in ("symbol", "start_utc", "end_utc", "reason")
+                }
+            except AttributeError as exc:
+                raise ValueError(
+                    f"{label} symbol_event_blackouts[{index}] is invalid"
+                ) from exc
+        blackout_payloads.append(values)
+    if not isinstance(raw_excluded, (list, tuple)):
+        raise ValueError(f"{label} excluded_symbols is invalid")
+    runtime = {
+        "symbols": raw_symbols,
+        "excluded_symbols": list(raw_excluded),
+        "symbol_event_blackouts": blackout_payloads,
+        "data_parity": data_parity,
+        **risk_context,
+    }
+    try:
+        contract = CanonicalResolvedPromotedStrategy.from_bot_config(config)
+    except ContractValidationError as exc:
+        raise ValueError(f"{label} canonical strategy is invalid ({exc})") from exc
+    return (
+        contract,
+        _strict_execution_context(runtime, label=label),
+        _strict_runtime_filters(runtime, label=label),
+    )
+
+
+def load_backtest_baseline(
+    repo_root: Path | None = None,
+    runtime_config_path: str | Path | None = None,
+    *,
+    expected_runtime_config_sha256: str | None = None,
+    effective_runtime_config: object | None = None,
+    effective_canonical_strategy_sha256: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     base = dict(DEFAULT_BACKTEST)
     source = {
         "mode": "defaults",
         "live_config_path": None,
         "research_config_path": None,
+        "promotion_pointer_path": None,
+        "promotion_pointer_valid": False,
+        "promotion_bundle_path": None,
+        "research_generation_sha256": None,
+        "promotion_bundle_sha256": None,
+        "research_source_content_sha256": None,
         "research_metrics_used": False,
         "live_config_approved": None,
         "research_approved": None,
         "research_matches_live_runtime": None,
+        "research_matches_live_symbols": None,
+        "execution_context_matches_pointer_live": None,
+        "execution_context_validation_errors": [],
+        "selected_runtime_config_sha256": None,
+        "effective_runtime_binding_valid": None,
+        "effective_runtime_binding_errors": [],
         "validation_errors": [],
-        "valid_for_comparison": True,
+        "valid_for_comparison": False,
     }
 
-    root = repo_root or Path(__file__).resolve().parent
-    live_config = _load_json_file(root / "config" / "live_config.json")
+    effective_binding_requested = any(
+        value is not None
+        for value in (
+            expected_runtime_config_sha256,
+            effective_runtime_config,
+            effective_canonical_strategy_sha256,
+        )
+    )
+    effective_binding_inputs_complete = all(
+        value is not None
+        for value in (
+            expected_runtime_config_sha256,
+            effective_runtime_config,
+            effective_canonical_strategy_sha256,
+        )
+    )
+    if effective_binding_requested and not effective_binding_inputs_complete:
+        binding_error = (
+            "effective runtime binding inputs are missing; source bytes, in-memory "
+            "config, and canonical identity are all required"
+        )
+        source["effective_runtime_binding_valid"] = False
+        source["effective_runtime_binding_errors"].append(binding_error)
+        source["validation_errors"].append(binding_error)
+
+    root = (repo_root or Path(__file__).resolve().parent).resolve(strict=False)
+    pointer_path = (root / "results" / "promotion_current.json").resolve(strict=False)
+    source["promotion_pointer_path"] = str(pointer_path)
+    pointer_live_path: Path | None = None
+    pointer_live_config: dict[str, Any] | None = None
+    pointer_live_sha256: str | None = None
+    pointer_research_path: Path | None = None
+    pointer_research: dict[str, Any] | None = None
+    pointer_bundle_contract: CanonicalResolvedPromotedStrategy | None = None
+    try:
+        pointer = load_verified_promotion_pointer(pointer_path, repo_root=root)
+        pointer_payload = pointer.payload
+        artifacts = pointer_payload.get("artifacts")
+        bundle_reference = pointer_payload.get("bundle")
+        if not isinstance(artifacts, dict) or not isinstance(bundle_reference, dict):
+            raise ValueError("promotion pointer references are missing or invalid")
+        pointer_bundle_path, pointer_bundle = _load_pointer_bound_json(
+            root,
+            {
+                "path": bundle_reference.get("path"),
+                "sha256": bundle_reference.get("file_sha256"),
+            },
+        )
+        strategy_identity = pointer_bundle.get("strategy")
+        if not isinstance(strategy_identity, dict):
+            raise ValueError("promotion bundle strategy identity is missing or invalid")
+        canonical_json = strategy_identity.get("canonical_json")
+        canonical_sha256 = strategy_identity.get("canonical_sha256")
+        if type(canonical_json) is not str or type(canonical_sha256) is not str:
+            raise ValueError("promotion bundle canonical strategy is missing or invalid")
+        try:
+            pointer_bundle_contract = CanonicalResolvedPromotedStrategy.from_json(
+                canonical_json
+            )
+        except ContractValidationError as exc:
+            raise ValueError("promotion bundle canonical strategy is invalid") from exc
+        if (
+            canonical_json != pointer_bundle_contract.canonical_json()
+            or canonical_sha256 != pointer_bundle_contract.sha256()
+            or pointer_bundle.get("bundle_sha256")
+            != bundle_reference.get("bundle_sha256")
+        ):
+            raise ValueError("promotion bundle strategy or identity is inconsistent")
+        pointer_live_path, pointer_live_config = _load_pointer_bound_json(
+            root,
+            artifacts.get("live_config"),
+        )
+        live_reference = artifacts.get("live_config")
+        if not isinstance(live_reference, dict):
+            raise ValueError("promotion live artifact reference is missing or invalid")
+        pointer_live_sha256 = _canonical_sha256(live_reference.get("sha256"))
+        if pointer_live_sha256 is None:
+            raise ValueError("promotion live artifact SHA-256 is missing or invalid")
+        pointer_research_path, pointer_research = _load_pointer_bound_json(
+            root,
+            artifacts.get("best_config_latest"),
+        )
+        generation_sha256 = pointer_payload.get("research_generation_sha256")
+        bundle_sha256 = bundle_reference.get("bundle_sha256")
+        source_identity = pointer_bundle.get("source_identity")
+        source_content_sha256 = (
+            source_identity.get("content_sha256")
+            if isinstance(source_identity, dict)
+            else None
+        )
+        generation_sha256 = _canonical_sha256(generation_sha256)
+        bundle_sha256 = _canonical_sha256(bundle_sha256)
+        source_content_sha256 = _canonical_sha256(source_content_sha256)
+        if generation_sha256 is None or bundle_sha256 is None:
+            raise ValueError("promotion pointer identities are missing or invalid")
+        if source_content_sha256 is None:
+            raise ValueError("promotion research source identity is missing or invalid")
+    except (OSError, RuntimeError, TypeError, UnicodeError, ValueError) as exc:
+        source["validation_errors"].append(
+            f"promotion pointer is missing or invalid ({exc})"
+        )
+        pointer_live_path = None
+        pointer_live_config = None
+        pointer_live_sha256 = None
+        pointer_research_path = None
+        pointer_research = None
+        pointer_bundle_contract = None
+    else:
+        source["promotion_pointer_valid"] = True
+        source["promotion_bundle_path"] = str(pointer_bundle_path)
+        source["research_generation_sha256"] = generation_sha256
+        source["promotion_bundle_sha256"] = bundle_sha256
+        source["research_source_content_sha256"] = source_content_sha256
+
+    selected_runtime_path: Path | None = None
+    if runtime_config_path is None:
+        selected_runtime_path = pointer_live_path or (
+            root / "config" / "live_config.json"
+        ).resolve(strict=False)
+    else:
+        try:
+            candidate = Path(runtime_config_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            candidate = candidate.resolve(strict=False)
+            candidate.relative_to(root)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            source["validation_errors"].append(
+                "runtime config path is invalid or outside the repository"
+            )
+        else:
+            selected_runtime_path = candidate
+
+    live_config = None
+    selected_runtime_config_sha256: str | None = None
+    if selected_runtime_path is not None:
+        if pointer_live_path is not None and selected_runtime_path == pointer_live_path:
+            live_config = pointer_live_config
+            selected_runtime_config_sha256 = pointer_live_sha256
+        else:
+            live_config, selected_runtime_config_sha256 = (
+                _load_json_file_with_sha256(selected_runtime_path)
+            )
+    source["selected_runtime_config_sha256"] = selected_runtime_config_sha256
     live_runtime: dict[str, Any] | None = None
-    if live_config is not None:
+    live_symbols: list[str] | None = None
+    live_contract: CanonicalResolvedPromotedStrategy | None = None
+    if selected_runtime_path is not None:
+        source["live_config_path"] = str(selected_runtime_path)
+    if live_config is None and selected_runtime_path is not None:
+        source["validation_errors"].append("live config is missing or invalid")
+    elif live_config is not None:
         runtime = live_config.get("runtime")
         if isinstance(runtime, dict):
             live_runtime = runtime
             symbols = runtime.get("symbols")
-            if isinstance(symbols, list) and symbols:
-                base["symbols"] = len(symbols)
-            try:
-                timeframe_minutes = int(runtime.get("bar_timeframe_minutes"))
-            except (TypeError, ValueError):
-                timeframe_minutes = None
-            if timeframe_minutes and timeframe_minutes > 0:
-                base["bars_per_day"] = max(1, int((6.5 * 60) / timeframe_minutes))
+            if not isinstance(symbols, list) or not symbols:
+                source["validation_errors"].append(
+                    "live runtime symbols are missing or invalid"
+                )
             source["mode"] = "live_config"
-            source["live_config_path"] = str(root / "config" / "live_config.json")
+        else:
+            source["validation_errors"].append("live config runtime metadata is missing or invalid")
         live_source = live_config.get("source")
-        if isinstance(live_source, dict) and "approved" in live_source:
-            source["live_config_approved"] = _to_optional_bool(live_source.get("approved"))
-            if source["live_config_approved"] is False:
+        if isinstance(live_source, dict) and isinstance(live_source.get("approved"), bool):
+            source["live_config_approved"] = live_source["approved"]
+            if source["live_config_approved"] is not True:
                 reasons = live_source.get("rejection_reasons") or []
                 reasons_text = ", ".join(str(item) for item in reasons if str(item))
                 detail = f"live config is approved=false"
                 if reasons_text:
                     detail = f"{detail} ({reasons_text})"
                 source["validation_errors"].append(detail)
+        else:
+            source["validation_errors"].append(
+                "live config approval metadata is missing or invalid"
+            )
+        if source["promotion_pointer_valid"] is True:
+            live_generation = (
+                live_source.get("research_generation_sha256")
+                if isinstance(live_source, dict)
+                else None
+            )
+            if type(live_generation) is not str:
+                source["validation_errors"].append(
+                    "live config research generation is missing or invalid"
+                )
+            elif live_generation != source["research_generation_sha256"]:
+                source["validation_errors"].append(
+                    "live config research generation does not match the committed promotion"
+                )
 
-    research = _load_json_file(root / "results" / "best_config_latest.json")
-    if research is not None:
-        source["research_config_path"] = str(root / "results" / "best_config_latest.json")
-        if "approved" in research:
-            source["research_approved"] = _to_optional_bool(research.get("approved"))
-            if source["research_approved"] is False:
+        live_runtime_cmp = _normalize_runtime_for_comparison(live_runtime)
+        missing_live_fields = [
+            key for key in PROMOTED_RUNTIME_FIELDS if key not in live_runtime_cmp
+        ]
+        if missing_live_fields:
+            source["validation_errors"].append(
+                "live runtime is missing promoted fields ("
+                + ", ".join(missing_live_fields)
+                + ")"
+            )
+        elif isinstance(live_runtime, dict):
+            try:
+                live_contract = CanonicalResolvedPromotedStrategy.from_mapping(
+                    live_runtime.get("symbols"),
+                    live_runtime_cmp,
+                )
+            except ContractValidationError as exc:
+                source["validation_errors"].append(
+                    f"live runtime canonical contract is invalid ({exc})"
+                )
+            else:
+                live_symbols = list(live_contract.symbols)
+                if (
+                    pointer_bundle_contract is not None
+                    and live_contract.canonical_bytes()
+                    != pointer_bundle_contract.canonical_bytes()
+                ):
+                    source["validation_errors"].append(
+                        "live runtime canonical contract does not match the committed promotion bundle"
+                    )
+                base["symbols"] = len(live_symbols)
+                timeframe_minutes = live_contract.promoted_values[
+                    "bar_timeframe_minutes"
+                ]
+                base["bars_per_day"] = max(
+                    1,
+                    int((6.5 * 60) / timeframe_minutes),
+                )
+
+    selected_context: dict[str, str | bool | int | float] | None = None
+    selected_filters: dict[str, object] | None = None
+    if pointer_live_config is not None and live_config is not None:
+        try:
+            pointer_runtime = pointer_live_config.get("runtime")
+            committed_context = _strict_execution_context(
+                pointer_runtime,
+                label="pointer live config",
+            )
+            committed_filters = _strict_runtime_filters(
+                pointer_runtime,
+                label="pointer live config",
+            )
+            selected_context = _strict_execution_context(
+                live_runtime,
+                label="selected live config",
+            )
+            selected_filters = _strict_runtime_filters(
+                live_runtime,
+                label="selected live config",
+            )
+            mismatches = [
+                key
+                for key in EXECUTION_CONTEXT_COMPARISON_FIELDS
+                if selected_context[key] != committed_context[key]
+            ]
+            if mismatches:
+                details = "; ".join(
+                    f"{key}: selected={selected_context[key]!r} "
+                    f"pointer={committed_context[key]!r}"
+                    for key in mismatches
+                )
+                raise ValueError(
+                    "selected runtime execution context does not match the "
+                    f"pointer live config ({details})"
+                )
+            filter_mismatches = [
+                key
+                for key in ("excluded_symbols", "symbol_event_blackouts")
+                if selected_filters[key] != committed_filters[key]
+            ]
+            if filter_mismatches:
+                raise ValueError(
+                    "selected runtime filters do not match the pointer live config "
+                    f"({', '.join(filter_mismatches)})"
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            context_error = f"runtime execution context is missing or invalid ({exc})"
+            source["execution_context_validation_errors"].append(context_error)
+            source["validation_errors"].append(context_error)
+            source["execution_context_matches_pointer_live"] = False
+        else:
+            source["execution_context_matches_pointer_live"] = True
+
+    if effective_binding_requested and effective_binding_inputs_complete:
+        try:
+            expected_source_sha256 = _canonical_sha256(
+                expected_runtime_config_sha256
+            )
+            expected_canonical_sha256 = _canonical_sha256(
+                effective_canonical_strategy_sha256
+            )
+            if expected_source_sha256 is None:
+                raise ValueError(
+                    "first-read runtime config SHA-256 is missing or invalid"
+                )
+            if expected_canonical_sha256 is None:
+                raise ValueError(
+                    "effective canonical strategy SHA-256 is missing or invalid"
+                )
+            if selected_runtime_config_sha256 != expected_source_sha256:
+                raise ValueError(
+                    "runtime config bytes changed after the effective BotConfig was resolved"
+                )
+            if live_contract is None or selected_context is None or selected_filters is None:
+                raise ValueError(
+                    "selected runtime canonical, execution, or filter context is unavailable"
+                )
+            (
+                effective_contract,
+                effective_context,
+                effective_filters,
+            ) = _strict_effective_runtime_binding(
+                effective_runtime_config,
+                label="effective in-memory config",
+            )
+            if (
+                effective_contract.sha256() != expected_canonical_sha256
+                or live_contract.sha256() != expected_canonical_sha256
+            ):
+                raise ValueError(
+                    "effective in-memory canonical strategy does not match the selected runtime"
+                )
+            context_mismatches = [
+                key
+                for key in EXECUTION_CONTEXT_COMPARISON_FIELDS
+                if effective_context[key] != selected_context[key]
+            ]
+            filter_mismatches = [
+                key
+                for key in ("excluded_symbols", "symbol_event_blackouts")
+                if effective_filters[key] != selected_filters[key]
+            ]
+            if context_mismatches or filter_mismatches:
+                details = ", ".join((*context_mismatches, *filter_mismatches))
+                raise ValueError(
+                    "effective in-memory execution/filter context does not match "
+                    f"the selected runtime ({details})"
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            binding_error = f"effective runtime binding failed ({exc})"
+            source["effective_runtime_binding_errors"].append(binding_error)
+            source["validation_errors"].append(binding_error)
+            source["effective_runtime_binding_valid"] = False
+        else:
+            source["effective_runtime_binding_valid"] = True
+
+    research_path = pointer_research_path or (
+        root / "results" / "best_config_latest.json"
+    ).resolve(strict=False)
+    research = (
+        pointer_research
+        if pointer_research_path is not None
+        else _load_json_file(research_path)
+    )
+    if research is None:
+        source["validation_errors"].append("research baseline artifact is missing or invalid")
+    else:
+        source["research_config_path"] = str(research_path)
+        if isinstance(research.get("approved"), bool):
+            source["research_approved"] = research["approved"]
+            if source["research_approved"] is not True:
                 reasons = research.get("rejection_reasons") or []
                 reasons_text = ", ".join(str(item) for item in reasons if str(item))
                 detail = f"research artifact is approved=false"
                 if reasons_text:
                     detail = f"{detail} ({reasons_text})"
                 source["validation_errors"].append(detail)
+        else:
+            source["validation_errors"].append(
+                "research approval metadata is missing or invalid"
+            )
 
-        research_config = _normalize_research_config_for_comparison(research.get("config"))
-        live_runtime_cmp = _normalize_runtime_for_comparison(live_runtime)
-        if live_runtime_cmp and research_config:
+        persisted_research_contract: CanonicalResolvedPromotedStrategy | None = None
+        try:
+            persisted_research_contract = (
+                CanonicalResolvedPromotedStrategy.from_payload(
+                    research.get("canonical_strategy_contract")
+                )
+            )
+        except ContractValidationError as exc:
+            source["validation_errors"].append(
+                "research canonical strategy contract is missing or invalid "
+                f"({exc})"
+            )
+
+        raw_research_config = research.get("config")
+        research_config = _normalize_research_config_for_comparison(raw_research_config)
+        research_symbols: list[str] | None = None
+        research_contract: CanonicalResolvedPromotedStrategy | None = None
+        flat_research_contract: CanonicalResolvedPromotedStrategy | None = None
+        if isinstance(raw_research_config, dict):
+            raw_research_symbols = raw_research_config.get("symbols")
+            if isinstance(raw_research_symbols, list) and raw_research_symbols:
+                research_symbols = raw_research_symbols
+        if research_symbols is None:
+            source["validation_errors"].append(
+                "research baseline symbols are missing or invalid"
+            )
+        missing_research_fields = [
+            key for key in PROMOTED_RUNTIME_FIELDS if key not in research_config
+        ]
+        if missing_research_fields:
+            source["validation_errors"].append(
+                "research baseline is missing promoted fields ("
+                + ", ".join(missing_research_fields)
+                + ")"
+            )
+        elif research_symbols is not None:
+            try:
+                flat_research_contract = CanonicalResolvedPromotedStrategy.from_mapping(
+                    research_symbols,
+                    research_config,
+                )
+            except ContractValidationError as exc:
+                source["validation_errors"].append(
+                    f"research canonical contract is invalid ({exc})"
+                )
+
+        if (
+            flat_research_contract is not None
+            and persisted_research_contract is not None
+        ):
+            if (
+                flat_research_contract.canonical_bytes()
+                != persisted_research_contract.canonical_bytes()
+            ):
+                source["validation_errors"].append(
+                    "research canonical strategy contract does not match its "
+                    "flat compatibility config"
+                )
+            else:
+                research_contract = persisted_research_contract
+
+        if live_contract is not None and research_contract is not None:
+            live_symbols = list(live_contract.symbols)
+            research_symbols = list(research_contract.symbols)
+            source["research_matches_live_symbols"] = (
+                research_contract.symbols == live_contract.symbols
+            )
+            if source["research_matches_live_symbols"] is not True:
+                source["validation_errors"].append(
+                    "research symbols do not match live runtime "
+                    f"(live={live_symbols!r} research={research_symbols!r})"
+                )
+
+            live_runtime_cmp = live_contract.promoted_values
+            research_runtime_cmp = research_contract.promoted_values
             mismatches: list[str] = []
-            for key, research_value in research_config.items():
-                if key not in live_runtime_cmp:
-                    continue
+            for key in PROMOTED_RUNTIME_FIELDS:
+                research_value = research_runtime_cmp[key]
                 if live_runtime_cmp[key] != research_value:
                     mismatches.append(f"{key}: live={live_runtime_cmp[key]!r} research={research_value!r}")
             source["research_matches_live_runtime"] = len(mismatches) == 0
@@ -204,26 +927,59 @@ def load_backtest_baseline(repo_root: Path | None = None) -> tuple[dict[str, Any
                 )
 
         performance = research.get("performance")
+        trades_per_day_value: float | None = None
+        win_rate: float | None = None
+        if not isinstance(performance, dict):
+            source["validation_errors"].append(
+                "research performance metadata is missing or invalid"
+            )
+        else:
+            trades_per_day_value = _to_nonnegative_finite_number(
+                performance.get("trades_per_day")
+            )
+            if trades_per_day_value is None:
+                source["validation_errors"].append(
+                    "research trades_per_day is missing or invalid"
+                )
+            win_rate = _to_ratio(performance.get("win_rate"))
+            if win_rate is None:
+                source["validation_errors"].append(
+                    "research win_rate is missing or invalid"
+                )
+
         research_valid = (
             isinstance(performance, dict)
-            and source["research_approved"] is not False
-            and source["research_matches_live_runtime"] is not False
-            and source["live_config_approved"] is not False
+            and source["promotion_pointer_valid"] is True
+            and source["research_approved"] is True
+            and source["research_matches_live_runtime"] is True
+            and source["research_matches_live_symbols"] is True
+            and source["execution_context_matches_pointer_live"] is True
+            and source["live_config_approved"] is True
+            and not source["validation_errors"]
+            and trades_per_day_value is not None
+            and win_rate is not None
         )
-        if isinstance(performance, dict) and research_valid:
-            try:
-                trades_per_day_value = float(performance.get("trades_per_day"))
-            except (TypeError, ValueError):
-                trades_per_day_value = None
-            if trades_per_day_value is not None and base["symbols"] > 0:
+        if research_valid:
+            if base["symbols"] > 0:
                 base["signal_rate_per_symbol_per_day"] = trades_per_day_value / base["symbols"]
-            win_rate = _to_ratio(performance.get("win_rate"))
-            if win_rate is not None:
-                base["win_rate"] = win_rate
+            base["win_rate"] = win_rate
             source["research_metrics_used"] = True
             source["mode"] = "live_config+research" if source["mode"] == "live_config" else "research"
 
-    source["valid_for_comparison"] = len(source["validation_errors"]) == 0
+    source["valid_for_comparison"] = (
+        len(source["validation_errors"]) == 0
+        and source["promotion_pointer_valid"] is True
+        and source["live_config_approved"] is True
+        and source["research_approved"] is True
+        and source["research_matches_live_runtime"] is True
+        and source["research_matches_live_symbols"] is True
+        and source["execution_context_matches_pointer_live"] is True
+        and source["research_metrics_used"] is True
+        and (
+            not effective_binding_requested
+            or source["effective_runtime_binding_valid"] is True
+        )
+    )
 
     return base, source
 
@@ -526,7 +1282,7 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict, log_health: dic
     """
     concerns = []
     n_sym = BACKTEST["symbols"]
-    if not BACKTEST_SOURCE.get("valid_for_comparison", True):
+    if BACKTEST_SOURCE.get("valid_for_comparison") is not True:
         validation_errors = BACKTEST_SOURCE.get("validation_errors") or []
         detail = "; ".join(str(item) for item in validation_errors if str(item)) or "baseline validation failed"
         concerns.append(f"BASELINE INVALID: {detail}")
@@ -676,7 +1432,7 @@ def print_report(
     row("Bars evaluated",        fmt(bar_q["evaluated"]),
         f"(expect ~{expected_bars} = {n_sym} syms × {bt_bars} bars)")
     row("Baseline source",       str(BACKTEST_SOURCE.get("mode", "defaults")))
-    if not BACKTEST_SOURCE.get("valid_for_comparison", True):
+    if BACKTEST_SOURCE.get("valid_for_comparison") is not True:
         print("  Baseline validation:")
         for item in BACKTEST_SOURCE.get("validation_errors", []):
             print(f"    - {item}")
@@ -897,7 +1653,7 @@ def main() -> None:
     pos        = compute_positions(logs["positions"])
     log_health = compute_log_health(logs)
     concerns   = detect_concerns(bar_q, sig, ex, pos, log_health)
-    if args.require_approved_baseline and not BACKTEST_SOURCE.get("valid_for_comparison", True):
+    if args.require_approved_baseline and BACKTEST_SOURCE.get("valid_for_comparison") is not True:
         for item in BACKTEST_SOURCE.get("validation_errors", []):
             print(f"Baseline validation error: {item}", file=sys.stderr)
         sys.exit(2)

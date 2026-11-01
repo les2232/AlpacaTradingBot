@@ -396,6 +396,126 @@ def normalize_decision_cycle_id(value: datetime | str) -> str:
     )
 
 
+_READ_ONLY_COMPATIBILITY_COLUMNS: dict[str, tuple[str, ...]] = {
+    "bot_runs": (
+        "id",
+        "session_id",
+        "symbol_fingerprint",
+        "environment",
+        "account_fingerprint",
+        "timestamp_utc",
+        "cash",
+        "buying_power",
+        "equity",
+        "last_equity",
+        "daily_pnl",
+        "kill_switch_triggered",
+    ),
+    "symbol_runs": (
+        "id",
+        "run_id",
+        "symbol",
+        "price",
+        "sma",
+        "ml_probability_up",
+        "ml_confidence",
+        "ml_training_rows",
+        "action",
+        "holding",
+        "holding_minutes",
+        "quantity",
+        "market_value",
+        "avg_entry_price",
+        "unrealized_pl",
+        "error",
+    ),
+    "order_history": (
+        "order_id",
+        "session_id",
+        "environment",
+        "account_fingerprint",
+        "observed_at_utc",
+        "submitted_at",
+        "filled_at",
+        "symbol",
+        "side",
+        "status",
+        "qty",
+        "filled_qty",
+        "filled_avg_price",
+        "notional",
+        "client_order_id",
+    ),
+    "order_intents": (
+        "intent_id",
+        "client_order_id",
+        "environment",
+        "account_fingerprint",
+        "decision_ts",
+        "symbol",
+        "side",
+        "intent_kind",
+        "requested_qty",
+        "final_qty",
+        "status",
+        "broker_order_id",
+        "broker_status",
+        "filled_qty",
+        "submission_attempts",
+        "error_category",
+        "created_at_utc",
+        "updated_at_utc",
+    ),
+    "runtime_state_bindings": (
+        "environment",
+        "account_fingerprint",
+        "provenance",
+        "history_cutoff_utc",
+        "bound_at_utc",
+    ),
+}
+
+
+def _install_read_only_compatibility_views(connection: sqlite3.Connection) -> None:
+    """Expose additive legacy columns through connection-local TEMP views.
+
+    A monitoring dashboard must not migrate the operator database merely to
+    read it.  TEMP views shadow legacy main-schema tables only for this
+    read-only connection, supplying NULL for columns introduced by later
+    additive migrations.  The main database bytes and schema stay untouched.
+    """
+
+    for table_name, expected_columns in _READ_ONLY_COMPATIBILITY_COLUMNS.items():
+        rows = connection.execute(
+            f'PRAGMA main.table_info("{table_name}")'
+        ).fetchall()
+        existing_columns = {str(row[1]) for row in rows}
+        if not rows:
+            if table_name != "runtime_state_bindings":
+                continue
+            projection = ", ".join(
+                f'CAST(NULL AS TEXT) AS "{column}"' for column in expected_columns
+            )
+            connection.execute(
+                f'CREATE TEMP VIEW "{table_name}" AS SELECT {projection} WHERE 0'
+            )
+            continue
+        if all(column in existing_columns for column in expected_columns):
+            continue
+        projection = ", ".join(
+            (
+                f'main."{table_name}"."{column}" AS "{column}"'
+                if column in existing_columns
+                else f'NULL AS "{column}"'
+            )
+            for column in expected_columns
+        )
+        connection.execute(
+            f'CREATE TEMP VIEW "{table_name}" AS '
+            f'SELECT {projection} FROM main."{table_name}"'
+        )
+
+
 class BotStorage:
     def __init__(self, db_path: str | Path, *, read_only: bool = False) -> None:
         self.db_path = require_canonical_database_path(db_path)
@@ -420,6 +540,7 @@ class BotStorage:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 30000")
         if self.read_only:
+            _install_read_only_compatibility_views(connection)
             connection.execute("PRAGMA query_only=ON")
         return connection
 

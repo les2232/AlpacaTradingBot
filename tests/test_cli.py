@@ -1,3 +1,5 @@
+import dataclasses
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -5,8 +7,51 @@ from uuid import uuid4
 
 import pytest
 
+import daily_report
+import trading_bot as runtime_trading_bot
 from alpaca_trading_bot import cli
-from trading_bot import BotConfig, RuntimeConfigDetails
+from tradeos.strategy_contract import (
+    CanonicalResolvedPromotedStrategy,
+    RUNTIME_FIXED_STRATEGY_ASSUMPTIONS,
+)
+from trading_bot import (
+    BotConfig,
+    RuntimeConfigDetails,
+    build_runtime_canonical_strategy_evidence,
+)
+
+
+@pytest.fixture(autouse=True)
+def valid_repository_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CLI unit tests independent from the checkout's promoted artifact."""
+
+    def valid_baseline(
+        project_root: Path,
+        runtime_config_path: str | Path | None = None,
+        **kwargs: object,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        selected_sha256 = kwargs.get("expected_runtime_config_sha256")
+        return (
+            {},
+            {
+                "valid_for_comparison": True,
+                "validation_errors": [],
+                "execution_context_matches_pointer_live": True,
+                "execution_context_validation_errors": [],
+                "selected_runtime_config_sha256": selected_sha256,
+                "effective_runtime_binding_valid": True,
+                "effective_runtime_binding_errors": [],
+                "research_generation_sha256": "a" * 64,
+                "promotion_bundle_sha256": "b" * 64,
+                "research_source_content_sha256": "c" * 64,
+            },
+        )
+
+    monkeypatch.setattr(
+        cli,
+        "load_backtest_baseline",
+        valid_baseline,
+    )
 
 
 def _cleanup_tree(path: Path) -> None:
@@ -18,6 +63,62 @@ def _cleanup_tree(path: Path) -> None:
         else:
             child.rmdir()
     path.rmdir()
+
+
+def _runtime_config(**overrides: object) -> BotConfig:
+    values: dict[str, object] = {
+        "symbols": ["AMD"],
+        "max_usd_per_trade": 200.0,
+        "max_symbol_exposure_usd": 200.0,
+        "max_open_positions": 3,
+        "max_daily_loss_usd": 300.0,
+        "sma_bars": 20,
+        "bar_timeframe_minutes": 15,
+        "strategy_mode": "mean_reversion",
+    }
+    values.update(overrides)
+    return BotConfig(**values)  # type: ignore[arg-type]
+
+
+def _runtime_module(**attributes: object) -> SimpleNamespace:
+    """A CLI test double that retains the real strategy contract boundary."""
+
+    namespace = dict(vars(runtime_trading_bot))
+    namespace.update(attributes)
+    return SimpleNamespace(**namespace)
+
+
+def _attachable_details(
+    *,
+    config: BotConfig | None = None,
+    runtime_config_path: str = "config/live_config.json",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        config=config or _runtime_config(),
+        runtime_config_path=runtime_config_path,
+        runtime_config_sha256="e" * 64,
+    )
+
+
+def _attach_with_strategy_evidence(details: object) -> object:
+    config = getattr(details, "config")
+    return cli._attach_baseline_validation(
+        details,
+        strategy_evidence=build_runtime_canonical_strategy_evidence(config),
+    )
+
+
+def _bound_baseline_source(
+    payload: dict[str, object],
+    *,
+    expected_runtime_config_sha256: object,
+) -> dict[str, object]:
+    return {
+        **payload,
+        "selected_runtime_config_sha256": expected_runtime_config_sha256,
+        "effective_runtime_binding_valid": True,
+        "effective_runtime_binding_errors": [],
+    }
 
 
 def test_cli_parser_accepts_preview() -> None:
@@ -52,6 +153,28 @@ def test_cli_parser_accepts_paper_shadow_and_unambiguous_repair_digests() -> Non
     assert repair.approved_plan_sha256 == "c" * 64
 
 
+def test_cli_parser_accepts_fixed_readiness_gate() -> None:
+    args = cli.build_parser().parse_args(["verify-readiness"])
+
+    assert args.command == "verify-readiness"
+    assert Path(args.config) == cli.PAPER_SHADOW_CONFIG_PATH
+    assert args.evidence_dir is None
+
+
+def test_repository_readiness_missing_evidence_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection = SimpleNamespace(evidence=None, rejected=())
+    fake_readiness = SimpleNamespace(
+        DEFAULT_EVIDENCE_DIR=Path("logs/readiness"),
+        select_latest_valid_evidence=lambda *args, **kwargs: selection,
+    )
+    monkeypatch.setitem(sys.modules, "tradeos.readiness", fake_readiness)
+
+    with pytest.raises(RuntimeError, match="without fresh, current, complete"):
+        cli._require_repository_readiness()
+
+
 def test_paper_shadow_uses_named_profile_writer_locks_and_explicit_deny(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -60,7 +183,12 @@ def test_paper_shadow_uses_named_profile_writer_locks_and_explicit_deny(
 
     expected_account = "paper-account-test"
     calls: dict[str, object] = {"locks": []}
-    config = SimpleNamespace(
+    monkeypatch.setattr(
+        cli,
+        "_require_repository_readiness",
+        lambda config_path=cli.PAPER_SHADOW_CONFIG_PATH: Path("readiness.json"),
+    )
+    config = _runtime_config(
         paper=True,
         broker_backend="alpaca",
         strategy_mode="mean_reversion",
@@ -77,8 +205,13 @@ def test_paper_shadow_uses_named_profile_writer_locks_and_explicit_deny(
         overridden_fields=("symbols",),
         runtime_config_approved=True,
         runtime_config_rejection_reasons=(),
+        runtime_config_sha256="e" * 64,
         baseline_valid_for_comparison=True,
         baseline_validation_errors=(),
+        execution_context_matches_pointer_live=True,
+        execution_context_validation_errors=(),
+        effective_runtime_binding_valid=True,
+        effective_runtime_binding_errors=(),
         launch_profile="paper_shadow",
         broker_environment="paper",
         submission_policy="deny",
@@ -102,7 +235,7 @@ def test_paper_shadow_uses_named_profile_writer_locks_and_explicit_deny(
         calls["runtime_path"] = cli.os.environ.get("BOT_RUNTIME_CONFIG_PATH")
         calls["execute_env"] = cli.os.environ.get("EXECUTE_ORDERS")
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: details,
         main=fake_main,
     )
@@ -110,7 +243,11 @@ def test_paper_shadow_uses_named_profile_writer_locks_and_explicit_deny(
     artifact.write_text("{}", encoding="utf-8")
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
-    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda value: value)
+    monkeypatch.setattr(
+        cli,
+        "_attach_baseline_validation",
+        lambda value, **_kwargs: value,
+    )
     monkeypatch.setattr(cli, "ExecutionLock", lambda: TrackingLock("kernel"))
     monkeypatch.setattr(cli, "_live_instance_lock", lambda: TrackingLock("legacy"))
     monkeypatch.setattr(
@@ -280,13 +417,13 @@ def test_run_dashboard_refuses_unverified_occupied_port(
 
 
 def test_run_live_refuses_non_paper_execution(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=False,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
         symbols=["AMD", "MSFT"],
     )
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path=None,
@@ -305,7 +442,7 @@ def test_run_live_refuses_non_paper_execution(monkeypatch: pytest.MonkeyPatch) -
 
 def test_run_preview_refuses_non_paper_without_starting_bot(monkeypatch: pytest.MonkeyPatch) -> None:
     called: dict[str, bool] = {"main": False}
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=False,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -327,7 +464,7 @@ def test_run_preview_refuses_non_paper_without_starting_bot(monkeypatch: pytest.
         assert config is not None
         assert session_id is not None
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path=None,
@@ -352,7 +489,7 @@ def test_run_live_refuses_second_live_instance(monkeypatch: pytest.MonkeyPatch) 
         '{"pid": 4242, "command": "tradeos live", "process_started_at_utc": "2026-04-16T14:00:00+00:00"}',
         encoding="utf-8",
     )
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -368,13 +505,14 @@ def test_run_live_refuses_second_live_instance(monkeypatch: pytest.MonkeyPatch) 
         max_data_delay_seconds=300,
     )
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path="config/live_config.json",
             overridden_fields=("symbols",),
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
         ),
         main=lambda **kwargs: None,
     )
@@ -407,7 +545,7 @@ def test_run_live_replaces_stale_lock_and_cleans_up(
     log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
     lock_path.write_text('{"pid": 999999, "command": "tradeos live"}', encoding="utf-8")
     called: dict[str, bool] = {"main": False}
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -436,13 +574,14 @@ def test_run_live_replaces_stale_lock_and_cleans_up(
         assert config is not None
         assert session_id is not None
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path="config/live_config.json",
             overridden_fields=("symbols",),
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
         ),
         main=fake_main,
     )
@@ -476,7 +615,7 @@ def test_run_live_replaces_stale_lock_and_cleans_up(
 def test_run_live_reports_lock_acquired(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
     log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -492,13 +631,14 @@ def test_run_live_reports_lock_acquired(monkeypatch: pytest.MonkeyPatch, capsys:
         max_data_delay_seconds=300,
     )
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path="config/live_config.json",
             overridden_fields=("symbols", "strategy_mode"),
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
         ),
         main=lambda **kwargs: None,
     )
@@ -545,7 +685,7 @@ def test_live_instance_lock_never_suppresses_body_error_when_metadata_changes(
 
 def test_run_live_loads_dotenv_before_resolving_config(monkeypatch: pytest.MonkeyPatch) -> None:
     called: list[str] = []
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -569,9 +709,10 @@ def test_run_live_loads_dotenv_before_resolving_config(monkeypatch: pytest.Monke
             overridden_fields=("symbols",),
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
         )
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=fake_load_config_details,
         main=lambda **kwargs: None,
     )
@@ -602,7 +743,7 @@ def test_run_live_acquires_lock_before_loading_config(monkeypatch: pytest.Monkey
     lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
     log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
     observed: dict[str, bool] = {"lock_seen_during_load": False, "lock_seen_during_main": False}
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -626,6 +767,7 @@ def test_run_live_acquires_lock_before_loading_config(monkeypatch: pytest.Monkey
             overridden_fields=("symbols",),
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
         )
 
     def fake_main(
@@ -640,7 +782,7 @@ def test_run_live_acquires_lock_before_loading_config(monkeypatch: pytest.Monkey
         assert config is not None
         assert session_id is not None
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=fake_load_config_details,
         main=fake_main,
     )
@@ -673,7 +815,7 @@ def test_run_live_recovers_malformed_lock(monkeypatch: pytest.MonkeyPatch, capsy
     lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
     log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
     lock_path.write_text("not-json", encoding="utf-8")
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -689,13 +831,14 @@ def test_run_live_recovers_malformed_lock(monkeypatch: pytest.MonkeyPatch, capsy
         max_data_delay_seconds=300,
     )
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path="config/live_config.json",
             overridden_fields=("symbols",),
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
         ),
         main=lambda **kwargs: None,
     )
@@ -725,27 +868,39 @@ def test_run_live_recovers_malformed_lock(monkeypatch: pytest.MonkeyPatch, capsy
 
 
 def test_run_live_refuses_unapproved_runtime_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
         symbols=["AMD"],
     )
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path="config/live_config.json",
             overridden_fields=("symbols",),
             runtime_config_approved=False,
             runtime_config_rejection_reasons=("profit_factor 1.0169 >= 1.2",),
+            runtime_config_sha256="e" * 64,
             baseline_valid_for_comparison=True,
             baseline_validation_errors=(),
+            execution_context_matches_pointer_live=True,
+            execution_context_validation_errors=(),
+            effective_runtime_binding_valid=True,
+            effective_runtime_binding_errors=(),
+            research_generation_sha256="a" * 64,
+            promotion_bundle_sha256="b" * 64,
+            research_source_content_sha256="c" * 64,
         ),
         main=lambda **kwargs: None,
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.delenv(cli.ALLOW_UNAPPROVED_RUNTIME_ENV, raising=False)
-    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
+    monkeypatch.setattr(
+        cli,
+        "_attach_baseline_validation",
+        lambda details, **_kwargs: details,
+    )
     monkeypatch.setattr(cli, "_live_instance_lock", cli.contextlib.nullcontext)
 
     with pytest.raises(RuntimeError, match="unapproved runtime config"):
@@ -766,13 +921,95 @@ def test_live_runtime_requires_explicit_approval_when_config_file_exists(
         cli._validate_runtime_config_approval(details, preview=False)
 
 
+def test_live_runtime_rejects_environment_only_config_even_with_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(cli.ALLOW_UNAPPROVED_RUNTIME_ENV, "true")
+    monkeypatch.setenv(cli.ALLOW_BASELINE_MISMATCH_ENV, "true")
+    details = SimpleNamespace(
+        runtime_config_path=None,
+        runtime_config_approved=None,
+        runtime_config_rejection_reasons=(),
+        baseline_valid_for_comparison=True,
+        baseline_validation_errors=(),
+    )
+
+    with pytest.raises(RuntimeError, match="without an explicit approved runtime config"):
+        cli._validate_runtime_config_approval(details, preview=False)
+
+    cli._validate_runtime_config_approval(details, preview=True)
+
+
+def test_run_live_refuses_environment_only_config_before_bot_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    called = {"main": False}
+    config = _runtime_config(paper=True)
+
+    def fake_main(**kwargs: object) -> None:
+        called["main"] = True
+
+    fake_module = _runtime_module(
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path=None,
+            overridden_fields=("symbols",),
+            runtime_config_approved=None,
+            runtime_config_rejection_reasons=(),
+        ),
+        main=fake_main,
+    )
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args: tmp_path / "bot.db")
+    monkeypatch.setattr(cli, "ExecutionLock", cli.contextlib.nullcontext)
+    monkeypatch.setattr(cli, "_live_instance_lock", cli.contextlib.nullcontext)
+    monkeypatch.setenv(cli.ALLOW_UNAPPROVED_RUNTIME_ENV, "true")
+    monkeypatch.setenv(cli.ALLOW_BASELINE_MISMATCH_ENV, "true")
+
+    with pytest.raises(RuntimeError, match="without an explicit approved runtime config"):
+        cli._run_live(preview=False)
+
+    assert called["main"] is False
+
+
+def test_run_preview_preserves_environment_only_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    called: dict[str, object] = {}
+    config = _runtime_config(paper=True)
+
+    def fake_main(**kwargs: object) -> None:
+        called.update(kwargs)
+
+    fake_module = _runtime_module(
+        load_config_details=lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path=None,
+            overridden_fields=("symbols",),
+            runtime_config_approved=None,
+            runtime_config_rejection_reasons=(),
+        ),
+        main=fake_main,
+    )
+    monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
+    monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "resolve_database_path", lambda *_args: tmp_path / "bot.db")
+
+    assert cli._run_live(preview=True) == 0
+    assert called["config"] is config
+    assert called["execute_orders"] is False
+
+
 def test_run_live_allows_unapproved_runtime_with_explicit_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lock_path = cli.PROJECT_ROOT / f"test_live_lock_{uuid4().hex}.lock"
     log_root = cli.PROJECT_ROOT / f"test_logs_{uuid4().hex}"
     called: dict[str, bool] = {"main": False}
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -800,15 +1037,23 @@ def test_run_live_allows_unapproved_runtime_with_explicit_override(
         assert config is not None
         assert session_id is not None
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path="config/live_config.json",
             overridden_fields=("symbols",),
             runtime_config_approved=False,
             runtime_config_rejection_reasons=("profit_factor 1.0169 >= 1.2",),
+            runtime_config_sha256="e" * 64,
             baseline_valid_for_comparison=True,
             baseline_validation_errors=(),
+            execution_context_matches_pointer_live=True,
+            execution_context_validation_errors=(),
+            effective_runtime_binding_valid=True,
+            effective_runtime_binding_errors=(),
+            research_generation_sha256="a" * 64,
+            promotion_bundle_sha256="b" * 64,
+            research_source_content_sha256="c" * 64,
         ),
         main=fake_main,
     )
@@ -816,7 +1061,11 @@ def test_run_live_allows_unapproved_runtime_with_explicit_override(
     monkeypatch.setattr(cli, "LIVE_BOT_LOCK_PATH", lock_path)
     monkeypatch.setattr(cli, "LOG_ROOT", log_root)
     monkeypatch.setenv(cli.ALLOW_UNAPPROVED_RUNTIME_ENV, "true")
-    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
+    monkeypatch.setattr(
+        cli,
+        "_attach_baseline_validation",
+        lambda details, **_kwargs: details,
+    )
     monkeypatch.setattr(
         cli,
         "_read_process_identity",
@@ -839,19 +1088,20 @@ def test_run_live_allows_unapproved_runtime_with_explicit_override(
 
 
 def test_run_live_refuses_baseline_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
         symbols=["AMD"],
     )
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path="config/live_config.json",
             overridden_fields=("symbols",),
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
             baseline_valid_for_comparison=False,
             baseline_validation_errors=("research config does not match live runtime",),
         ),
@@ -859,7 +1109,11 @@ def test_run_live_refuses_baseline_mismatch(monkeypatch: pytest.MonkeyPatch) -> 
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.delenv(cli.ALLOW_BASELINE_MISMATCH_ENV, raising=False)
-    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
+    monkeypatch.setattr(
+        cli,
+        "_attach_baseline_validation",
+        lambda details, **_kwargs: details,
+    )
     monkeypatch.setattr(cli, "_live_instance_lock", cli.contextlib.nullcontext)
 
     with pytest.raises(RuntimeError, match="does not match the promoted baseline"):
@@ -871,7 +1125,7 @@ def test_run_live_allows_baseline_mismatch_with_explicit_override(
     tmp_path: Path,
 ) -> None:
     called: dict[str, bool] = {"main": False}
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -899,13 +1153,14 @@ def test_run_live_allows_baseline_mismatch_with_explicit_override(
         assert config is not None
         assert session_id is not None
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path="config/live_config.json",
             overridden_fields=("symbols",),
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
             baseline_valid_for_comparison=False,
             baseline_validation_errors=("research config does not match live runtime",),
         ),
@@ -913,7 +1168,11 @@ def test_run_live_allows_baseline_mismatch_with_explicit_override(
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.setenv(cli.ALLOW_BASELINE_MISMATCH_ENV, "true")
-    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
+    monkeypatch.setattr(
+        cli,
+        "_attach_baseline_validation",
+        lambda details, **_kwargs: details,
+    )
     monkeypatch.setattr(cli, "_live_instance_lock", cli.contextlib.nullcontext)
     monkeypatch.setattr(cli, "LOG_ROOT", tmp_path / "logs")
 
@@ -938,24 +1197,497 @@ def test_attach_baseline_validation_supports_frozen_runtime_details(monkeypatch:
         overridden_fields=("symbols",),
         runtime_config_approved=True,
         runtime_config_rejection_reasons=(),
+        runtime_config_sha256="e" * 64,
     )
     monkeypatch.setattr(
         cli,
         "load_backtest_baseline",
-        lambda project_root: (
+        lambda project_root, runtime_config_path=None, **kwargs: (
             None,
-            {
-                "valid_for_comparison": False,
-                "validation_errors": ["research config does not match live runtime"],
-            },
+            _bound_baseline_source(
+                {
+                    "valid_for_comparison": False,
+                    "validation_errors": ["research config does not match live runtime"],
+                },
+                expected_runtime_config_sha256=kwargs.get(
+                    "expected_runtime_config_sha256"
+                ),
+            ),
         ),
     )
 
-    updated = cli._attach_baseline_validation(details)
+    updated = _attach_with_strategy_evidence(details)
 
     assert updated is not details
     assert updated.baseline_valid_for_comparison is False
-    assert updated.baseline_validation_errors == ("research config does not match live runtime",)
+    assert updated.baseline_validation_errors == (
+        "research config does not match live runtime",
+        "pointer-live execution-context match metadata is missing or invalid",
+    )
+
+
+def test_attach_baseline_validation_uses_the_selected_runtime_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "config"
+    results_dir = tmp_path / "results"
+    config_dir.mkdir()
+    results_dir.mkdir()
+
+    matching_config = BotConfig(
+        symbols=["AMD"],
+        max_usd_per_trade=200.0,
+        max_symbol_exposure_usd=200.0,
+        max_open_positions=1,
+        max_daily_loss_usd=300.0,
+        sma_bars=20,
+        bar_timeframe_minutes=15,
+        strategy_mode="mean_reversion",
+        bb_period=20,
+    )
+    divergent_config = dataclasses.replace(matching_config, bb_period=25)
+
+    def runtime_payload(config: BotConfig) -> dict[str, object]:
+        payload = {
+            "symbols": list(config.symbols),
+            **{
+                key: getattr(config, key)
+                for key in daily_report.PROMOTED_RUNTIME_FIELDS
+            },
+        }
+        payload["symbol_strategy_modes"] = {
+            symbol: (config.symbol_strategy_modes or {}).get(
+                symbol,
+                config.strategy_mode,
+            )
+            for symbol in config.symbols
+        }
+        return payload
+
+    matching_runtime = runtime_payload(matching_config)
+    divergent_runtime = runtime_payload(divergent_config)
+    matching_contract = CanonicalResolvedPromotedStrategy.from_research_resolution(
+        matching_config.symbols,
+        {
+            key: matching_runtime[key]
+            for key in daily_report.PROMOTED_RUNTIME_FIELDS
+        },
+        dict(RUNTIME_FIXED_STRATEGY_ASSUMPTIONS),
+    ).to_canonical_dict()
+    for name, runtime in (
+        ("paper_shadow_config.json", matching_runtime),
+        ("live_config.json", divergent_runtime),
+    ):
+        (config_dir / name).write_text(
+            json.dumps(
+                {
+                    "source": {"approved": True, "rejection_reasons": []},
+                    "runtime": runtime,
+                }
+            ),
+            encoding="utf-8",
+        )
+    (results_dir / "best_config_latest.json").write_text(
+        json.dumps(
+            {
+                "approved": True,
+                "rejection_reasons": [],
+                "config": {
+                    "symbols": list(matching_config.symbols),
+                    **{
+                        key: matching_runtime[key]
+                        for key in daily_report.PROMOTED_RUNTIME_FIELDS
+                    },
+                },
+                "canonical_strategy_contract": matching_contract,
+                "performance": {"trades_per_day": 2.0, "win_rate": 75.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+
+    def selected_runtime_baseline(
+        project_root: Path,
+        runtime_config_path: str | Path | None = None,
+        **kwargs: object,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if runtime_config_path == "config/paper_shadow_config.json":
+            return {}, _bound_baseline_source(
+                {
+                    "valid_for_comparison": True,
+                    "validation_errors": [],
+                    "execution_context_matches_pointer_live": True,
+                    "execution_context_validation_errors": [],
+                    "research_generation_sha256": "a" * 64,
+                    "promotion_bundle_sha256": "b" * 64,
+                    "research_source_content_sha256": "c" * 64,
+                },
+                expected_runtime_config_sha256=kwargs.get(
+                    "expected_runtime_config_sha256"
+                ),
+            )
+        return {}, _bound_baseline_source(
+            {
+                "valid_for_comparison": False,
+                "validation_errors": ["research config does not match live runtime (bb_period: live=25 research=20)"],
+                "execution_context_matches_pointer_live": True,
+                "execution_context_validation_errors": [],
+                "research_generation_sha256": "a" * 64,
+                "promotion_bundle_sha256": "b" * 64,
+                "research_source_content_sha256": "c" * 64,
+            },
+            expected_runtime_config_sha256=kwargs.get(
+                "expected_runtime_config_sha256"
+            ),
+        )
+
+    monkeypatch.setattr(
+        cli,
+        "load_backtest_baseline",
+        selected_runtime_baseline,
+    )
+
+    matching = _attach_with_strategy_evidence(
+        _attachable_details(
+            config=matching_config,
+            runtime_config_path="config/paper_shadow_config.json",
+        )
+    )
+    divergent = _attach_with_strategy_evidence(
+        _attachable_details(config=divergent_config)
+    )
+
+    assert matching.baseline_valid_for_comparison is True
+    assert matching.baseline_validation_errors == ()
+    assert divergent.baseline_valid_for_comparison is False
+    assert any(
+        "bb_period: live=25 research=20" in error
+        for error in divergent.baseline_validation_errors
+    )
+
+
+def test_attach_baseline_validation_rejects_missing_validity_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    details = _attachable_details()
+    monkeypatch.setattr(
+        cli,
+        "load_backtest_baseline",
+        lambda project_root, runtime_config_path=None, **kwargs: (
+            None,
+            _bound_baseline_source(
+                {"validation_errors": []},
+                expected_runtime_config_sha256=kwargs.get(
+                    "expected_runtime_config_sha256"
+                ),
+            ),
+        ),
+    )
+
+    updated = _attach_with_strategy_evidence(details)
+
+    assert updated.baseline_valid_for_comparison is False
+    assert updated.baseline_validation_errors == (
+        "baseline validity metadata is missing or invalid",
+        "pointer-live execution-context match metadata is missing or invalid",
+    )
+
+
+def test_attach_baseline_validation_never_borrows_pointer_for_env_only_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_loader(*args, **kwargs):
+        raise AssertionError("pathless runtime must not load pointer baseline")
+
+    monkeypatch.setattr(cli, "load_backtest_baseline", unexpected_loader)
+
+    updated = cli._attach_baseline_validation(
+        SimpleNamespace(runtime_config_path=None)
+    )
+
+    assert updated.baseline_valid_for_comparison is False
+    assert updated.baseline_validation_errors == (
+        "explicit runtime config artifact is required; environment-only configuration "
+        "cannot inherit promoted baseline validation",
+    )
+    assert updated.research_generation_sha256 is None
+    assert updated.promotion_bundle_sha256 is None
+    assert updated.research_source_content_sha256 is None
+    assert updated.execution_context_matches_pointer_live is False
+    assert updated.execution_context_validation_errors == (
+        "explicit runtime config artifact is required for pointer-live "
+        "execution-context comparison",
+    )
+
+
+def test_attach_baseline_validation_carries_exact_promotion_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_sha256 = "a" * 64
+    bundle_sha256 = "b" * 64
+    source_content_sha256 = "c" * 64
+    monkeypatch.setattr(
+        cli,
+        "load_backtest_baseline",
+        lambda project_root, runtime_config_path=None, **kwargs: (
+            {},
+            _bound_baseline_source(
+                {
+                    "valid_for_comparison": True,
+                    "validation_errors": [],
+                    "execution_context_matches_pointer_live": True,
+                    "execution_context_validation_errors": [],
+                    "research_generation_sha256": generation_sha256,
+                    "promotion_bundle_sha256": bundle_sha256,
+                    "research_source_content_sha256": source_content_sha256,
+                },
+                expected_runtime_config_sha256=kwargs.get(
+                    "expected_runtime_config_sha256"
+                ),
+            ),
+        ),
+    )
+
+    updated = _attach_with_strategy_evidence(_attachable_details())
+
+    assert updated.baseline_valid_for_comparison is True
+    assert updated.baseline_validation_errors == ()
+    assert updated.execution_context_matches_pointer_live is True
+    assert updated.execution_context_validation_errors == ()
+    assert updated.research_generation_sha256 == generation_sha256
+    assert updated.promotion_bundle_sha256 == bundle_sha256
+    assert updated.research_source_content_sha256 == source_content_sha256
+
+
+@pytest.mark.parametrize(
+    ("context_match", "context_errors"),
+    [
+        (None, []),
+        ("true", []),
+        (False, ["selected runtime execution context differs"]),
+        (True, ["pointer execution context is malformed"]),
+        (True, [""]),
+    ],
+)
+def test_attach_baseline_validation_rejects_missing_or_invalid_context_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+    context_match: object,
+    context_errors: object,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "load_backtest_baseline",
+        lambda project_root, runtime_config_path=None, **kwargs: (
+            {},
+            _bound_baseline_source(
+                {
+                    "valid_for_comparison": True,
+                    "validation_errors": [],
+                    "execution_context_matches_pointer_live": context_match,
+                    "execution_context_validation_errors": context_errors,
+                    "research_generation_sha256": "a" * 64,
+                    "promotion_bundle_sha256": "b" * 64,
+                    "research_source_content_sha256": "c" * 64,
+                },
+                expected_runtime_config_sha256=kwargs.get(
+                    "expected_runtime_config_sha256"
+                ),
+            ),
+        ),
+    )
+
+    updated = _attach_with_strategy_evidence(_attachable_details())
+
+    assert updated.baseline_valid_for_comparison is False
+    assert updated.execution_context_matches_pointer_live is False
+    assert updated.execution_context_validation_errors
+    assert updated.research_generation_sha256 is None
+    assert updated.promotion_bundle_sha256 is None
+    assert updated.research_source_content_sha256 is None
+
+
+@pytest.mark.parametrize(
+    ("generation_sha256", "bundle_sha256", "source_content_sha256"),
+    [
+        (None, "b" * 64, "c" * 64),
+        ("a" * 64, None, "c" * 64),
+        ("a" * 64, "b" * 64, None),
+        ("A" * 64, "b" * 64, "c" * 64),
+        ("g" * 64, "b" * 64, "c" * 64),
+        ("a" * 63, "b" * 64, "c" * 64),
+        ("a" * 64, 7, "c" * 64),
+        ("a" * 64, "b" * 64, "C" * 64),
+        ("a" * 64, "b" * 64, "z" * 64),
+    ],
+)
+def test_attach_baseline_validation_rejects_untrusted_promotion_identities(
+    monkeypatch: pytest.MonkeyPatch,
+    generation_sha256: object,
+    bundle_sha256: object,
+    source_content_sha256: object,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "load_backtest_baseline",
+        lambda project_root, runtime_config_path=None, **kwargs: (
+            {},
+            _bound_baseline_source(
+                {
+                    "valid_for_comparison": True,
+                    "validation_errors": [],
+                    "execution_context_matches_pointer_live": True,
+                    "execution_context_validation_errors": [],
+                    "research_generation_sha256": generation_sha256,
+                    "promotion_bundle_sha256": bundle_sha256,
+                    "research_source_content_sha256": source_content_sha256,
+                },
+                expected_runtime_config_sha256=kwargs.get(
+                    "expected_runtime_config_sha256"
+                ),
+            ),
+        ),
+    )
+
+    updated = _attach_with_strategy_evidence(_attachable_details())
+
+    assert updated.baseline_valid_for_comparison is False
+    assert updated.research_generation_sha256 is None
+    assert updated.promotion_bundle_sha256 is None
+    assert updated.research_source_content_sha256 is None
+    assert any("SHA-256 is missing or invalid" in error for error in updated.baseline_validation_errors)
+
+
+def test_startup_writer_rejects_baseline_without_trusted_promotion_identities(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _runtime_config(paper=True)
+    details = SimpleNamespace(
+        config=config,
+        baseline_valid_for_comparison=True,
+        baseline_validation_errors=(),
+        execution_context_matches_pointer_live=True,
+        execution_context_validation_errors=(),
+        runtime_config_sha256="e" * 64,
+        effective_runtime_binding_valid=True,
+        effective_runtime_binding_errors=(),
+        research_generation_sha256="A" * 64,
+        promotion_bundle_sha256="b" * 64,
+        research_source_content_sha256="c" * 64,
+    )
+    monkeypatch.setattr(cli, "LOG_ROOT", tmp_path / "logs")
+
+    with pytest.raises(ValueError, match="exact research generation, bundle, and source"):
+        cli._persist_startup_config(
+            details,
+            preview=False,
+            session_id="invalid-baseline-identities",
+            strategy_evidence=build_runtime_canonical_strategy_evidence(config),
+            database_path=tmp_path / "bot.db",
+        )
+
+    assert not (tmp_path / "logs").exists()
+
+
+@pytest.mark.parametrize(
+    ("context_match", "context_errors"),
+    [
+        (None, ()),
+        (False, ("selected execution context differs",)),
+        (True, ("unexpected validation error",)),
+    ],
+)
+def test_startup_writer_rejects_valid_baseline_without_exact_execution_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    context_match: bool | None,
+    context_errors: tuple[str, ...],
+) -> None:
+    config = _runtime_config(paper=True)
+    details = SimpleNamespace(
+        config=config,
+        baseline_valid_for_comparison=True,
+        baseline_validation_errors=(),
+        execution_context_matches_pointer_live=context_match,
+        execution_context_validation_errors=context_errors,
+        runtime_config_sha256="e" * 64,
+        effective_runtime_binding_valid=True,
+        effective_runtime_binding_errors=(),
+        research_generation_sha256="a" * 64,
+        promotion_bundle_sha256="b" * 64,
+        research_source_content_sha256="c" * 64,
+    )
+    monkeypatch.setattr(cli, "LOG_ROOT", tmp_path / "logs")
+
+    with pytest.raises(ValueError, match="pointer-live execution-context match"):
+        cli._persist_startup_config(
+            details,
+            preview=False,
+            session_id="invalid-execution-context",
+            strategy_evidence=build_runtime_canonical_strategy_evidence(config),
+            database_path=tmp_path / "bot.db",
+        )
+
+    assert not (tmp_path / "logs").exists()
+
+
+@pytest.mark.parametrize(
+    ("runtime_config_sha256", "binding_valid", "binding_errors"),
+    [
+        (None, True, ()),
+        ("e" * 64, None, ()),
+        ("e" * 64, False, ("runtime bytes changed",)),
+        ("e" * 64, True, ("unexpected binding error",)),
+    ],
+)
+def test_startup_writer_rejects_valid_baseline_without_effective_runtime_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    runtime_config_sha256: str | None,
+    binding_valid: bool | None,
+    binding_errors: tuple[str, ...],
+) -> None:
+    config = _runtime_config(paper=True)
+    details = SimpleNamespace(
+        config=config,
+        runtime_config_sha256=runtime_config_sha256,
+        baseline_valid_for_comparison=True,
+        baseline_validation_errors=(),
+        execution_context_matches_pointer_live=True,
+        execution_context_validation_errors=(),
+        effective_runtime_binding_valid=binding_valid,
+        effective_runtime_binding_errors=binding_errors,
+        research_generation_sha256="a" * 64,
+        promotion_bundle_sha256="b" * 64,
+        research_source_content_sha256="c" * 64,
+    )
+    monkeypatch.setattr(cli, "LOG_ROOT", tmp_path / "logs")
+
+    with pytest.raises(ValueError, match="exact first-read runtime bytes"):
+        cli._persist_startup_config(
+            details,
+            preview=False,
+            session_id="invalid-effective-runtime-binding",
+            strategy_evidence=build_runtime_canonical_strategy_evidence(config),
+            database_path=tmp_path / "bot.db",
+        )
+
+    assert not (tmp_path / "logs").exists()
+
+
+def test_validate_runtime_baseline_rejects_missing_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(cli.ALLOW_BASELINE_MISMATCH_ENV, raising=False)
+
+    with pytest.raises(RuntimeError, match="failed baseline validation"):
+        cli._validate_runtime_baseline(
+            SimpleNamespace(runtime_config_path="config/live_config.json"),
+            preview=False,
+        )
 
 
 def test_run_live_recovers_reused_pid_lock(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -965,7 +1697,7 @@ def test_run_live_recovers_reused_pid_lock(monkeypatch: pytest.MonkeyPatch, caps
         '{"pid": 4242, "command": "tradeos live", "process_started_at_utc": "2026-04-16T09:30:00+00:00"}',
         encoding="utf-8",
     )
-    config = SimpleNamespace(
+    config = _runtime_config(
         paper=True,
         strategy_mode="mean_reversion",
         bar_timeframe_minutes=15,
@@ -981,13 +1713,14 @@ def test_run_live_recovers_reused_pid_lock(monkeypatch: pytest.MonkeyPatch, caps
         max_data_delay_seconds=300,
     )
 
-    fake_module = SimpleNamespace(
+    fake_module = _runtime_module(
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path="config/live_config.json",
             overridden_fields=("symbols",),
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
         ),
         main=lambda **kwargs: None,
     )
@@ -1023,7 +1756,7 @@ def test_persist_startup_config_writes_live_artifact(
 ) -> None:
     log_root = tmp_path / "logs"
     details = SimpleNamespace(
-        config=SimpleNamespace(
+        config=BotConfig(
             paper=True,
             strategy_mode="mean_reversion",
             bar_timeframe_minutes=15,
@@ -1042,19 +1775,19 @@ def test_persist_startup_config_writes_live_artifact(
             max_symbol_exposure_usd=200.0,
             max_open_positions=3,
             max_daily_loss_usd=300.0,
-                max_orders_per_minute=6,
-                max_price_deviation_bps=75.0,
-                max_live_price_age_seconds=60,
-                max_data_delay_seconds=300,
-                ml_lookback_bars=320,
-                breakout_max_stop_pct=0.03,
-                sma_stop_pct=0.0,
-                mean_reversion_exit_style="sma",
-                mean_reversion_max_atr_percentile=0.0,
-                mean_reversion_trend_filter=False,
-                mean_reversion_trend_slope_filter=False,
-                mean_reversion_stop_pct=0.0,
-            ),
+            max_orders_per_minute=6,
+            max_price_deviation_bps=75.0,
+            max_live_price_age_seconds=60,
+            max_data_delay_seconds=300,
+            ml_lookback_bars=320,
+            breakout_max_stop_pct=0.03,
+            sma_stop_pct=0.0,
+            mean_reversion_exit_style="sma",
+            mean_reversion_max_atr_percentile=0.0,
+            mean_reversion_trend_filter=False,
+            mean_reversion_trend_slope_filter=False,
+            mean_reversion_stop_pct=0.0,
+        ),
         runtime_config_path="config/live_config.json",
         overridden_fields=("symbols", "strategy_mode"),
         runtime_config_approved=True,
@@ -1064,7 +1797,13 @@ def test_persist_startup_config_writes_live_artifact(
     monkeypatch.setenv("BOT_DB_PATH", "bot_history.db")
 
     try:
-        path = cli._persist_startup_config(details, preview=False, session_id="live-test-session")
+        strategy_evidence = build_runtime_canonical_strategy_evidence(details.config)
+        path = cli._persist_startup_config(
+            details,
+            preview=False,
+            session_id="live-test-session",
+            strategy_evidence=strategy_evidence,
+        )
         payload = cli.json.loads(path.read_text(encoding="utf-8"))
         latest_payload = cli.json.loads((path.parent / "startup_config.json").read_text(encoding="utf-8"))
 
@@ -1092,6 +1831,15 @@ def test_persist_startup_config_writes_live_artifact(
         assert payload["mean_reversion_trend_filter"] is False
         assert payload["mean_reversion_trend_slope_filter"] is False
         assert payload["mean_reversion_stop_pct"] == 0.0
+        assert payload["canonical_strategy_contract"] == (
+            strategy_evidence["canonical_strategy_contract"]
+        )
+        assert payload["canonical_strategy_sha256"] == (
+            strategy_evidence["canonical_strategy_sha256"]
+        )
+        assert payload["research_generation_sha256"] is None
+        assert payload["promotion_bundle_sha256"] is None
+        assert payload["research_source_content_sha256"] is None
         assert payload["db_path"] == str((cli.PROJECT_ROOT / "bot_history.db").resolve())
         assert latest_payload == payload
     finally:
@@ -1137,10 +1885,7 @@ def test_live_command_rejects_non_paper_config_before_main_or_bot_construction(
     def unexpected_call(*args, **kwargs):
         pytest.fail("non-paper configuration reached an order-capable entrypoint")
 
-    config = SimpleNamespace(
-        paper=False,
-        base_url="https://api.alpaca.markets",
-    )
+    config = _runtime_config(paper=False)
     monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "resolve_database_path", lambda *_args: tmp_path / "bot.db")
     monkeypatch.setattr(cli, "ExecutionLock", NoopContext)
@@ -1236,10 +1981,7 @@ def test_paper_reconcile_prints_safe_final_code_from_bot_report(
         def reconcile_broker_safety(self):
             return report
 
-    config = SimpleNamespace(
-        paper=True,
-        base_url="https://paper-api.alpaca.markets",
-    )
+    config = _runtime_config(paper=True)
     monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "resolve_database_path", lambda: tmp_path / "bot.db")
     monkeypatch.setattr(
@@ -1300,10 +2042,7 @@ def test_live_run_holds_execution_lock_while_trading_main_executes(
         assert state == {"execution_lock_held": True, "live_lock_held": True}
         events.append("main")
 
-    config = SimpleNamespace(
-        paper=True,
-        base_url="https://paper-api.alpaca.markets",
-    )
+    config = _runtime_config(paper=True)
     monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         cli, "resolve_database_path", lambda *_args: tmp_path / "bot.db"
@@ -1314,7 +2053,14 @@ def test_live_run_holds_execution_lock_while_trading_main_executes(
     monkeypatch.setattr(
         trading_bot,
         "load_config_details",
-        lambda: SimpleNamespace(config=config),
+        lambda: SimpleNamespace(
+            config=config,
+            runtime_config_path="config/live_config.json",
+            overridden_fields=(),
+            runtime_config_approved=True,
+            runtime_config_rejection_reasons=(),
+            runtime_config_sha256="e" * 64,
+        ),
     )
     monkeypatch.setattr(trading_bot, "main", fake_main)
 

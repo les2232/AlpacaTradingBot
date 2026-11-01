@@ -17,6 +17,7 @@ Active live mode: **`mean_reversion`** (set in `config/live_config.json`, valida
   - timeframe
   - indicator/filter settings
 - If `config/live_config.json` differs from `.env`, the bot will override `.env` for supported runtime fields and print which fields were overridden at startup.
+- `config/paper_shadow_config.json` is the machine-specific named profile for supervised paper-shadow sessions. Keep it untracked.
 
 ## Supported Interfaces
 
@@ -26,40 +27,43 @@ Active live mode: **`mean_reversion`** (set in `config/live_config.json`, valida
 
 ## One Operator Workflow
 
-Use exactly one execution process and one monitoring process.
+Use one monitoring process. Start a shadow process only for a manually supervised no-submit session.
 
-1. Start the full live session with one click:
+1. Start the read-only dashboard:
 
 ```powershell
 .\start_dashboard.ps1
 ```
 
-This is the preferred launcher. By default it starts or safely reuses `tradeos
-live`, then starts the dashboard and opens the browser when the dashboard is
-ready. It refuses an already-occupied dashboard port because the existing
-process's workspace and database authority cannot be verified. It also keeps
-the live approval gate on by default.
+This is the default launcher behavior. It starts only the dashboard and opens
+the browser when the dashboard is ready; it does not start a trading or shadow
+process. It refuses an already-occupied dashboard port because the existing
+process's workspace and database authority cannot be verified.
 
-If you are deliberately testing an unapproved research config, use the explicit override:
+2. Only for an explicitly supervised no-submit observation session, start the
+paper shadow and dashboard together:
 
 ```powershell
-.\start_dashboard.ps1 -AllowUnapprovedRuntime
+.\start_dashboard.ps1 -PaperShadow
 ```
 
-Treat that as a temporary research-mode launch, not the normal production path.
+This starts `tradeos paper-shadow` with broker submission denied. Keep the
+session manually supervised and stop it when observation is complete. Never
+substitute `tradeos live` or `tradeos paper`; both are order-capable and outside
+this workflow.
 
-2. Confirm the startup summary matches expectations:
+3. If paper shadow was started, confirm the startup summary matches expectations:
    - `account=paper`
    - `strategy=mean_reversion`
    - `timeframe=15m`
    - `symbols=15`
 
-3. During market hours, inspect:
+4. During the supervised shadow session, inspect:
    - `logs/<date>/bars.jsonl`
    - `logs/<date>/risk.jsonl`
    - `logs/<date>/signals.jsonl`
 
-4. If you need monitoring without starting the bot:
+5. The explicit dashboard-only form is:
 
 ```powershell
 .\start_dashboard.ps1 -DashboardOnly
@@ -68,6 +72,7 @@ Treat that as a temporary research-mode launch, not the normal production path.
 ## What Not To Do
 
 - Do not run multiple `tradeos live` processes.
+- Do not use `tradeos live` or `tradeos paper` for a no-submit session; both are order-capable.
 - Do not use the dashboard to execute trading cycles.
 - Do not change `.env` and `config/live_config.json` independently without checking the startup summary.
 - Do not treat historical logs in `logs/` as safe to commit by default.

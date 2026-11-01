@@ -29,16 +29,67 @@ This script is intentionally different from run_compare_suite.ps1:
 """
 
 import argparse
+import io
 import json
+import hashlib
+import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Callable, Mapping
+from uuid import uuid4
 
 import pandas as pd
 from dataset_integrity import load_verified_manifest
 from daily_report import DEFAULT_BACKTEST, WARN
+from dotenv import dotenv_values
 from research.experiment_log import log_experiment_run
+from tradeos.research_bundle import (
+    ApprovalPolicy,
+    BacktestCanonicalStrategy,
+    BacktestModelExecutionEvidence,
+    DRIFT_PROFILE_POLICY_V1,
+    DRIFT_PROFILE_SCHEMA_NAME,
+    DRIFT_PROFILE_SCHEMA_VERSION,
+    RegimePolicy,
+    ResearchBundle,
+    ResearchBundleValidationError,
+    ResearchPublicationError,
+    RISK_EXECUTION_CONTEXT_FIELDS,
+    StabilityPolicy,
+    assert_dataset_checkpoint_unchanged,
+    assert_source_identity_unchanged,
+    build_backtest_selection_evidence,
+    build_dataset_provenance_set,
+    build_latest_research_state,
+    build_live_config_payload,
+    build_promotion_pointer,
+    build_research_config_identity,
+    build_research_bundle,
+    canonical_strategy_from_backtest_row,
+    capture_dataset_checkpoint,
+    capture_dataset_provenance,
+    capture_source_identity,
+    compute_research_generation_sha256,
+    evaluate_approval_policy,
+    evaluate_stability_policy,
+    generation_directory_component,
+    json_file_bytes,
+    load_verified_promotion_pointer,
+    model_execution_evidence_from_backtest_row,
+    normalize_metrics,
+    publish_files_atomically,
+    resolve_risk_execution_context,
+    strict_json_loads,
+    validate_backtest_selection_artifacts,
+    verify_latest_research_state_bytes,
+    write_immutable_bundle,
+    write_immutable_generation,
+)
+from tradeos.execution_lock import ExecutionLock
+from tradeos.strategy_contract import PROMOTED_STRATEGY_FIELDS
 import strategy_report
 
 # ---------------------------------------------------------------------------
@@ -55,36 +106,148 @@ STABILITY_REPORT_PATH = RESULTS_DIR / "stability_report.json"
 TRADE_DECISION_PATH   = RESULTS_DIR / "trade_decision.json"
 LIVE_CONFIG_PATH      = CONFIG_DIR / "live_config.json"
 DRIFT_PROFILE_PATH    = RESULTS_DIR / "drift_profile.json"
+PROMOTION_BUNDLE_DIR  = RESULTS_DIR / "promotions"
+PROMOTION_GENERATION_DIR = PROMOTION_BUNDLE_DIR / "generations"
+PROMOTION_POINTER_PATH = RESULTS_DIR / "promotion_current.json"
+LATEST_RESEARCH_STATE_PATH = RESULTS_DIR / "research_latest.json"
+RESEARCH_LOCK_PATH = SCRIPT_DIR / ".research_pipeline.lock"
+
+APPROVAL_POLICY_NAME    = "tradeos.primary_research_approval"
+APPROVAL_POLICY_VERSION = 1
+STABILITY_POLICY_NAME    = "tradeos.multi_window_stability"
+STABILITY_POLICY_VERSION = 1
+REGIME_POLICY_NAME       = "tradeos.market_regime_gate"
+REGIME_POLICY_VERSION    = 1
 
 
-def _load_live_runtime_defaults() -> dict:
-    if not LIVE_CONFIG_PATH.exists():
-        raise RuntimeError(f"Live config not found: {LIVE_CONFIG_PATH}")
-
-    payload = json.loads(LIVE_CONFIG_PATH.read_text(encoding="utf-8"))
+def _load_live_runtime_defaults(
+    live_config_path: Path,
+    *,
+    dotenv_path: Path | None = None,
+    process_environment: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    path = Path(live_config_path)
+    if not path.exists():
+        raise RuntimeError(f"Live config not found: {path}")
+    try:
+        payload = strict_json_loads(
+            path.read_text(encoding="utf-8"),
+            label="research live config",
+        )
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(f"Live config is unreadable: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Live config must contain an object: {path}")
     runtime = payload.get("runtime")
     if not isinstance(runtime, dict):
-        raise RuntimeError(f"Live config is missing a 'runtime' object: {LIVE_CONFIG_PATH}")
+        raise RuntimeError(f"Live config is missing a 'runtime' object: {path}")
+
+    environment_file = dotenv_path if dotenv_path is not None else SCRIPT_DIR / ".env"
+    try:
+        dotenv_environment = dotenv_values(environment_file)
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError("Research dotenv inputs are unreadable.") from exc
+    effective_environment: dict[str, object] = {
+        key: value
+        for key, value in dotenv_environment.items()
+        if type(key) is str and value is not None
+    }
+    effective_environment.update(
+        os.environ if process_environment is None else process_environment
+    )
 
     symbols = runtime.get("symbols")
     if not isinstance(symbols, list) or not symbols:
-        raise RuntimeError(f"Live config is missing runtime.symbols: {LIVE_CONFIG_PATH}")
+        raise RuntimeError(f"Live config is missing runtime.symbols: {path}")
 
     strategy_mode = str(runtime.get("strategy_mode") or "").strip()
     if not strategy_mode:
-        raise RuntimeError(f"Live config is missing runtime.strategy_mode: {LIVE_CONFIG_PATH}")
+        raise RuntimeError(f"Live config is missing runtime.strategy_mode: {path}")
 
+    normalized_symbols: list[str] = []
+    seen_symbols: set[str] = set()
+    for raw_symbol in symbols:
+        if type(raw_symbol) is not str:
+            raise RuntimeError(f"Live config research symbols must be strings: {path}")
+        symbol = raw_symbol.strip().upper()
+        if not symbol or symbol in seen_symbols:
+            raise RuntimeError(
+                "Live config research symbols must be nonblank and unique after "
+                f"normalization: {path}"
+            )
+        seen_symbols.add(symbol)
+        normalized_symbols.append(symbol)
+    raw_timeframe = runtime.get("bar_timeframe_minutes")
+    if (
+        not normalized_symbols
+        or type(raw_timeframe) is not int
+        or raw_timeframe < 1
+    ):
+        raise RuntimeError(f"Live config research symbols/timeframe are invalid: {path}")
     return {
-        "symbols": [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()],
-        "bar_timeframe_minutes": int(runtime.get("bar_timeframe_minutes", 15) or 15),
+        "symbols": normalized_symbols,
+        "bar_timeframe_minutes": raw_timeframe,
         "strategy_mode": strategy_mode,
-        "sma_bars": int(runtime.get("sma_bars", 20) or 20),
-        "entry_threshold_pct": float(runtime.get("entry_threshold_pct", 0.002) or 0.002),
-        "mean_reversion_exit_style": str(runtime.get("mean_reversion_exit_style") or "sma"),
-        "mean_reversion_max_atr_percentile": float(
-            runtime.get("mean_reversion_max_atr_percentile", 80.0) or 80.0
+        "risk_execution_context": resolve_risk_execution_context(
+            runtime,
+            effective_environment,
         ),
     }
+
+
+@dataclass(frozen=True)
+class ResolvedResearchInputs:
+    symbols: tuple[str, ...]
+    bar_timeframe_minutes: int
+    strategy_mode: str
+    risk_execution_context: tuple[tuple[str, int | float], ...]
+    input_sha256: str
+
+    @property
+    def timeframe(self) -> str:
+        return f"{self.bar_timeframe_minutes}Min"
+
+    @property
+    def sweep_params(self) -> tuple[tuple[str, str], ...]:
+        return (("strategy-mode-list", self.strategy_mode), *SWEEP_PARAMETER_TEMPLATE)
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "symbols": list(self.symbols),
+            "bar_timeframe_minutes": self.bar_timeframe_minutes,
+            "strategy_mode": self.strategy_mode,
+            "risk_execution_context": dict(self.risk_execution_context),
+            "input_sha256": self.input_sha256,
+        }
+
+
+def _resolve_research_inputs(
+    live_config_path: Path = LIVE_CONFIG_PATH,
+) -> ResolvedResearchInputs:
+    values = _load_live_runtime_defaults(live_config_path)
+    body = {
+        "symbols": values["symbols"],
+        "bar_timeframe_minutes": values["bar_timeframe_minutes"],
+        "strategy_mode": values["strategy_mode"],
+        "risk_execution_context": values["risk_execution_context"],
+    }
+    encoded = json.dumps(
+        body,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return ResolvedResearchInputs(
+        symbols=tuple(body["symbols"]),  # type: ignore[arg-type]
+        bar_timeframe_minutes=body["bar_timeframe_minutes"],  # type: ignore[arg-type]
+        strategy_mode=body["strategy_mode"],  # type: ignore[arg-type]
+        risk_execution_context=tuple(
+            (field, body["risk_execution_context"][field])  # type: ignore[index]
+            for field in RISK_EXECUTION_CONTEXT_FIELDS
+        ),
+        input_sha256=hashlib.sha256(encoded).hexdigest(),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,11 +270,6 @@ def parse_args() -> argparse.Namespace:
 # SNAPSHOT CONFIG
 # ---------------------------------------------------------------------------
 
-LIVE_RESEARCH_DEFAULTS = _load_live_runtime_defaults()
-
-SNAPSHOT_SYMBOLS   = LIVE_RESEARCH_DEFAULTS["symbols"]
-SNAPSHOT_TIMEFRAME = f"{LIVE_RESEARCH_DEFAULTS['bar_timeframe_minutes']}Min"
-
 # Lookback windows (in calendar days) run in order, shortest first.
 # The longest window is treated as the primary result for approval and
 # best_config_latest.json.  Add or remove entries freely.
@@ -126,8 +284,7 @@ SNAPSHOT_ALIGN_MODE    = "shared"     # choices: shared | none
 # Add or remove entries here — nothing else needs to change.
 # ---------------------------------------------------------------------------
 
-SWEEP_PARAMS: list[tuple[str, str]] = [
-    ("strategy-mode-list",        LIVE_RESEARCH_DEFAULTS["strategy_mode"]),
+SWEEP_PARAMETER_TEMPLATE: tuple[tuple[str, str], ...] = (
     # Broader SMA range to find a tighter or looser mean.
     ("sma-bars-list",             "10,15,20,25,30"),
     # Tighter entries (0.001) and slightly wider (0.003) added to the search space.
@@ -139,7 +296,7 @@ SWEEP_PARAMS: list[tuple[str, str]] = [
     # Sweep ATR percentile filter — lower values only trade lower-vol pullbacks,
     # which tend to revert more cleanly.  80 (previous default) is included.
     ("mean-reversion-max-atr-percentile-list", "40,50,60,70,80"),
-]
+)
 
 # Fixed (non-sweep) backtest parameters.
 FIXED_PARAMS: list[tuple[str, str]] = [
@@ -166,16 +323,10 @@ APPROVAL_MIN_TRADES_PER_DAY   = 0.5   # trades_per_day must be >= this
 STABILITY_MIN_PROFIT_FACTOR = 1.1    # profit_factor must be >= this in all windows
 STABILITY_MAX_DRAWDOWN_PCT  = 10.0   # max_drawdown_pct must be <= this in all windows
 
-# Parameters that must match across all windows for the config to be stable.
-# ── VERIFY THESE match CONFIG_COLS ────────────────────────────────────────
-STABILITY_PARAMS = [
-    "strategy_mode",
-    "sma_bars",
-    "entry_threshold_pct",
-    "time_window_mode",
-    "mean_reversion_exit_style",
-    "mean_reversion_max_atr_percentile",
-]
+# Compatibility projection only.  Stability and promotion use the exact
+# canonical strategy envelope/hash emitted by backtest_runner.py, never a
+# hand-picked parameter subset.
+STABILITY_PARAMS = list(PROMOTED_STRATEGY_FIELDS)
 
 # ---------------------------------------------------------------------------
 # REGIME CONFIG
@@ -190,10 +341,11 @@ REGIME_VOL_PERIOD         = 20      # bars in the rolling volatility window
 REGIME_TREND_SMA_PERIOD   = 50      # bars in the trend SMA
 REGIME_VOL_HIGH_THRESHOLD = 0.003   # rolling std > this  → high_volatility
 REGIME_SLOPE_THRESHOLD    = 0.02    # |SMA % change over SMA period| > this → trending
+REGIME_MAX_DATA_AGE_HOURS = 96.0    # accommodates weekends; older bars fail closed
 
 # Regimes listed here disable trading regardless of approval / stability.
 # Remove "high_volatility" or add "sideways" to adjust behaviour.
-REGIME_DISABLE_ON: set[str] = {"high_volatility"}
+REGIME_DISABLE_ON: set[str] = {"high_volatility", "stale", "unknown"}
 
 
 # ---------------------------------------------------------------------------
@@ -223,23 +375,18 @@ def _ensure_dir(path: Path) -> Path:
     return path
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _timestamped_csv(results_dir: Path, prefix: str) -> Path:
-    """Return results/<prefix>_YYYYMMDD_HHMMSS.csv (directory is created here)."""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return _ensure_dir(results_dir) / f"{prefix}_{stamp}.csv"
-
-
-def _newest_dataset(datasets_dir: Path) -> Path:
-    """Return the most-recently-modified subdirectory of datasets_dir."""
-    if not datasets_dir.is_dir():
-        raise RuntimeError(f"Datasets directory not found: '{datasets_dir}'")
-    candidates = [p for p in datasets_dir.iterdir() if p.is_dir()]
-    if not candidates:
-        raise RuntimeError(
-            f"No dataset folders found in '{datasets_dir}'. "
-            "Make sure the snapshot step completed successfully."
-        )
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    """Return a collision-resistant research CSV path."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    return _ensure_dir(results_dir) / f"{prefix}_{stamp}_{uuid4().hex[:8]}.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +410,7 @@ def _run(cmd: list[str], *, label: str) -> None:
     _log(f"Command: {' '.join(cmd)}")
     print()
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, cwd=SCRIPT_DIR)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"Step '{label}' failed (exit code {exc.returncode}).\n"
@@ -277,43 +424,108 @@ def _run(cmd: list[str], *, label: str) -> None:
 # Date utilities
 # ---------------------------------------------------------------------------
 
-def _snapshot_date_range(lookback_days: int) -> tuple[str, str]:
+def _resolve_research_anchor_utc(
+    now_utc: datetime | None = None,
+) -> str:
+    anchor = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return anchor.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _canonical_utc_text(value: object, *, field: str) -> str:
+    if type(value) is not str or not value:
+        raise ResearchBundleValidationError(f"{field} is missing or invalid.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ResearchBundleValidationError(f"{field} is not a valid timestamp.") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ResearchBundleValidationError(f"{field} must resolve to UTC.")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _snapshot_date_range(
+    lookback_days: int,
+    *,
+    research_anchor_utc: str,
+) -> tuple[str, str]:
     """
     Return (start, end) as UTC timestamp strings accepted by dataset_snapshotter.py.
     end  = today at UTC midnight
     start = end − lookback_days
     """
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    end   = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        end = datetime.fromisoformat(research_anchor_utc.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ResearchBundleValidationError("Research UTC anchor is invalid.") from exc
+    if end.tzinfo is None or end.utcoffset() != timedelta(0):
+        raise ResearchBundleValidationError("Research UTC anchor must be timezone-aware UTC.")
     start = end - timedelta(days=lookback_days)
     return start.strftime(fmt), end.strftime(fmt)
+
+
+def _fresh_window_ranges(research_anchor_utc: str) -> list[dict[str, object]]:
+    return [
+        {
+            "lookback_days": days,
+            "start_utc": _snapshot_date_range(
+                days,
+                research_anchor_utc=research_anchor_utc,
+            )[0],
+            "end_utc": research_anchor_utc,
+        }
+        for days in VALIDATION_WINDOWS
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Pipeline steps
 # ---------------------------------------------------------------------------
 
-def step_snapshot(lookback_days: int) -> Path:
+def step_snapshot(
+    lookback_days: int,
+    *,
+    resolved_inputs: ResolvedResearchInputs | None = None,
+    research_anchor_utc: str | None = None,
+) -> Path:
     """
     Fetch a dataset for the given lookback window via dataset_snapshotter.py.
     Returns the Path of the newly created dataset directory.
-    Uses set-difference (before vs. after) to identify the new folder reliably
-    even when multiple snapshots run back-to-back.
+    Computes and verifies the exact content-addressed dataset target.  It never
+    selects by directory mtime or an unrelated concurrent snapshot.
     """
-    # Record what already exists so we can identify the new folder afterwards.
-    existing: set[Path] = (
-        {p for p in DATASETS_DIR.iterdir() if p.is_dir()}
-        if DATASETS_DIR.is_dir() else set()
+    inputs = resolved_inputs or _resolve_research_inputs()
+    anchor = research_anchor_utc or _resolve_research_anchor_utc()
+    start_str, end_str = _snapshot_date_range(
+        lookback_days,
+        research_anchor_utc=anchor,
     )
+    start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+    end = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+    from dataset_snapshotter import build_dataset_id, compute_code_hash
 
-    start_str, end_str = _snapshot_date_range(lookback_days)
+    code_hash = compute_code_hash(SCRIPT_DIR)
+    expected_dataset_id = build_dataset_id(
+        list(inputs.symbols),
+        inputs.timeframe,
+        start,
+        end,
+        SNAPSHOT_FEED.lower(),
+        code_hash,
+    )
+    expected_dataset = DATASETS_DIR / expected_dataset_id
 
     cmd = [
         sys.executable, str(SCRIPT_DIR / "dataset_snapshotter.py"),
-        "--symbols",    *SNAPSHOT_SYMBOLS,
+        "--symbols",    *inputs.symbols,
         "--start",      start_str,
         "--end",        end_str,
-        "--timeframe",  SNAPSHOT_TIMEFRAME,
+        "--timeframe",  inputs.timeframe,
         "--feed",       SNAPSHOT_FEED,
         "--adjustment", SNAPSHOT_ADJUSTMENT,
         "--align-mode", SNAPSHOT_ALIGN_MODE,
@@ -321,28 +533,54 @@ def step_snapshot(lookback_days: int) -> Path:
     ]
 
     _run(cmd, label=f"Dataset snapshot ({lookback_days}d)")
+    if not expected_dataset.is_dir():
+        raise RuntimeError(
+            "Snapshotter did not create/reuse the deterministic requested dataset: "
+            f"{expected_dataset}"
+        )
+    manifest = load_verified_manifest(expected_dataset)
+    expected_symbols = list(inputs.symbols)
+    try:
+        manifest_start = datetime.fromisoformat(
+            str(manifest["start_utc"]).replace("Z", "+00:00")
+        )
+        manifest_end = datetime.fromisoformat(
+            str(manifest["end_utc"]).replace("Z", "+00:00")
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Snapshot manifest start/end evidence is invalid.") from exc
+    if (
+        manifest.get("dataset_id") != expected_dataset_id
+        or manifest_start != start
+        or manifest_end != end
+        or manifest.get("symbols") != expected_symbols
+        or manifest.get("timeframe") != inputs.timeframe
+        or manifest.get("feed") != SNAPSHOT_FEED.lower()
+        or manifest.get("adjustment") != SNAPSHOT_ADJUSTMENT.lower()
+        or manifest.get("align_mode") != SNAPSHOT_ALIGN_MODE
+        or manifest.get("code_hash") != code_hash
+    ):
+        raise RuntimeError(
+            "Snapshot manifest contradicts the exact requested research window/configuration."
+        )
+    return expected_dataset
 
-    # Identify the newly created dataset folder.
-    current = {p for p in DATASETS_DIR.iterdir() if p.is_dir()}
-    new_dirs = current - existing
-    if len(new_dirs) == 1:
-        return new_dirs.pop()
-    if len(new_dirs) > 1:
-        # More than one new folder — pick the newest by mtime.
-        return max(new_dirs, key=lambda p: p.stat().st_mtime)
-    # Fallback: snapshotter re-used an existing folder (same date range + hash).
-    return _newest_dataset(DATASETS_DIR)
 
-
-def step_backtest(output_csv: Path, dataset_path: Path) -> None:
+def step_backtest(
+    output_csv: Path,
+    dataset_path: Path,
+    *,
+    resolved_inputs: ResolvedResearchInputs | None = None,
+) -> None:
     """Run the parameter sweep backtest against dataset_path."""
     _log(f"Using dataset: {dataset_path.name}")
 
+    inputs = resolved_inputs or _resolve_research_inputs()
     cmd = [
         sys.executable, str(SCRIPT_DIR / "backtest_runner.py"),
         "--dataset",    str(dataset_path),
         "--output-csv", str(output_csv),
-        *_params_to_flags(SWEEP_PARAMS),
+        *_params_to_flags(list(inputs.sweep_params)),
         *_params_to_flags(FIXED_PARAMS),
     ]
 
@@ -360,28 +598,9 @@ COL_PF             = "profit_factor"      # higher is better
 COL_DRAWDOWN       = "max_drawdown_pct"   # lower  is better
 COL_TRADES_PER_DAY = "trades_per_day"     # higher is better
 
-# Config columns saved to best_config_latest.json and shown in the top-5 table.
-# ── VERIFY THESE match the CSV header ─────────────────────────────────────
-CONFIG_COLS = [
-    "strategy_mode",
-    "sma_bars",
-    "entry_threshold_pct",
-    "ml_probability_buy",
-    "ml_probability_sell",
-    "threshold_mode",
-    "atr_multiple",
-    "atr_percentile_threshold",
-    "time_window_mode",
-    "regime_filter_enabled",
-    "orb_filter_mode",
-    "breakout_exit_style",
-    "breakout_tight_stop_fraction",
-    "mean_reversion_exit_style",
-    "mean_reversion_max_atr_percentile",
-    "mean_reversion_trend_filter",
-    "mean_reversion_trend_slope_filter",
-    "mean_reversion_stop_pct",
-]
+# Kept for compatibility with reporting code, but derived from the explicit
+# versioned contract.  It is not an evidence boundary.
+CONFIG_COLS = list(PROMOTED_STRATEGY_FIELDS)
 
 METRIC_COLS = [
     COL_RETURN,
@@ -416,10 +635,27 @@ def step_rank_results(sweep_csv: Path, leaderboard_csv: Path) -> dict:
 
     combined_score = mean of the three per-metric ranks (lower is better).
     """
-    df = pd.read_csv(sweep_csv)
+    try:
+        sweep_bytes = sweep_csv.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"Sweep CSV is unreadable: {sweep_csv}") from exc
+    df = pd.read_csv(io.BytesIO(sweep_bytes))
+    df.insert(0, "source_row_index", range(len(df)))
 
     # Validate that expected columns exist before proceeding.
-    missing = [c for c in (COL_RETURN, COL_PF, COL_DRAWDOWN) if c not in df.columns]
+    missing = [
+        c
+        for c in (
+            COL_RETURN,
+            COL_PF,
+            COL_DRAWDOWN,
+            "canonical_strategy_json",
+            "canonical_strategy_sha256",
+            "model_execution_evidence_json",
+            "model_execution_evidence_sha256",
+        )
+        if c not in df.columns
+    ]
     if missing:
         raise RuntimeError(
             f"Ranking columns not found in {sweep_csv.name}: {missing}\n"
@@ -435,7 +671,17 @@ def step_rank_results(sweep_csv: Path, leaderboard_csv: Path) -> dict:
         df["rank_return"] + df["rank_pf"] + df["rank_drawdown"]
     ) / 3.0
 
-    df_sorted = df.sort_values("combined_score").reset_index(drop=True)
+    # Ranking ties are deterministic and explicitly bound by research_config.
+    df_sorted = df.sort_values(
+        [
+            "combined_score",
+            "canonical_strategy_sha256",
+            "model_execution_evidence_sha256",
+            "source_row_index",
+        ],
+        ascending=[True, True, True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
     df_sorted.to_csv(leaderboard_csv, index=False)
     _log(f"Leaderboard : {leaderboard_csv}")
 
@@ -454,67 +700,128 @@ def step_rank_results(sweep_csv: Path, leaderboard_csv: Path) -> dict:
     print(top5.to_string(index=True))
     print()
 
-    return df_sorted.iloc[0].to_dict()
+    best_row = df_sorted.iloc[0].to_dict()
+    # Promotion is impossible unless the selected row carries the exact
+    # canonical envelope and matching digest produced by the backtest.
+    canonical_strategy_from_backtest_row(best_row)
+    model_execution_evidence_from_backtest_row(best_row)
+    candidates: list[dict[str, object]] = []
+    for _, row in df.sort_values("source_row_index").iterrows():
+        row_mapping = row.to_dict()
+        candidate_contract = canonical_strategy_from_backtest_row(row_mapping)
+        candidate_model = model_execution_evidence_from_backtest_row(row_mapping)
+        candidate_metrics = _selected_metrics(row_mapping)
+        candidates.append(
+            {
+                "source_row_index": int(row_mapping["source_row_index"]),
+                "total_return_pct": candidate_metrics[COL_RETURN],
+                "profit_factor": candidate_metrics[COL_PF],
+                "max_drawdown_pct": candidate_metrics[COL_DRAWDOWN],
+                "canonical_strategy_sha256": candidate_contract.sha256,
+                "model_execution_evidence_sha256": candidate_model.sha256,
+            }
+        )
+    try:
+        leaderboard_bytes = leaderboard_csv.read_bytes()
+    except OSError as exc:
+        raise ResearchBundleValidationError(
+            "Leaderboard CSV became unreadable after ranking."
+        ) from exc
+    selection_evidence = build_backtest_selection_evidence(
+        sweep_csv_sha256=hashlib.sha256(sweep_bytes).hexdigest(),
+        leaderboard_csv_sha256=hashlib.sha256(leaderboard_bytes).hexdigest(),
+        selected_source_row_index=int(best_row["source_row_index"]),
+        candidates=candidates,
+    )
+    validate_backtest_selection_artifacts(
+        selection_evidence,
+        sweep_csv_bytes=sweep_bytes,
+        leaderboard_csv_bytes=leaderboard_bytes,
+    )
+    best_row["research_selection_evidence"] = selection_evidence
+    return best_row
+
+
+def _approval_policy() -> ApprovalPolicy:
+    return ApprovalPolicy(
+        name=APPROVAL_POLICY_NAME,
+        version=APPROVAL_POLICY_VERSION,
+        min_profit_factor=float(APPROVAL_MIN_PROFIT_FACTOR),
+        max_drawdown_pct=float(APPROVAL_MAX_DRAWDOWN_PCT),
+        min_total_return_pct=float(APPROVAL_MIN_TOTAL_RETURN_PCT),
+        min_trades_per_day=float(APPROVAL_MIN_TRADES_PER_DAY),
+    )
+
+
+def _stability_policy() -> StabilityPolicy:
+    return StabilityPolicy(
+        name=STABILITY_POLICY_NAME,
+        version=STABILITY_POLICY_VERSION,
+        min_profit_factor=float(STABILITY_MIN_PROFIT_FACTOR),
+        max_drawdown_pct=float(STABILITY_MAX_DRAWDOWN_PCT),
+        minimum_window_count=max(2, len(VALIDATION_WINDOWS)),
+        required_lookback_days=tuple(VALIDATION_WINDOWS),
+        require_consistent_canonical_strategy=True,
+        require_consistent_model_execution=True,
+    )
+
+
+def _regime_policy() -> RegimePolicy:
+    return RegimePolicy(
+        name=REGIME_POLICY_NAME,
+        version=REGIME_POLICY_VERSION,
+        volatility_period_bars=REGIME_VOL_PERIOD,
+        trend_sma_period_bars=REGIME_TREND_SMA_PERIOD,
+        high_volatility_threshold=float(REGIME_VOL_HIGH_THRESHOLD),
+        slope_threshold=float(REGIME_SLOPE_THRESHOLD),
+        max_data_age_hours=float(REGIME_MAX_DATA_AGE_HOURS),
+        disable_on=tuple(sorted(REGIME_DISABLE_ON)),
+    )
+
+
+def _selected_metrics(best_row: Mapping[str, object]) -> dict[str, float]:
+    selected_names = tuple(
+        dict.fromkeys(
+            (
+                *METRIC_COLS,
+                "total_trades",
+                "expectancy",
+                "avg_return_per_trade_pct",
+            )
+        )
+    )
+    return normalize_metrics(
+        {name: best_row[name] for name in selected_names if name in best_row}
+    )
 
 
 def step_approve_config(best_row: dict) -> tuple[bool, list[str]]:
-    """
-    Evaluate the best-ranked config against the approval thresholds defined
-    at the top of this file.
+    """Evaluate one selected row through the versioned approval policy."""
 
-    Each check is: (display_label, actual_value, threshold, passed, description).
-    Returns (approved, rejection_reasons) where rejection_reasons is empty when approved.
-    """
-    approval_cols = [COL_PF, COL_DRAWDOWN, COL_RETURN, COL_TRADES_PER_DAY]
-    missing = [c for c in approval_cols if c not in best_row]
-    if missing:
-        raise RuntimeError(
-            f"Cannot evaluate approval — columns missing from best row: {missing}"
-        )
+    metrics = _selected_metrics(best_row)
+    policy = _approval_policy()
+    outcome = evaluate_approval_policy(metrics, policy)
+    approved = outcome.approved
+    rejection_reasons = list(outcome.rejection_reasons)
 
-    # Each tuple: (label, actual, threshold, passed, human-readable condition)
-    checks = [
-        (
-            COL_PF,
-            best_row[COL_PF],
-            APPROVAL_MIN_PROFIT_FACTOR,
-            best_row[COL_PF] >= APPROVAL_MIN_PROFIT_FACTOR,
-            f"profit_factor {best_row[COL_PF]:.4f} >= {APPROVAL_MIN_PROFIT_FACTOR}",
-        ),
-        (
-            COL_DRAWDOWN,
-            best_row[COL_DRAWDOWN],
-            APPROVAL_MAX_DRAWDOWN_PCT,
-            best_row[COL_DRAWDOWN] <= APPROVAL_MAX_DRAWDOWN_PCT,
-            f"max_drawdown_pct {best_row[COL_DRAWDOWN]:.4f}% <= {APPROVAL_MAX_DRAWDOWN_PCT}%",
-        ),
-        (
-            COL_RETURN,
-            best_row[COL_RETURN],
-            APPROVAL_MIN_TOTAL_RETURN_PCT,
-            best_row[COL_RETURN] >= APPROVAL_MIN_TOTAL_RETURN_PCT,
-            f"total_return_pct {best_row[COL_RETURN]:.4f}% >= {APPROVAL_MIN_TOTAL_RETURN_PCT}%",
-        ),
-        (
-            COL_TRADES_PER_DAY,
-            best_row[COL_TRADES_PER_DAY],
-            APPROVAL_MIN_TRADES_PER_DAY,
-            best_row[COL_TRADES_PER_DAY] >= APPROVAL_MIN_TRADES_PER_DAY,
-            f"trades_per_day {best_row[COL_TRADES_PER_DAY]:.4f} >= {APPROVAL_MIN_TRADES_PER_DAY}",
-        ),
-    ]
-
-    rejection_reasons = [desc for _, _, _, passed, desc in checks if not passed]
-    approved = len(rejection_reasons) == 0
-
-    # Console summary
     verdict = "APPROVED" if approved else "REJECTED"
     print()
     print(f"  Approval verdict: {verdict}")
     print("  " + "-" * 55)
-    for _, _, _, passed, desc in checks:
-        status = "PASS" if passed else "FAIL"
-        print(f"  [{status}] {desc}")
+    checks = (
+        metrics[COL_PF] >= policy.min_profit_factor,
+        metrics[COL_DRAWDOWN] <= policy.max_drawdown_pct,
+        metrics[COL_RETURN] >= policy.min_total_return_pct,
+        metrics[COL_TRADES_PER_DAY] >= policy.min_trades_per_day,
+    )
+    descriptions = (
+        f"profit_factor {metrics[COL_PF]:.4f} >= {policy.min_profit_factor}",
+        f"max_drawdown_pct {metrics[COL_DRAWDOWN]:.4f}% <= {policy.max_drawdown_pct}%",
+        f"total_return_pct {metrics[COL_RETURN]:.4f}% >= {policy.min_total_return_pct}%",
+        f"trades_per_day {metrics[COL_TRADES_PER_DAY]:.4f} >= {policy.min_trades_per_day}",
+    )
+    for passed, description in zip(checks, descriptions, strict=True):
+        print(f"  [{'PASS' if passed else 'FAIL'}] {description}")
     print()
 
     return approved, rejection_reasons
@@ -527,37 +834,13 @@ def step_save_best_config(
     approved: bool,
     rejection_reasons: list[str],
 ) -> None:
-    """
-    Extract config and performance fields from best_row and write a
-    human-readable JSON file to output_path.
-    """
-    # Check that all expected columns are present before building the dict.
-    all_expected = CONFIG_COLS + [c for c in METRIC_COLS if c != "combined_score"]
-    missing = [c for c in all_expected if c not in best_row]
-    if missing:
-        raise RuntimeError(
-            f"Cannot save best config — columns missing from leaderboard row: {missing}"
-        )
+    """Deprecated unsafe writer; promotion must commit through the pointer workflow."""
 
-    config = {col: best_row[col] for col in CONFIG_COLS}
-    performance = {
-        col: round(best_row[col], 6)
-        for col in METRIC_COLS
-        if col in best_row
-    }
-
-    payload = {
-        "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "dataset": str(dataset_path),
-        "approved": approved,
-        "rejection_reasons": rejection_reasons,
-        "config": config,
-        "performance": performance,
-    }
-
-    _ensure_dir(output_path.parent)
-    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    _log(f"Best config : {output_path}")
+    del best_row, dataset_path, output_path, approved, rejection_reasons
+    raise ResearchPublicationError(
+        "Direct best-config writes are forbidden; finalize a validated bundle and "
+        "commit its generation pointer."
+    )
 
 
 def _load_dataset_manifest_and_bars(dataset_path: Path) -> tuple[dict, pd.DataFrame]:
@@ -645,79 +928,12 @@ def step_write_live_config(
     approved: bool,
     rejection_reasons: list[str],
 ) -> None:
-    symbols, symbol_source, manifest = _resolve_dataset_symbols(dataset_path)
-    timeframe_text = str(manifest.get("timeframe") or "").strip()
-    if not timeframe_text:
-        raise RuntimeError(f"Dataset manifest is missing timeframe: {dataset_path / 'manifest.json'}")
+    """Deprecated unsafe writer; promotion must commit through the pointer workflow."""
 
-    required = [
-        "strategy_mode",
-        "threshold_mode",
-        "time_window_mode",
-        "regime_filter_enabled",
-        "orb_filter_mode",
-        "breakout_exit_style",
-        "breakout_tight_stop_fraction",
-        "mean_reversion_exit_style",
-        "mean_reversion_max_atr_percentile",
-        "mean_reversion_trend_filter",
-        "mean_reversion_trend_slope_filter",
-        "mean_reversion_stop_pct",
-        "atr_multiple",
-        "atr_percentile_threshold",
-        "ml_probability_buy",
-        "ml_probability_sell",
-    ]
-    missing = [key for key in required if key not in best_row]
-    if missing:
-        raise RuntimeError(f"Cannot write live config; best result is missing fields: {missing}")
-
-    runtime = {
-        "symbols": symbols,
-        "bar_timeframe_minutes": _parse_timeframe_to_minutes(timeframe_text),
-        "strategy_mode": best_row["strategy_mode"],
-        "sma_bars": int(best_row["sma_bars"]) if pd.notna(best_row.get("sma_bars")) else None,
-        "entry_threshold_pct": (
-            float(best_row["entry_threshold_pct"])
-            if pd.notna(best_row.get("entry_threshold_pct"))
-            else None
-        ),
-        "ml_probability_buy": float(best_row["ml_probability_buy"]),
-        "ml_probability_sell": float(best_row["ml_probability_sell"]),
-        "threshold_mode": best_row["threshold_mode"],
-        "atr_multiple": float(best_row["atr_multiple"]),
-        "atr_percentile_threshold": float(best_row["atr_percentile_threshold"]),
-        "time_window_mode": best_row["time_window_mode"],
-        "regime_filter_enabled": _coerce_boolish(best_row["regime_filter_enabled"], "regime_filter_enabled"),
-        "orb_filter_mode": best_row["orb_filter_mode"],
-        "breakout_exit_style": best_row["breakout_exit_style"],
-        "breakout_tight_stop_fraction": float(best_row["breakout_tight_stop_fraction"]),
-        "mean_reversion_exit_style": best_row["mean_reversion_exit_style"],
-        "mean_reversion_max_atr_percentile": float(best_row["mean_reversion_max_atr_percentile"]),
-        "mean_reversion_trend_filter": _coerce_boolish(best_row["mean_reversion_trend_filter"], "mean_reversion_trend_filter"),
-        "mean_reversion_trend_slope_filter": _coerce_boolish(
-            best_row["mean_reversion_trend_slope_filter"],
-            "mean_reversion_trend_slope_filter",
-        ),
-        "mean_reversion_stop_pct": float(best_row["mean_reversion_stop_pct"]),
-    }
-
-    payload = {
-        "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source": {
-            "dataset": str(dataset_path),
-            "dataset_symbol_source": symbol_source,
-            "approved": approved,
-            "rejection_reasons": rejection_reasons,
-        },
-        "runtime": runtime,
-    }
-
-    _ensure_dir(output_path.parent)
-    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    _log(
-        f"Live config  : {output_path} "
-        f"(symbols from {symbol_source}: {', '.join(symbols)})"
+    del best_row, dataset_path, output_path, approved, rejection_reasons
+    raise ResearchPublicationError(
+        "Direct live-config writes are forbidden; finalize a validated bundle and "
+        "commit its generation pointer."
     )
 
 
@@ -757,8 +973,10 @@ def _classify_regime_for_symbol(closes: pd.Series) -> dict:
 
     return {
         "regime":             regime,
-        "current_volatility": round(float(current_vol), 6) if not pd.isna(current_vol) else None,
-        "sma_slope_pct":      round(slope_pct, 6),
+        # Retain exact finite signals so bundle-side policy recomputation cannot
+        # flip a near-threshold label due to display rounding.
+        "current_volatility": float(current_vol) if not pd.isna(current_vol) else None,
+        "sma_slope_pct":      float(slope_pct),
     }
 
 
@@ -777,6 +995,13 @@ def step_detect_regime(dataset_path: Path) -> dict:
     missing  = required - set(df.columns)
     if missing:
         raise RuntimeError(f"Regime detection requires columns {missing} — not in dataset")
+    parsed_timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    latest_timestamp = parsed_timestamps.max()
+    if pd.isna(latest_timestamp):
+        raise RuntimeError("Regime detection found no valid bar timestamps")
+    latest_bar_utc = latest_timestamp.to_pydatetime().astimezone(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
     per_symbol: dict[str, dict] = {}
     for symbol, grp in df.groupby("symbol"):
@@ -800,7 +1025,14 @@ def step_detect_regime(dataset_path: Path) -> dict:
     valid_vols  = [r["current_volatility"] for r in per_symbol.values() if r["current_volatility"] is not None]
     avg_vol     = round(sum(valid_vols) / len(valid_vols), 6) if valid_vols else None
     avg_slope   = round(sum(r["sma_slope_pct"] for r in per_symbol.values()) / len(per_symbol), 6)
-    disabled    = overall in REGIME_DISABLE_ON
+    policy = _regime_policy()
+    latest_bar_time = datetime.fromisoformat(latest_bar_utc.replace("Z", "+00:00"))
+    data_age_hours = (
+        datetime.now(timezone.utc) - latest_bar_time
+    ).total_seconds() / 3600.0
+    if data_age_hours < 0 or data_age_hours > policy.max_data_age_hours:
+        overall = "stale"
+    disabled = overall in policy.disable_on
 
     # --- console summary ---------------------------------------------------
     print()
@@ -816,8 +1048,10 @@ def step_detect_regime(dataset_path: Path) -> dict:
     print()
 
     return {
+        "policy":            policy.to_payload(),
         "regime":            overall,
         "disabled_by_regime": disabled,
+        "latest_bar_utc":    latest_bar_utc,
         "avg_volatility":    avg_vol,
         "avg_sma_slope_pct": avg_slope,
         "per_symbol":        per_symbol,
@@ -829,100 +1063,77 @@ def step_detect_regime(dataset_path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def step_evaluate_stability(window_results: list[dict]) -> dict:
-    """
-    Compare best configs across all validation windows and return a stability
-    summary dict.
+    """Recompute stability from policy-bound strategy/model/dataset evidence."""
 
-    A config is STABLE when:
-      - profit_factor >= STABILITY_MIN_PROFIT_FACTOR in every window
-      - max_drawdown_pct <= STABILITY_MAX_DRAWDOWN_PCT in every window
-      - all STABILITY_PARAMS are identical across every window
-    """
-    best_rows = [w["best_row"] for w in window_results]
+    if not window_results:
+        raise ResearchBundleValidationError("Stability requires at least one window.")
+    resolved_windows: list[
+        tuple[
+            dict,
+            BacktestCanonicalStrategy,
+            BacktestModelExecutionEvidence,
+            dict[str, float],
+        ]
+    ] = []
+    evidence_windows: list[dict[str, object]] = []
+    for window in window_results:
+        row = window.get("best_row")
+        if not isinstance(row, Mapping):
+            raise ResearchBundleValidationError("Stability window is missing its best row.")
+        canonical = canonical_strategy_from_backtest_row(row)
+        model_evidence = model_execution_evidence_from_backtest_row(row)
+        metrics = _selected_metrics(row)
+        provenance = window.get("dataset_provenance")
+        selection_evidence = row.get("research_selection_evidence")
+        if not isinstance(provenance, Mapping):
+            raise ResearchBundleValidationError(
+                "Stability window is missing captured dataset provenance."
+            )
+        if not isinstance(selection_evidence, Mapping):
+            raise ResearchBundleValidationError(
+                "Stability window is missing deterministic selection evidence."
+            )
+        provenance_sha = provenance.get("provenance_sha256")
+        evidence_windows.append(
+            {
+                "lookback_days": window["lookback_days"],
+                "canonical_strategy_sha256": canonical.sha256,
+                "dataset_provenance_sha256": provenance_sha,
+                "model_execution_evidence_json": model_evidence.canonical_json,
+                "model_execution_evidence_sha256": model_evidence.sha256,
+                "selection_evidence": selection_evidence,
+                "metrics": metrics,
+            }
+        )
+        resolved_windows.append(
+            (window, canonical, model_evidence, metrics)
+        )
 
-    # --- metric checks (must hold in every window) -------------------------
-    pf_failures = [
-        f"{w['lookback_days']}d window: profit_factor {w['best_row'][COL_PF]:.4f}"
-        f" < {STABILITY_MIN_PROFIT_FACTOR}"
-        for w in window_results
-        if w["best_row"].get(COL_PF, 0) < STABILITY_MIN_PROFIT_FACTOR
-    ]
-
-    dd_failures = [
-        f"{w['lookback_days']}d window: max_drawdown_pct {w['best_row'][COL_DRAWDOWN]:.4f}%"
-        f" > {STABILITY_MAX_DRAWDOWN_PCT}%"
-        for w in window_results
-        if w["best_row"].get(COL_DRAWDOWN, 999) > STABILITY_MAX_DRAWDOWN_PCT
-    ]
-
-    # --- parameter consistency check ---------------------------------------
-    # For each stability param, collect the value seen in each window.
-    param_values: dict[str, list] = {}
-    for param in STABILITY_PARAMS:
-        vals = [row.get(param) for row in best_rows]
-        if any(v is not None for v in vals):
-            param_values[param] = vals
-
-    # A parameter is inconsistent if it takes more than one distinct value.
-    inconsistent_params: dict[str, list] = {
-        param: vals
-        for param, vals in param_values.items()
-        if len({str(v) for v in vals}) > 1
-    }
-    param_failures = [
-        f"Inconsistent {param}: {vals}"
-        for param, vals in inconsistent_params.items()
-    ]
-
-    all_reasons  = pf_failures + dd_failures + param_failures
-    stable       = len(all_reasons) == 0
-    params_consistent = len(inconsistent_params) == 0
-
-    # --- average metrics across windows ------------------------------------
-    avg_metric_keys = [
-        COL_RETURN, COL_PF, COL_DRAWDOWN,
-        "sharpe_ratio", "win_rate", "trades_per_day", "realized_pnl",
-    ]
-    average_metrics: dict[str, float] = {}
-    for key in avg_metric_keys:
-        vals = [row[key] for row in best_rows if key in row]
-        if vals:
-            average_metrics[key] = round(sum(vals) / len(vals), 6)
+    stability = evaluate_stability_policy(evidence_windows, _stability_policy())
 
     # --- console summary ---------------------------------------------------
-    verdict = "STABLE" if stable else "UNSTABLE"
+    verdict = "STABLE" if stability["stable"] else "UNSTABLE"
     print()
     print(f"  Stability verdict: {verdict}")
     print("  " + "-" * 55)
-    for w in window_results:
-        row = w["best_row"]
-        pf  = row.get(COL_PF, float("nan"))
-        dd  = row.get(COL_DRAWDOWN, float("nan"))
-        ret = row.get(COL_RETURN, float("nan"))
-        sm  = row.get("strategy_mode", "?")
-        sma = row.get("sma_bars", "?")
-        thr = row.get("entry_threshold_pct", "?")
+    for window, canonical, _model_evidence, metrics in resolved_windows:
+        values = canonical.contract.promoted_values
         print(
-            f"  {w['lookback_days']:>3}d  strategy={sm} sma={sma} thresh={thr}"
-            f"  pf={pf:.4f}  dd={dd:.4f}%  ret={ret:.4f}%"
+            f"  {window['lookback_days']:>3}d  strategy={values['strategy_mode']} "
+            f"sma={values['sma_bars']} thresh={values['entry_threshold_pct']}"
+            f"  pf={metrics[COL_PF]:.4f}  dd={metrics[COL_DRAWDOWN]:.4f}% "
+            f"ret={metrics[COL_RETURN]:.4f}%"
         )
-    if all_reasons:
+    if stability["reasons"]:
         print()
-        for reason in all_reasons:
+        for reason in stability["reasons"]:
             print(f"  [FAIL] {reason}")
     else:
         print()
         print("  [PASS] All windows meet metric thresholds")
-        print(f"  [{'PASS' if params_consistent else 'FAIL'}] Parameters consistent across windows")
+        print("  [PASS] Canonical strategy and model execution are consistent")
     print()
-
-    return {
-        "stable": stable,
-        "reasons": all_reasons,
-        "params_consistent": params_consistent,
-        "inconsistent_params": {k: [str(v) for v in vs] for k, vs in inconsistent_params.items()},
-        "average_metrics": average_metrics,
-    }
+    return stability
 
 
 def step_save_stability_report(
@@ -1014,22 +1225,15 @@ def step_make_trade_decision(
             print(f"    [regime]     '{regime['regime']}' is in REGIME_DISABLE_ON")
     print()
 
-    perf_keys = [COL_RETURN, COL_PF, COL_DRAWDOWN, "sharpe_ratio", "trades_per_day"]
-    performance = {k: round(best_row[k], 6) for k in perf_keys if k in best_row}
+    canonical = canonical_strategy_from_backtest_row(best_row)
 
     return {
-        "timestamp":           datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "should_trade":        should_trade,
         "approved":            approved,
         "stable":              stable,
         "disabled_by_regime":  disabled_by_regime,
-        "rejection_reasons":   rejection_reasons,
-        "stability_reasons":   stability_reasons,
         "market_regime":       regime["regime"],
-        "regime_avg_vol":      regime["avg_volatility"],
-        "regime_avg_slope_pct": regime["avg_sma_slope_pct"],
-        "selected_config":     {col: best_row[col] for col in CONFIG_COLS if col in best_row},
-        "performance":         performance,
+        "canonical_strategy_sha256": canonical.sha256,
     }
 
 
@@ -1046,7 +1250,7 @@ def _safe_metric(row: dict, key: str) -> float | None:
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -1154,6 +1358,724 @@ def step_save_drift_profile(
     _log(f"Drift profile   : {output_path}")
 
 
+@dataclass(frozen=True)
+class ResearchPublicationTargets:
+    repo_root: Path
+    bundle_directory: Path
+    generation_directory: Path
+    pointer_path: Path
+    latest_state_path: Path
+    best_config_path: Path
+    stability_report_path: Path
+    trade_decision_path: Path
+    drift_profile_path: Path
+    live_config_path: Path
+
+
+@dataclass(frozen=True)
+class ResearchPublicationResult:
+    bundle_path: Path
+    bundle_sha256: str
+    research_generation_sha256: str
+    published: bool
+    pointer_path: Path | None
+    latest_state_path: Path
+
+
+def _default_publication_targets() -> ResearchPublicationTargets:
+    return ResearchPublicationTargets(
+        repo_root=SCRIPT_DIR,
+        bundle_directory=PROMOTION_BUNDLE_DIR,
+        generation_directory=PROMOTION_GENERATION_DIR,
+        pointer_path=PROMOTION_POINTER_PATH,
+        latest_state_path=LATEST_RESEARCH_STATE_PATH,
+        best_config_path=BEST_CONFIG_PATH,
+        stability_report_path=STABILITY_REPORT_PATH,
+        trade_decision_path=TRADE_DECISION_PATH,
+        drift_profile_path=DRIFT_PROFILE_PATH,
+        live_config_path=LIVE_CONFIG_PATH,
+    )
+
+
+def _repo_relative(path: Path, repo_root: Path) -> str:
+    root = Path(repo_root).resolve(strict=True)
+    candidate = Path(path).resolve(strict=False)
+    try:
+        return candidate.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ResearchPublicationError(
+            f"Publication target escapes the repository root: {candidate}"
+        ) from exc
+
+
+def _research_config_inputs(
+    args: argparse.Namespace,
+    *,
+    resolved_inputs: ResolvedResearchInputs | None = None,
+    research_anchor_utc: str | None = None,
+    window_ranges: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    inputs = resolved_inputs or _resolve_research_inputs()
+    anchor = research_anchor_utc or _resolve_research_anchor_utc()
+    if args.dataset:
+        existing_path = Path(args.dataset)
+        if not existing_path.is_absolute():
+            existing_path = SCRIPT_DIR / existing_path
+        existing_reference = _repo_relative(existing_path, SCRIPT_DIR)
+        if window_ranges is None:
+            manifest = load_verified_manifest(existing_path)
+            window_ranges = [
+                {
+                    "lookback_days": 0,
+                    "start_utc": _canonical_utc_text(
+                        manifest.get("start_utc", manifest.get("start")),
+                        field="existing dataset start_utc",
+                    ),
+                    "end_utc": _canonical_utc_text(
+                        manifest.get("end_utc", manifest.get("end")),
+                        field="existing dataset end_utc",
+                    ),
+                }
+            ]
+    else:
+        existing_reference = None
+        if window_ranges is None:
+            window_ranges = _fresh_window_ranges(anchor)
+    assert window_ranges is not None
+    return {
+        "dataset_request": {
+            "mode": "existing_dataset" if args.dataset else "fresh_snapshots",
+            "research_anchor_utc": anchor,
+            "validation_windows": [0] if args.dataset else list(VALIDATION_WINDOWS),
+            "window_ranges": window_ranges,
+            "existing_dataset_reference": existing_reference,
+            "snapshot": (
+                None
+                if args.dataset
+                else {
+                    "symbols": list(inputs.symbols),
+                    "timeframe": inputs.timeframe,
+                    "feed": SNAPSHOT_FEED.lower(),
+                    "adjustment": SNAPSHOT_ADJUSTMENT.lower(),
+                    "align_mode": SNAPSHOT_ALIGN_MODE,
+                }
+            ),
+        },
+        "search": {
+            "sweep_parameters": [
+                {"flag": flag, "value": value} for flag, value in inputs.sweep_params
+            ],
+            "fixed_parameters": [
+                {"flag": flag, "value": value} for flag, value in FIXED_PARAMS
+            ],
+        },
+        "ranking_policy": {
+            "name": "tradeos.mean_metric_rank",
+            "version": 1,
+            "combined_score_formula": "mean(rank_return,rank_pf,rank_drawdown)",
+            "tie_method": "min",
+            "tie_breakers": [
+                "canonical_strategy_sha256",
+                "model_execution_evidence_sha256",
+                "source_row_index",
+            ],
+            "metric_directions": {
+                "max_drawdown_pct": "ascending",
+                "profit_factor": "descending",
+                "total_return_pct": "descending",
+            },
+        },
+        "approval_policy": _approval_policy().to_payload(),
+        "stability_policy": _stability_policy().to_payload(),
+        "regime_policy": _regime_policy().to_payload(),
+        "evidence_contract": {
+            "canonical_strategy_json_column": "canonical_strategy_json",
+            "canonical_strategy_sha256_column": "canonical_strategy_sha256",
+            "model_execution_evidence_json_column": "model_execution_evidence_json",
+            "model_execution_evidence_sha256_column": "model_execution_evidence_sha256",
+        },
+        "resolved_live_inputs": inputs.to_payload(),
+    }
+
+
+def _assert_run_inputs_unchanged(
+    *,
+    repo_root: Path,
+    source_identity: Mapping[str, object],
+    window_results: list[dict],
+) -> None:
+    assert_source_identity_unchanged(
+        source_identity,
+        capture_source_identity(repo_root),
+    )
+    for window in window_results:
+        checkpoint = window.get("dataset_checkpoint")
+        provenance = window.get("dataset_provenance")
+        row = window.get("best_row")
+        if (
+            not isinstance(checkpoint, Mapping)
+            or not isinstance(provenance, Mapping)
+            or not isinstance(row, Mapping)
+        ):
+            raise ResearchBundleValidationError(
+                "Research window is missing its pre/post execution evidence."
+            )
+        selection = row.get("research_selection_evidence")
+        sweep_csv = window.get("sweep_csv")
+        leaderboard_csv = window.get("leaderboard_csv")
+        if (
+            not isinstance(selection, Mapping)
+            or not isinstance(sweep_csv, Path)
+            or not isinstance(leaderboard_csv, Path)
+        ):
+            raise ResearchBundleValidationError(
+                "Research window is missing sweep/leaderboard selection identity."
+            )
+        try:
+            sweep_bytes = sweep_csv.read_bytes()
+            leaderboard_bytes = leaderboard_csv.read_bytes()
+        except OSError as exc:
+            raise ResearchBundleValidationError(
+                "Sweep or leaderboard artifact became unreadable."
+            ) from exc
+        if (
+            selection.get("sweep_csv_sha256") != hashlib.sha256(sweep_bytes).hexdigest()
+            or selection.get("leaderboard_csv_sha256")
+            != hashlib.sha256(leaderboard_bytes).hexdigest()
+        ):
+            raise ResearchBundleValidationError(
+                "Sweep or leaderboard bytes changed after deterministic selection."
+            )
+        validate_backtest_selection_artifacts(
+            selection,
+            sweep_csv_bytes=sweep_bytes,
+            leaderboard_csv_bytes=leaderboard_bytes,
+        )
+        assert_dataset_checkpoint_unchanged(
+            checkpoint,
+            capture_dataset_checkpoint(window["dataset"]),
+        )
+        canonical = canonical_strategy_from_backtest_row(row)
+        observed_provenance = capture_dataset_provenance(
+            window["dataset"],
+            canonical.contract,
+        )
+        if observed_provenance != provenance:
+            raise ResearchBundleValidationError(
+                "Dataset provenance changed after stability evaluation."
+            )
+
+
+def _assert_resolved_live_inputs_unchanged(
+    *,
+    live_config_path: Path,
+    research_config_inputs: Mapping[str, object],
+) -> None:
+    declared = research_config_inputs.get("resolved_live_inputs")
+    observed = _resolve_research_inputs(live_config_path).to_payload()
+    if not isinstance(declared, Mapping) or dict(declared) != observed:
+        raise ResearchBundleValidationError(
+            "Resolved live research inputs changed during the locked research run."
+        )
+
+
+def finalize_research_bundle_and_publish(
+    *,
+    window_results: list[dict],
+    approved: bool,
+    rejection_reasons: list[str],
+    stability: Mapping[str, object],
+    regime: Mapping[str, object],
+    final_decision: Mapping[str, object],
+    source_identity: Mapping[str, object],
+    research_config_inputs: Mapping[str, object],
+    targets: ResearchPublicationTargets,
+    generated_at_utc: str | None = None,
+    failure_injector: Callable[[str, int, Path], None] | None = None,
+) -> ResearchPublicationResult:
+    """Finalize immutable evidence, then commit one pointer-backed generation."""
+
+    if not window_results:
+        raise ResearchBundleValidationError("Research publication has no windows.")
+    root = Path(targets.repo_root).resolve(strict=True)
+    _assert_resolved_live_inputs_unchanged(
+        live_config_path=targets.live_config_path,
+        research_config_inputs=research_config_inputs,
+    )
+    _assert_run_inputs_unchanged(
+        repo_root=root,
+        source_identity=source_identity,
+        window_results=window_results,
+    )
+    primary = window_results[-1]
+    primary_row = primary.get("best_row")
+    if not isinstance(primary_row, Mapping):
+        raise ResearchBundleValidationError("Primary research row is missing.")
+    canonical = canonical_strategy_from_backtest_row(primary_row)
+    model_evidence = model_execution_evidence_from_backtest_row(primary_row)
+    metrics = _selected_metrics(primary_row)
+    approval_policy = _approval_policy()
+    expected_approval = evaluate_approval_policy(metrics, approval_policy)
+    if (
+        type(approved) is not bool
+        or approved != expected_approval.approved
+        or tuple(rejection_reasons) != expected_approval.rejection_reasons
+    ):
+        raise ResearchBundleValidationError(
+            "Publication approval contradicts bound metrics and policy."
+        )
+    stable = stability.get("stable")
+    disabled_by_regime = regime.get("disabled_by_regime")
+    market_regime = regime.get("regime")
+    if (
+        type(stable) is not bool
+        or type(disabled_by_regime) is not bool
+        or type(market_regime) is not str
+        or not market_regime
+    ):
+        raise ResearchBundleValidationError(
+            "Publication stability or regime verdict types are invalid."
+        )
+    eligible = bool(approved and stable and not disabled_by_regime)
+    expected_final_decision = {
+        "should_trade": eligible,
+        "approved": approved,
+        "stable": stable,
+        "disabled_by_regime": disabled_by_regime,
+        "market_regime": market_regime,
+        "canonical_strategy_sha256": canonical.sha256,
+    }
+    if (
+        not isinstance(final_decision, Mapping)
+        or set(final_decision) != set(expected_final_decision)
+        or any(
+            type(final_decision[field]) is not bool
+            for field in (
+                "should_trade",
+                "approved",
+                "stable",
+                "disabled_by_regime",
+            )
+        )
+        or dict(final_decision) != expected_final_decision
+    ):
+        raise ResearchBundleValidationError(
+            "Final decision contradicts approval, stability, regime, or strategy identity."
+        )
+    dataset_set = build_dataset_provenance_set(
+        [
+            {
+                "lookback_days": window["lookback_days"],
+                "provenance": window["dataset_provenance"],
+            }
+            for window in window_results
+        ],
+        primary_window_index=len(window_results) - 1,
+    )
+    research_config = build_research_config_identity(research_config_inputs)
+    generated_at = generated_at_utc or datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    approval_payload = {
+        "policy": approval_policy.to_payload(),
+        "approved": approved,
+        "rejection_reasons": list(rejection_reasons),
+    }
+    generation_sha256 = compute_research_generation_sha256(
+        generated_at_utc=generated_at,
+        source_content_sha256=source_identity["content_sha256"],  # type: ignore[arg-type]
+        runtime_environment_sha256=source_identity["runtime_environment"][
+            "environment_sha256"
+        ],  # type: ignore[index,arg-type]
+        dataset_provenance_sha256=dataset_set["provenance_sha256"],  # type: ignore[arg-type]
+        research_config_sha256=research_config["config_sha256"],  # type: ignore[arg-type]
+        canonical_strategy_sha256=canonical.sha256,
+        model_execution_evidence_sha256=model_evidence.sha256,
+        metrics=metrics,
+        approval=approval_payload,
+        stability=stability,
+        regime=regime,
+        final_decision=final_decision,
+    )
+
+    live_original_bytes: bytes | None = None
+    live_bytes: bytes | None = None
+    if eligible:
+        try:
+            live_original_bytes = targets.live_config_path.read_bytes()
+            live_text = live_original_bytes.decode("utf-8", errors="strict")
+        except (OSError, UnicodeError) as exc:
+            raise ResearchPublicationError("Live config base is unreadable.") from exc
+        live_base = strict_json_loads(live_text, label="live config base")
+        if not isinstance(live_base, Mapping):
+            raise ResearchBundleValidationError("Live config base must be an object.")
+        live_payload = build_live_config_payload(
+            live_base,
+            canonical,
+            risk_execution_context=research_config_inputs[
+                "resolved_live_inputs"
+            ]["risk_execution_context"],  # type: ignore[index,arg-type]
+            source_updates={
+                "approved": True,
+                "rejection_reasons": [],
+                "saved_at": generated_at,
+                "dataset": _repo_relative(primary["dataset"], root),
+                "approval_policy": approval_policy.to_payload(),
+                "research_generation_sha256": generation_sha256,
+                "research_config_sha256": research_config["config_sha256"],
+                "dataset_provenance_sha256": dataset_set["provenance_sha256"],
+                "source_git_commit": source_identity["git_commit"],
+                "source_content_sha256": source_identity["content_sha256"],
+                "model_execution_evidence_sha256": model_evidence.sha256,
+            },
+        )
+        live_payload["saved_at"] = generated_at
+        live_bytes = json_file_bytes(live_payload)
+
+    live_hash = hashlib.sha256(live_bytes).hexdigest() if live_bytes is not None else None
+    bundle = build_research_bundle(
+        canonical_strategy=canonical,
+        model_execution_evidence=model_evidence,
+        metrics=metrics,
+        approval_policy=approval_policy,
+        approved=approved,
+        rejection_reasons=rejection_reasons,
+        stability=stability,
+        regime=regime,
+        final_decision=final_decision,
+        dataset_provenance=dataset_set,
+        source_identity=source_identity,
+        research_config_inputs=research_config_inputs,
+        live_config_sha256=live_hash,
+        generated_at_utc=generated_at,
+    )
+    bundle_payload = bundle.payload
+    publication = bundle_payload["publication"]
+    assert isinstance(publication, dict)
+    if publication["generation_sha256"] != generation_sha256:
+        raise ResearchBundleValidationError(
+            "Precomputed generation identity differs from the finalized bundle."
+        )
+    bundle_path = write_immutable_bundle(bundle, targets.bundle_directory)
+    bundle_relative = _repo_relative(bundle_path, root)
+    bundle_file_bytes = bundle.file_bytes()
+    bundle_file_sha256 = hashlib.sha256(bundle_file_bytes).hexdigest()
+    if not eligible:
+        latest_state = build_latest_research_state(
+            research_generation_sha256=generation_sha256,
+            bundle_path=bundle_relative,
+            bundle_sha256=bundle.sha256,
+            bundle_file_sha256=bundle_file_sha256,
+            eligible=False,
+            completed_at_utc=generated_at,
+        )
+        latest_state_bytes = latest_state.file_bytes()
+        verify_latest_research_state_bytes(
+            latest_state_bytes,
+            repo_root=root,
+        )
+        _assert_run_inputs_unchanged(
+            repo_root=root,
+            source_identity=source_identity,
+            window_results=window_results,
+        )
+        _assert_resolved_live_inputs_unchanged(
+            live_config_path=targets.live_config_path,
+            research_config_inputs=research_config_inputs,
+        )
+        publish_files_atomically(
+            {},
+            commit_pointer=(targets.latest_state_path, latest_state_bytes),
+            failure_injector=failure_injector,
+        )
+        return ResearchPublicationResult(
+            bundle_path=bundle_path,
+            bundle_sha256=bundle.sha256,
+            research_generation_sha256=generation_sha256,
+            published=False,
+            pointer_path=None,
+            latest_state_path=targets.latest_state_path,
+        )
+    assert live_bytes is not None and live_original_bytes is not None
+    bundle_identity = bundle_payload["strategy"]
+    assert isinstance(bundle_identity, dict)
+    best_payload = {
+        "schema_name": "tradeos.promoted_best_config_projection",
+        "schema_version": 1,
+        "saved_at": generated_at,
+        "research_generation_sha256": generation_sha256,
+        "bundle_path": bundle_relative,
+        "bundle_sha256": bundle.sha256,
+        "approved": approved,
+        "rejection_reasons": list(rejection_reasons),
+        "approval_policy": approval_policy.to_payload(),
+        "dataset_provenance_sha256": dataset_set["provenance_sha256"],
+        "config": {
+            "symbols": list(canonical.contract.symbols),
+            **canonical.contract.promoted_values,
+        },
+        "performance": metrics,
+        "canonical_strategy_contract": strict_json_loads(
+            canonical.canonical_json,
+            label="canonical strategy",
+        ),
+        "canonical_strategy_json": canonical.canonical_json,
+        "canonical_strategy_sha256": canonical.sha256,
+        "strategy_config_sha256": bundle_identity["strategy_config_sha256"],
+        "model_execution_evidence_sha256": model_evidence.sha256,
+    }
+    stability_payload = {
+        "schema_name": "tradeos.promoted_stability_projection",
+        "schema_version": 1,
+        "saved_at": generated_at,
+        "research_generation_sha256": generation_sha256,
+        "bundle_path": bundle_relative,
+        "bundle_sha256": bundle.sha256,
+        "validation_windows": [window["lookback_days"] for window in window_results],
+        "per_window": [
+            {
+                "lookback_days": window["lookback_days"],
+                "dataset_provenance_sha256": window["dataset_provenance"][
+                    "provenance_sha256"
+                ],
+                "canonical_strategy_sha256": window["best_row"][
+                    "canonical_strategy_sha256"
+                ],
+                "model_execution_evidence_sha256": window["best_row"][
+                    "model_execution_evidence_sha256"
+                ],
+                "selection_evidence_sha256": window["best_row"][
+                    "research_selection_evidence"
+                ]["evidence_sha256"],
+                "performance": _selected_metrics(window["best_row"]),
+            }
+            for window in window_results
+        ],
+        "average_performance": stability["average_metrics"],
+        "stability": dict(stability),
+        "market_regime": dict(regime),
+    }
+    decision_payload = {
+        "schema_name": "tradeos.promoted_trade_decision_projection",
+        "schema_version": 1,
+        "timestamp": generated_at,
+        "research_generation_sha256": generation_sha256,
+        "bundle_path": bundle_relative,
+        "bundle_sha256": bundle.sha256,
+        **dict(final_decision),
+        "rejection_reasons": list(rejection_reasons),
+        "stability_reasons": list(stability["reasons"]),
+    }
+    projected_generation_path = (
+        targets.generation_directory
+        / generation_directory_component(generation_sha256)
+    )
+    immutable_projection_paths = {
+        "best_config": _repo_relative(
+            projected_generation_path / "best_config_latest.json",
+            root,
+        ),
+        "trade_decision": _repo_relative(
+            projected_generation_path / "trade_decision.json",
+            root,
+        ),
+        "stability_report": _repo_relative(
+            projected_generation_path / "stability_report.json",
+            root,
+        ),
+        "live_config": _repo_relative(
+            projected_generation_path / "live_config.json",
+            root,
+        ),
+    }
+    dataset_windows = dataset_set["windows"]
+    assert isinstance(dataset_windows, list)
+    primary_dataset_window = dataset_windows[dataset_set["primary_window_index"]]
+    assert isinstance(primary_dataset_window, dict)
+    primary_provenance = primary_dataset_window["provenance"]
+    assert isinstance(primary_provenance, dict)
+    primary_observed = primary_provenance["observed"]
+    assert isinstance(primary_observed, dict)
+    drift_performance_names = (
+        "trades_per_day",
+        "win_rate",
+        "profit_factor",
+        "sharpe_ratio",
+        "realized_pnl",
+        "combined_score",
+    )
+    if any(name not in metrics for name in drift_performance_names):
+        raise ResearchBundleValidationError(
+            "Promoted drift projection requires all bound performance metrics."
+        )
+    signal_rate = metrics["trades_per_day"] / len(canonical.contract.symbols)
+    drift_payload = {
+        "schema_name": DRIFT_PROFILE_SCHEMA_NAME,
+        "schema_version": DRIFT_PROFILE_SCHEMA_VERSION,
+        "generated_at": generated_at,
+        "approved": approved,
+        "source_artifacts": {
+        "dataset_provenance_sha256": dataset_set["provenance_sha256"],
+            **immutable_projection_paths,
+        "bundle": bundle_relative,
+        },
+        "context": {
+            "strategy_mode": canonical.contract.promoted_values["strategy_mode"],
+            "symbols": list(canonical.contract.symbols),
+            "symbol_count": len(canonical.contract.symbols),
+            "timeframe": primary_observed["timeframe"],
+            "bar_timeframe_minutes": canonical.contract.promoted_values[
+                "bar_timeframe_minutes"
+            ],
+            "stable": stability["stable"],
+            "market_regime": regime["regime"],
+        },
+        "performance": {
+            name: metrics[name] for name in drift_performance_names
+        },
+        "metrics": {
+            "buy_signal_rate_per_symbol_per_day": signal_rate,
+            "sell_signal_rate_per_symbol_per_day": signal_rate,
+            "rejection_rate": DRIFT_PROFILE_POLICY_V1.rejection_rate,
+            "rejection_breakdown": None,
+            "hybrid_branch_participation": None,
+            "avg_bar_age_s": DRIFT_PROFILE_POLICY_V1.avg_bar_age_s,
+            "stale_bar_rate": DRIFT_PROFILE_POLICY_V1.stale_bar_rate,
+        },
+        "metric_sources": DRIFT_PROFILE_POLICY_V1.metric_sources(),
+        "research_generation_sha256": generation_sha256,
+        "bundle_path": bundle_relative,
+        "bundle_sha256": bundle.sha256,
+    }
+    artifact_bytes = {
+        "best_config_latest": json_file_bytes(best_payload),
+        "live_config": live_bytes,
+        "stability_report": json_file_bytes(stability_payload),
+        "trade_decision": json_file_bytes(decision_payload),
+        "drift_profile": json_file_bytes(drift_payload),
+    }
+    immutable_generation_path = write_immutable_generation(
+        generation_sha256,
+        {
+            "best_config_latest.json": artifact_bytes["best_config_latest"],
+            "live_config.json": artifact_bytes["live_config"],
+            "stability_report.json": artifact_bytes["stability_report"],
+            "trade_decision.json": artifact_bytes["trade_decision"],
+            "drift_profile.json": artifact_bytes["drift_profile"],
+        },
+        targets.generation_directory,
+    )
+    if immutable_generation_path != projected_generation_path:
+        raise ResearchPublicationError(
+            "Immutable generation path differs from its full-digest projection."
+        )
+    pointer_artifacts = {
+        "best_config_latest": (
+            _repo_relative(
+                immutable_generation_path / "best_config_latest.json",
+                root,
+            ),
+            artifact_bytes["best_config_latest"],
+        ),
+        "live_config": (
+            _repo_relative(immutable_generation_path / "live_config.json", root),
+            artifact_bytes["live_config"],
+        ),
+        "stability_report": (
+            _repo_relative(
+                immutable_generation_path / "stability_report.json",
+                root,
+            ),
+            artifact_bytes["stability_report"],
+        ),
+        "trade_decision": (
+            _repo_relative(
+                immutable_generation_path / "trade_decision.json",
+                root,
+            ),
+            artifact_bytes["trade_decision"],
+        ),
+        "drift_profile": (
+            _repo_relative(immutable_generation_path / "drift_profile.json", root),
+            artifact_bytes["drift_profile"],
+        ),
+    }
+    pointer = build_promotion_pointer(
+        research_generation_sha256=generation_sha256,
+        bundle_path=bundle_relative,
+        bundle_sha256=bundle.sha256,
+        bundle_file_sha256=bundle_file_sha256,
+        artifacts=pointer_artifacts,
+    )
+    pointer_bytes = pointer.file_bytes()
+    targets.pointer_path.parent.mkdir(parents=True, exist_ok=True)
+    pointer_verification_path = (
+        targets.pointer_path.parent
+        / f".{targets.pointer_path.name}.{uuid4().hex}.verify"
+    )
+    try:
+        with pointer_verification_path.open("xb") as handle:
+            handle.write(pointer_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        load_verified_promotion_pointer(
+            pointer_verification_path,
+            repo_root=root,
+            require_latest_state=False,
+        )
+    finally:
+        pointer_verification_path.unlink(missing_ok=True)
+    latest_state = build_latest_research_state(
+        research_generation_sha256=generation_sha256,
+        bundle_path=bundle_relative,
+        bundle_sha256=bundle.sha256,
+        bundle_file_sha256=bundle_file_sha256,
+        eligible=True,
+        promotion_pointer_path=_repo_relative(targets.pointer_path, root),
+        promotion_pointer=pointer,
+        promotion_pointer_file_sha256=hashlib.sha256(pointer_bytes).hexdigest(),
+        completed_at_utc=generated_at,
+    )
+    latest_state_bytes = latest_state.file_bytes()
+    verify_latest_research_state_bytes(
+        latest_state_bytes,
+        repo_root=root,
+        promotion_pointer_path=targets.pointer_path,
+        promotion_pointer_bytes=pointer_bytes,
+    )
+    _assert_run_inputs_unchanged(
+        repo_root=root,
+        source_identity=source_identity,
+        window_results=window_results,
+    )
+    _assert_resolved_live_inputs_unchanged(
+        live_config_path=targets.live_config_path,
+        research_config_inputs=research_config_inputs,
+    )
+    publications = {
+        targets.best_config_path: artifact_bytes["best_config_latest"],
+        targets.live_config_path: artifact_bytes["live_config"],
+        targets.stability_report_path: artifact_bytes["stability_report"],
+        targets.trade_decision_path: artifact_bytes["trade_decision"],
+        targets.drift_profile_path: artifact_bytes["drift_profile"],
+        targets.pointer_path: pointer_bytes,
+    }
+    publish_files_atomically(
+        publications,
+        commit_pointer=(targets.latest_state_path, latest_state_bytes),
+        expected_originals={targets.live_config_path: live_original_bytes},
+        failure_injector=failure_injector,
+    )
+    return ResearchPublicationResult(
+        bundle_path=bundle_path,
+        bundle_sha256=bundle.sha256,
+        research_generation_sha256=generation_sha256,
+        published=True,
+        pointer_path=targets.pointer_path,
+        latest_state_path=targets.latest_state_path,
+    )
+
+
 def _report_outputs(output_csv: Path) -> None:
     """Print paths of all CSV files the backtest runner produced."""
     # backtest_runner.py appends these suffixes when --output-csv is given.
@@ -1169,8 +2091,7 @@ def _report_outputs(output_csv: Path) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    args = parse_args()
+def _main_locked(args: argparse.Namespace) -> None:
     _section("run_research.py  —  starting")
 
     _log(f"Best config target : {BEST_CONFIG_PATH}")
@@ -1181,58 +2102,142 @@ def main() -> None:
 
     window_results: list[dict] = []
     primary_sweep_csv: Path | None = None
+    # `_main_locked` is entered only after ExecutionLock acquisition. Resolve
+    # the one UTC anchor and all live-derived inputs here, never at import time.
+    research_anchor_utc = _resolve_research_anchor_utc()
+    resolved_inputs = _resolve_research_inputs(LIVE_CONFIG_PATH)
+    existing_dataset_path: Path | None = None
+    if args.dataset:
+        existing_dataset_path = Path(args.dataset)
+        if not existing_dataset_path.is_absolute():
+            existing_dataset_path = SCRIPT_DIR / existing_dataset_path
+        existing_dataset_path = existing_dataset_path.resolve(strict=False)
+        if not existing_dataset_path.exists() or not existing_dataset_path.is_dir():
+            raise RuntimeError(
+                "Provided dataset path does not exist or is not a directory: "
+                f"{existing_dataset_path}"
+            )
+        existing_manifest = load_verified_manifest(existing_dataset_path)
+        window_ranges = [
+            {
+                "lookback_days": 0,
+                "start_utc": _canonical_utc_text(
+                    existing_manifest.get(
+                        "start_utc",
+                        existing_manifest.get("start"),
+                    ),
+                    field="existing dataset start_utc",
+                ),
+                "end_utc": _canonical_utc_text(
+                    existing_manifest.get(
+                        "end_utc",
+                        existing_manifest.get("end"),
+                    ),
+                    field="existing dataset end_utc",
+                ),
+            }
+        ]
+    else:
+        window_ranges = _fresh_window_ranges(research_anchor_utc)
+    source_identity = capture_source_identity(SCRIPT_DIR)
+    research_config_inputs = _research_config_inputs(
+        args,
+        resolved_inputs=resolved_inputs,
+        research_anchor_utc=research_anchor_utc,
+        window_ranges=window_ranges,
+    )
+    # Validate the exact declared search/policy inputs before any snapshot or
+    # backtest work can begin.
+    build_research_config_identity(research_config_inputs)
 
     try:
         if args.dataset:
-            dataset_path = Path(args.dataset)
-            if not dataset_path.exists() or not dataset_path.is_dir():
-                raise RuntimeError(f"Provided dataset path does not exist or is not a directory: {dataset_path}")
+            assert existing_dataset_path is not None
+            dataset_path = existing_dataset_path
 
             _log("Research mode      : existing dataset")
             _log_dataset_details(dataset_path, context="Existing")
 
             sweep_csv = _timestamped_csv(RESULTS_DIR, "research_dataset")
             leaderboard_csv = _timestamped_csv(RESULTS_DIR, "leaderboard_dataset")
+            dataset_checkpoint = capture_dataset_checkpoint(dataset_path)
 
             _section("Existing Dataset — Backtest")
-            step_backtest(sweep_csv, dataset_path)
+            step_backtest(
+                sweep_csv,
+                dataset_path,
+                resolved_inputs=resolved_inputs,
+            )
 
             _section("Existing Dataset — Rank")
             best_row = step_rank_results(sweep_csv, leaderboard_csv)
+            assert_dataset_checkpoint_unchanged(
+                dataset_checkpoint,
+                capture_dataset_checkpoint(dataset_path),
+            )
+            canonical = canonical_strategy_from_backtest_row(best_row)
+            dataset_provenance = capture_dataset_provenance(
+                dataset_path,
+                canonical.contract,
+            )
 
             window_results.append({
                 "lookback_days": 0,
                 "dataset": dataset_path,
                 "sweep_csv": sweep_csv,
+                "leaderboard_csv": leaderboard_csv,
                 "best_row": best_row,
+                "dataset_checkpoint": dataset_checkpoint,
+                "dataset_provenance": dataset_provenance,
             })
             primary_sweep_csv = sweep_csv
         else:
             n = len(VALIDATION_WINDOWS)
             _log("Research mode      : fresh snapshots")
             _log(f"Validation windows : {VALIDATION_WINDOWS} days ({n} windows)")
-            _log(f"Snapshot symbols   : {', '.join(SNAPSHOT_SYMBOLS)}")
+            _log(f"Snapshot symbols   : {', '.join(resolved_inputs.symbols)}")
 
             # ── Phase 1: run snapshot + backtest + rank for every window ──────
             for i, days in enumerate(VALIDATION_WINDOWS, 1):
                 _section(f"Window {i} of {n} ({days} days) — Snapshot")
-                dataset_path = step_snapshot(days)
+                dataset_path = step_snapshot(
+                    days,
+                    resolved_inputs=resolved_inputs,
+                    research_anchor_utc=research_anchor_utc,
+                )
                 _log_dataset_details(dataset_path, context=f"Window {days}d")
 
                 sweep_csv = _timestamped_csv(RESULTS_DIR, f"research_{days}d")
                 leaderboard_csv = _timestamped_csv(RESULTS_DIR, f"leaderboard_{days}d")
+                dataset_checkpoint = capture_dataset_checkpoint(dataset_path)
 
                 _section(f"Window {i} of {n} ({days} days) — Backtest")
-                step_backtest(sweep_csv, dataset_path)
+                step_backtest(
+                    sweep_csv,
+                    dataset_path,
+                    resolved_inputs=resolved_inputs,
+                )
 
                 _section(f"Window {i} of {n} ({days} days) — Rank")
                 best_row = step_rank_results(sweep_csv, leaderboard_csv)
+                assert_dataset_checkpoint_unchanged(
+                    dataset_checkpoint,
+                    capture_dataset_checkpoint(dataset_path),
+                )
+                canonical = canonical_strategy_from_backtest_row(best_row)
+                dataset_provenance = capture_dataset_provenance(
+                    dataset_path,
+                    canonical.contract,
+                )
 
                 window_results.append({
                     "lookback_days": days,
                     "dataset": dataset_path,
                     "sweep_csv": sweep_csv,
+                    "leaderboard_csv": leaderboard_csv,
                     "best_row": best_row,
+                    "dataset_checkpoint": dataset_checkpoint,
+                    "dataset_provenance": dataset_provenance,
                 })
 
                 if days == VALIDATION_WINDOWS[-1]:
@@ -1249,23 +2254,7 @@ def main() -> None:
         _section(f"Approval — {approval_label}")
         approved, rejection_reasons = step_approve_config(primary["best_row"])
 
-        _section("Save best config")
-        step_save_best_config(
-            primary["best_row"], primary["dataset"],
-            BEST_CONFIG_PATH, approved, rejection_reasons,
-        )
-
         # ── Phase 3: stability evaluation across all windows ──────────────
-        if approved:
-            _section("Promote runtime config")
-            step_write_live_config(
-                primary["best_row"], primary["dataset"],
-                LIVE_CONFIG_PATH, approved, rejection_reasons,
-            )
-        else:
-            _section("Promote runtime config")
-            _log("Skipped live config promotion because the selected config was not approved.")
-
         _section("Stability evaluation")
         stability = step_evaluate_stability(window_results)
 
@@ -1273,83 +2262,109 @@ def main() -> None:
         _section("Market regime detection")
         regime = step_detect_regime(primary["dataset"])
 
-        step_save_stability_report(window_results, stability, regime, STABILITY_REPORT_PATH)
-
         # ── Phase 5: combine into a single trade decision ─────────────────
         _section("Trade decision")
         decision = step_make_trade_decision(
             approved, rejection_reasons, stability, regime, primary["best_row"]
         )
-        step_save_trade_decision(decision, TRADE_DECISION_PATH)
 
-        if approved:
-            _section("Save drift profile")
-            step_save_drift_profile(
-                primary["best_row"],
-                primary["dataset"],
-                approved,
-                stability,
-                regime,
-                DRIFT_PROFILE_PATH,
-            )
+        # ── Phase 6: immutable bundle/projections, latest-state marker LAST ─
+        _section("Finalize research bundle")
+        publication_result = finalize_research_bundle_and_publish(
+            window_results=window_results,
+            approved=approved,
+            rejection_reasons=rejection_reasons,
+            stability=stability,
+            regime=regime,
+            final_decision=decision,
+            source_identity=source_identity,
+            research_config_inputs=research_config_inputs,
+            targets=_default_publication_targets(),
+        )
+        _log(f"Immutable bundle : {publication_result.bundle_path}")
+        _log(f"Bundle SHA       : {publication_result.bundle_sha256}")
+        _log(f"Generation SHA   : {publication_result.research_generation_sha256}")
+        _log(f"Latest state     : {publication_result.latest_state_path}")
+        if publication_result.published:
+            _log(f"Commit pointer   : {publication_result.pointer_path}")
         else:
-            _section("Save drift profile")
-            _log("Skipped drift profile generation because the selected config was not approved.")
+            _log("Current aliases unchanged: final decision is not promotion-eligible.")
 
-        _section("Generate operator reports")
-        for report_path in strategy_report.write_reports(SCRIPT_DIR):
-            _log(f"Report       : {report_path}")
+        if publication_result.published:
+            _section("Generate operator reports")
+            try:
+                for report_path in strategy_report.write_reports(SCRIPT_DIR):
+                    _log(f"Report       : {report_path}")
+            except Exception as exc:
+                _log(
+                    "Warning: committed promotion is valid, but operator report "
+                    f"generation failed ({type(exc).__name__})."
+                )
 
     except RuntimeError as exc:
-        _section("FAILED")
-        _log(f"Error: {exc}")
-        sys.exit(1)
+        raise RuntimeError(str(exc)) from exc
 
     _section("Done")
     if primary_sweep_csv:
         _report_outputs(primary_sweep_csv)
     if window_results:
         primary = window_results[-1]
-        log_experiment_run(
-            run_type="research_pipeline",
-            script_path=__file__,
-            entrypoint=sys.argv[0],
-            strategy_name=str(primary["best_row"].get("strategy_mode") or "unknown"),
-            dataset_path=primary["dataset"],
-            symbols=SNAPSHOT_SYMBOLS,
-            params={
-                "dataset_arg": args.dataset,
-                "validation_windows": VALIDATION_WINDOWS,
-                "snapshot_timeframe": SNAPSHOT_TIMEFRAME,
-                "snapshot_feed": SNAPSHOT_FEED,
-                "snapshot_adjustment": SNAPSHOT_ADJUSTMENT,
-                "snapshot_align_mode": SNAPSHOT_ALIGN_MODE,
-                "sweep_params": dict(SWEEP_PARAMS),
-                "fixed_params": dict(FIXED_PARAMS),
-            },
-            metrics={
-                "total_return_pct": primary["best_row"].get("total_return_pct"),
-                "profit_factor": primary["best_row"].get("profit_factor"),
-                "sharpe": primary["best_row"].get("sharpe_ratio"),
-                "win_rate": primary["best_row"].get("win_rate"),
-                "max_drawdown_pct": primary["best_row"].get("max_drawdown_pct"),
-                "trade_count": primary["best_row"].get("total_trades"),
-                "expectancy": primary["best_row"].get("expectancy"),
-                "realized_pnl": primary["best_row"].get("realized_pnl"),
-            },
-            output_path=RESULTS_DIR,
-            summary_path=STABILITY_REPORT_PATH,
-            extra_fields={
-                "approved": approved,
-                "approval_reasons": rejection_reasons,
-                "stable": stability["stable"],
-                "stability_reasons": stability["reasons"],
-                "market_regime": regime["regime"],
-                "primary_sweep_csv": str(primary_sweep_csv) if primary_sweep_csv else None,
-                "trade_decision_path": str(TRADE_DECISION_PATH),
-                "best_config_path": str(BEST_CONFIG_PATH),
-            },
-        )
+        try:
+            log_experiment_run(
+                run_type="research_pipeline",
+                script_path=__file__,
+                entrypoint=sys.argv[0],
+                strategy_name=str(primary["best_row"].get("strategy_mode") or "unknown"),
+                dataset_path=primary["dataset"],
+                symbols=list(resolved_inputs.symbols),
+                params={
+                    "dataset_arg": args.dataset,
+                    "validation_windows": VALIDATION_WINDOWS,
+                    "snapshot_timeframe": resolved_inputs.timeframe,
+                    "snapshot_feed": SNAPSHOT_FEED,
+                    "snapshot_adjustment": SNAPSHOT_ADJUSTMENT,
+                    "snapshot_align_mode": SNAPSHOT_ALIGN_MODE,
+                    "sweep_params": dict(resolved_inputs.sweep_params),
+                    "fixed_params": dict(FIXED_PARAMS),
+                },
+                metrics={
+                    "total_return_pct": primary["best_row"].get("total_return_pct"),
+                    "profit_factor": primary["best_row"].get("profit_factor"),
+                    "sharpe": primary["best_row"].get("sharpe_ratio"),
+                    "win_rate": primary["best_row"].get("win_rate"),
+                    "max_drawdown_pct": primary["best_row"].get("max_drawdown_pct"),
+                    "trade_count": primary["best_row"].get("total_trades"),
+                    "expectancy": primary["best_row"].get("expectancy"),
+                    "realized_pnl": primary["best_row"].get("realized_pnl"),
+                },
+                output_path=RESULTS_DIR,
+                summary_path=publication_result.bundle_path,
+                extra_fields={
+                    "approved": approved,
+                    "approval_reasons": rejection_reasons,
+                    "stable": stability["stable"],
+                    "stability_reasons": stability["reasons"],
+                    "market_regime": regime["regime"],
+                    "primary_sweep_csv": str(primary_sweep_csv) if primary_sweep_csv else None,
+                    "promotion_bundle_path": str(publication_result.bundle_path),
+                    "research_generation_sha256": (
+                        publication_result.research_generation_sha256
+                    ),
+                },
+            )
+        except Exception as exc:
+            _log(f"Warning: experiment log failed ({type(exc).__name__}).")
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        with ExecutionLock(RESEARCH_LOCK_PATH):
+            _main_locked(args)
+    except RuntimeError as exc:
+        _section("FAILED")
+        _log(f"Error: {exc}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

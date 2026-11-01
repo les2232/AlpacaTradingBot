@@ -4141,6 +4141,13 @@ def _status_overview(state: DashboardState) -> tuple[str, str, str]:
             "err",
             "No recent session data is available yet. Start a TradeOS session or wait for persisted startup metadata.",
         )
+    if cfg is None and state.has_persisted_snapshot:
+        return (
+            "Metadata Unbound",
+            "warn",
+            "Saved database state is available, but no validated startup metadata "
+            "matches that persisted session.",
+        )
     if cfg is not None and state.last_cycle_report is None and not state.has_persisted_snapshot:
         return (
             "Initializing",

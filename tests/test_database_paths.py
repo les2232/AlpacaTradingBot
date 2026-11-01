@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import sys
@@ -54,6 +55,119 @@ def test_dashboard_storage_is_sqlite_query_only_and_does_not_change_database(
     assert after_tables == before_tables
 
 
+def test_dashboard_read_only_storage_projects_legacy_scope_columns_without_migration(
+    tmp_path: Path,
+) -> None:
+    database_path = (tmp_path / "legacy-dashboard.db").resolve()
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE bot_runs (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT,
+                symbol_fingerprint TEXT,
+                timestamp_utc TEXT NOT NULL,
+                cash REAL NOT NULL,
+                buying_power REAL NOT NULL,
+                equity REAL NOT NULL,
+                last_equity REAL NOT NULL,
+                daily_pnl REAL NOT NULL,
+                kill_switch_triggered INTEGER NOT NULL
+            );
+            CREATE TABLE symbol_runs (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                price REAL,
+                sma REAL,
+                ml_probability_up REAL,
+                ml_confidence REAL,
+                ml_training_rows INTEGER,
+                action TEXT NOT NULL,
+                holding INTEGER NOT NULL,
+                holding_minutes REAL,
+                quantity REAL NOT NULL,
+                market_value REAL NOT NULL,
+                avg_entry_price REAL,
+                unrealized_pl REAL,
+                error TEXT
+            );
+            CREATE TABLE order_history (
+                order_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                observed_at_utc TEXT NOT NULL,
+                submitted_at TEXT,
+                filled_at TEXT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                status TEXT NOT NULL,
+                qty REAL,
+                filled_qty REAL,
+                filled_avg_price REAL,
+                notional REAL,
+                client_order_id TEXT
+            );
+            CREATE TABLE order_intents (
+                intent_id TEXT PRIMARY KEY,
+                client_order_id TEXT NOT NULL,
+                account_fingerprint TEXT NOT NULL,
+                decision_ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                intent_kind TEXT NOT NULL,
+                requested_qty TEXT NOT NULL,
+                final_qty TEXT NOT NULL,
+                status TEXT NOT NULL,
+                broker_order_id TEXT,
+                broker_status TEXT,
+                filled_qty TEXT NOT NULL,
+                submission_attempts INTEGER NOT NULL,
+                error_category TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
+            );
+            INSERT INTO bot_runs VALUES (
+                1, 'legacy-session', 'legacy-symbols',
+                '2026-04-24T19:45:00+00:00', 100, 200, 100, 100, 0, 0
+            );
+            INSERT INTO symbol_runs VALUES (
+                1, 1, 'COP', 121.0, 122.0, NULL, NULL, NULL,
+                'SNAPSHOT_ONLY', 1, NULL, -8, -968, NULL, NULL, NULL
+            );
+            INSERT INTO order_history VALUES (
+                'order-1', 'legacy-session', '2026-04-24T19:40:00+00:00',
+                NULL, NULL, 'COP', 'sell', 'FILLED', 8, 8, 121, NULL, NULL
+            );
+            """
+        )
+    before_bytes = database_path.read_bytes()
+    before_schema = sqlite3.connect(database_path).execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+
+    storage = BotStorage(database_path, read_only=True)
+    latest = storage.get_latest_run()
+    orders = storage.get_order_history()
+
+    assert latest is not None
+    assert latest["session_id"] == "legacy-session"
+    assert latest["environment"] is None
+    assert latest["account_fingerprint"] is None
+    assert storage.get_latest_symbol_snapshot()[0]["quantity"] == -8
+    assert orders[0]["environment"] is None
+    assert orders[0]["account_fingerprint"] is None
+    assert storage.get_runtime_state_binding(
+        environment="paper",
+        account_fingerprint="f" * 64,
+    ) is None
+
+    after_schema = sqlite3.connect(database_path).execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+    assert database_path.read_bytes() == before_bytes
+    assert after_schema == before_schema
+
+
 def test_dashboard_launcher_defaults_to_dashboard_only_and_never_invokes_live() -> None:
     launcher = (TRADEOS_REPOSITORY_ROOT / "start_dashboard.ps1").read_text(
         encoding="utf-8"
@@ -89,7 +203,7 @@ def test_runtime_config_and_log_root_are_launcher_invariant(
     monkeypatch.delenv(runtime_paths.LOG_ROOT_ENV, raising=False)
 
     monkeypatch.chdir(tmp_path)
-    runtime_path, _, _ = trading_bot._load_runtime_config_payload()
+    runtime_path, _, _, _ = trading_bot._load_runtime_config_payload()
 
     assert runtime_path == (
         TRADEOS_REPOSITORY_ROOT / "config" / "live_config.json"
@@ -104,13 +218,17 @@ def test_relative_runtime_config_path_is_repository_anchored(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("BOT_RUNTIME_CONFIG_PATH", "config/live_config.json")
 
-    runtime_path, runtime, payload = trading_bot._load_runtime_config_payload()
+    runtime_path, runtime, payload, runtime_sha256 = (
+        trading_bot._load_runtime_config_payload()
+    )
 
     assert runtime_path == (
         TRADEOS_REPOSITORY_ROOT / "config" / "live_config.json"
     ).resolve()
     assert isinstance(runtime, dict)
     assert isinstance(payload, dict)
+    assert runtime_path is not None
+    assert runtime_sha256 == hashlib.sha256(runtime_path.read_bytes()).hexdigest()
 
 
 def test_relative_database_path_is_repository_anchored_from_every_cwd(
@@ -226,6 +344,7 @@ def test_cli_and_direct_runtime_resolve_the_same_database(
         observed["cli"] = Path(cli.os.environ[DATABASE_PATH_ENV])
 
     fake_module = SimpleNamespace(
+        BotConfig=trading_bot.BotConfig,
         load_config_details=lambda: SimpleNamespace(
             config=config,
             runtime_config_path=None,
@@ -233,11 +352,18 @@ def test_cli_and_direct_runtime_resolve_the_same_database(
             runtime_config_approved=True,
             runtime_config_rejection_reasons=(),
         ),
+        build_runtime_canonical_strategy_evidence=(
+            trading_bot.build_runtime_canonical_strategy_evidence
+        ),
         main=capture_cli_main,
     )
     monkeypatch.setitem(sys.modules, "trading_bot", fake_module)
     monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
-    monkeypatch.setattr(cli, "_attach_baseline_validation", lambda details: details)
+    monkeypatch.setattr(
+        cli,
+        "_attach_baseline_validation",
+        lambda details, **_kwargs: details,
+    )
 
     assert cli._run_live(preview=True) == 0
     assert observed == {"runtime": expected, "cli": expected}
@@ -345,12 +471,21 @@ def test_dashboard_startup_artifact_discovery_is_cwd_invariant(
     day_dir = repository_root / "logs" / "2026-04-23"
     day_dir.mkdir(parents=True)
     database_path = (tmp_path / "authority.db").resolve()
+    BotStorage(database_path)
     artifact_path = day_dir / "startup_config.20260423T154500Z.json"
     artifact_path.write_text(
         json.dumps(
             {
                 "session_id": "session-a",
                 "started_at_utc": "2026-04-23T15:45:00+00:00",
+                "launch_mode": "live",
+                "execution_enabled": True,
+                "paper": True,
+                "account_mode": "paper",
+                "strategy_mode": "mean_reversion",
+                "bar_timeframe_minutes": 15,
+                "symbols": ["AMD"],
+                "symbol_count": 1,
                 "db_path": str(database_path),
             }
         ),
@@ -360,6 +495,7 @@ def test_dashboard_startup_artifact_discovery_is_cwd_invariant(
     unrelated_cwd.mkdir()
     monkeypatch.setattr(runtime_paths, "TRADEOS_REPOSITORY_ROOT", repository_root)
     monkeypatch.delenv("BOT_LOG_ROOT", raising=False)
+    monkeypatch.setenv("BOT_DB_PATH", str(database_path))
 
     monkeypatch.chdir(repository_root)
     from_repository = dashboard_state._load_startup_configs()

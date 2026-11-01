@@ -366,9 +366,12 @@ def test_reconciliation_output_is_detailed_and_account_masked(storage: BotStorag
     broker = FakeBroker()
 
     report = _reconciler(storage, broker).reconcile()
+    redacted = report.to_redacted_dict()
     rendered = format_reconciliation(report)
 
     assert EXPECTED_ACCOUNT not in rendered
+    assert redacted["account_fingerprint"] == EXPECTED_FINGERPRINT
+    assert EXPECTED_FINGERPRINT not in rendered
     assert report.account_id_masked in rendered
     assert "Broker positions: []" in rendered
     assert "Open/pending orders: []" in rendered

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import hmac
 import io
@@ -31,6 +32,16 @@ _ALLOWED_PICKLE_GLOBALS = {
 
 class ModelArtifactError(RuntimeError):
     """Raised when a saved model is corrupt, unsupported, or unsafe to deserialize."""
+
+
+@dataclass(frozen=True)
+class LoadedModelArtifact:
+    """Validated payload plus identity of the exact bytes deserialized."""
+
+    payload: dict[str, Any]
+    model_sha256: str
+    sidecar_declared_sha256: str | None
+    sidecar_sha256: str | None
 
 
 class _RestrictedModelUnpickler(pickle.Unpickler):
@@ -69,9 +80,22 @@ def _validate_payload(payload: object) -> dict[str, Any]:
     return payload
 
 
-def load_model_payload(model_path: Path) -> dict[str, Any]:
+def _deserialize_model_payload(raw: bytes, *, model_path: Path) -> dict[str, Any]:
+    stream = io.BytesIO(raw)
+    try:
+        payload = _RestrictedModelUnpickler(stream).load()
+    except ModelArtifactError:
+        raise
+    except (pickle.PickleError, AttributeError, EOFError, ImportError, IndexError, TypeError, ValueError) as exc:
+        raise ModelArtifactError(f"Model artifact could not be deserialized: {model_path}") from exc
+    if stream.read(1):
+        raise ModelArtifactError(f"Model artifact contains trailing data: {model_path}")
+    return _validate_payload(payload)
+
+
+def load_model_payload_with_evidence(model_path: Path) -> LoadedModelArtifact:
     """
-    Load the repository's sklearn model format without permitting arbitrary pickle globals.
+    Load the model and retain identity for the exact byte buffer deserialized.
 
     A matching ``.sha256`` sidecar is verified when present. Legacy artifacts without a
     sidecar remain readable, but are still constrained by the restricted unpickler.
@@ -85,28 +109,35 @@ def load_model_payload(model_path: Path) -> dict[str, Any]:
     except OSError as exc:
         raise ModelArtifactError(f"Model file is unreadable: {model_path}") from exc
 
+    model_sha256 = hashlib.sha256(raw).hexdigest()
     sidecar_path = _sha256_sidecar_path(model_path)
+    sidecar_declared_sha256: str | None = None
+    sidecar_sha256: str | None = None
     if sidecar_path.exists():
         try:
-            expected = sidecar_path.read_text(encoding="ascii").strip().split()[0].lower()
+            sidecar_raw = sidecar_path.read_bytes()
+            expected = sidecar_raw.decode("ascii").strip().split()[0].lower()
         except (OSError, IndexError, UnicodeError) as exc:
             raise ModelArtifactError(f"Model hash sidecar is unreadable: {sidecar_path}") from exc
         if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
             raise ModelArtifactError(f"Model hash sidecar is invalid: {sidecar_path}")
-        actual = hashlib.sha256(raw).hexdigest()
-        if not hmac.compare_digest(actual, expected):
+        if not hmac.compare_digest(model_sha256, expected):
             raise ModelArtifactError(f"Model SHA-256 mismatch: {model_path}")
+        sidecar_declared_sha256 = expected
+        sidecar_sha256 = hashlib.sha256(sidecar_raw).hexdigest()
 
-    stream = io.BytesIO(raw)
-    try:
-        payload = _RestrictedModelUnpickler(stream).load()
-    except ModelArtifactError:
-        raise
-    except (pickle.PickleError, AttributeError, EOFError, ImportError, IndexError, TypeError, ValueError) as exc:
-        raise ModelArtifactError(f"Model artifact could not be deserialized: {model_path}") from exc
-    if stream.read(1):
-        raise ModelArtifactError(f"Model artifact contains trailing data: {model_path}")
-    return _validate_payload(payload)
+    return LoadedModelArtifact(
+        payload=_deserialize_model_payload(raw, model_path=model_path),
+        model_sha256=model_sha256,
+        sidecar_declared_sha256=sidecar_declared_sha256,
+        sidecar_sha256=sidecar_sha256,
+    )
+
+
+def load_model_payload(model_path: Path) -> dict[str, Any]:
+    """Load the repository model format, preserving the historical payload API."""
+
+    return load_model_payload_with_evidence(model_path).payload
 
 
 def save_model_payload(payload: dict[str, Any], model_path: Path) -> None:

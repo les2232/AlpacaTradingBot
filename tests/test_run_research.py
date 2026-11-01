@@ -86,7 +86,7 @@ def test_build_drift_profile_payload_includes_hybrid_branch_participation() -> N
         shutil.rmtree(base_dir, ignore_errors=True)
 
 
-def test_save_drift_profile_writes_stable_json_shape_and_loader_can_read_it() -> None:
+def test_save_drift_profile_shape_does_not_bypass_pointer_backed_loader() -> None:
     base_dir = Path.cwd() / f"test_run_research_drift_write_{uuid.uuid4().hex}"
     try:
         (base_dir / "config").mkdir(parents=True)
@@ -159,9 +159,12 @@ def test_save_drift_profile_writes_stable_json_shape_and_loader_can_read_it() ->
             assert payload["metrics"]["hybrid_branch_participation"]["bollinger_breakout"] == 0.3
 
             profile = load_baseline_profile(base_dir)
-            assert profile.strategy_mode == "hybrid_bb_mr"
-            assert profile.buy_signal_rate_per_symbol_per_day == 4.0
-            assert dict(profile.hybrid_branch_participation)["bollinger_breakout"] == 0.3
+            assert profile.valid_for_comparison is False
+            assert profile.strategy_mode is None
+            assert any(
+                "promotion pointer" in error
+                for error in profile.validation_errors
+            )
         finally:
             run_research.BEST_CONFIG_PATH = original_best
             run_research.TRADE_DECISION_PATH = original_trade

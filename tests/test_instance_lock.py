@@ -35,7 +35,11 @@ def _hold_lock_until_released(
                 "registered": current_process_holds_lock(lock_path),
             }
         )
-        release_event.wait(20)
+        # Windows ``spawn`` can spend more than ten seconds importing the test
+        # module on a cold/contended host.  Keep the holder alive long enough
+        # for the contender to exercise the kernel lock rather than timing out
+        # during interpreter startup.
+        release_event.wait(60)
         lock.release()
     except BaseException as exc:
         ready_connection.send(
@@ -114,7 +118,7 @@ def _acquire_and_crash(lock_path: str, ready_connection: Any) -> None:
     os._exit(23)
 
 
-def _receive(connection: Any, timeout: float = 10.0) -> Any:
+def _receive(connection: Any, timeout: float = 30.0) -> Any:
     assert connection.poll(timeout), "spawned lock process did not respond in time"
     return connection.recv()
 
