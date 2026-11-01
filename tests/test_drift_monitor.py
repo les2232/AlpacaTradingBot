@@ -633,8 +633,44 @@ def test_drift_rejection_expectation_comes_from_bound_profile_not_defaults(
     )
     rejection_alerts = [a for a in report.alerts if a.key == "rejection_rate_high"]
     assert [a.expected for a in rejection_alerts] == [
-        f"{DRIFT_PROFILE_POLICY_V1.rejection_rate:.0%}"
+        f"{DRIFT_PROFILE_POLICY_V1.rejection_rate:.0%} or lower "
+        "(drift policy threshold, not research-measured)"
     ]
+
+
+def test_rejection_alert_is_labelled_as_policy_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_verified_pointer_baseline(
+        monkeypatch,
+        tmp_path,
+        trades_per_day=4.0,
+        win_rate=60.0,
+    )
+
+    report = build_drift_report(
+        signal_events=[
+            {"event": "signal.evaluated", "action": "HOLD", "symbol": "AMD", "rejection": "no_signal"}
+            for _ in range(12)
+        ],
+        bar_events=[],
+        risk_events=[],
+        repo_root=tmp_path,
+    )
+
+    (alert,) = [a for a in report.alerts if a.key == "rejection_rate_high"]
+    # Same trigger and severity as before: 100% observed vs a 72% threshold.
+    assert alert.severity == "err"
+    assert alert.observed == "100%"
+    assert alert.summary == "Rejection rate materially exceeds the drift policy threshold."
+    assert alert.expected == "72% or lower (drift policy threshold, not research-measured)"
+    assert "drift policy" in alert.why_it_matters
+    assert "not as proof the strategy has drifted from research" in alert.why_it_matters
+    # The policy value is never presented as research evidence.
+    for text in (alert.summary, alert.expected):
+        assert "validated profile" not in text
+    assert "than research," not in alert.why_it_matters
 
 
 def test_drift_profile_rejection_rate_off_policy_fails_closed(

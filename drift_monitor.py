@@ -658,10 +658,13 @@ def evaluate_drift(baseline: BaselineProfile, live: LiveMetrics) -> tuple[DriftA
                 DriftAlert(
                     key="rejection_rate_high",
                     severity="err" if delta >= 0.2 else "warn",
-                    summary="Rejection rate materially exceeds the validated profile.",
+                    # baseline.rejection_rate is the drift policy v1 threshold
+                    # bound into the promotion, not a research measurement, so
+                    # the alert must not present it as the validated profile.
+                    summary="Rejection rate materially exceeds the drift policy threshold.",
                     observed=f"{live.rejection_rate:.0%}",
-                    expected=f"{baseline.rejection_rate:.0%}",
-                    why_it_matters="When the bot is rejecting far more setups than research, live behavior can drift away from the tested strategy profile even if the code is still running.",
+                    expected=f"{baseline.rejection_rate:.0%} or lower (drift policy threshold, not research-measured)",
+                    why_it_matters="The bot is rejecting far more setups than the operator drift policy allows. This threshold is a fixed policy value rather than a research result, so treat it as an operational check on filters and data, not as proof the strategy has drifted from research.",
                 )
             )
 
