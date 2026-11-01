@@ -112,6 +112,15 @@ class DbSessionSummary:
     run_ids: tuple[int, ...]
 
 
+_RUN_TYPES: tuple[tuple[str, str], ...] = (
+    ("paper-shadow-", "paper-shadow run (no submit)"),
+    ("preview-", "preview run (no submit)"),
+    ("live-", "trading run (orders enabled)"),
+    ("reconcile-", "broker reconciliation, no trading"),
+    ("repair-", "local state repair, no trading"),
+)
+
+
 @dataclass(frozen=True)
 class SessionRef:
     key: str
@@ -125,10 +134,25 @@ class SessionRef:
     db_run_count: int
 
     @property
+    def run_type(self) -> str:
+        """Human description derived from the session-id prefix the CLI assigns."""
+
+        sid = self.session_id or ""
+        for prefix, text in _RUN_TYPES:
+            if sid.startswith(prefix):
+                return text
+        return "unrecognised run type"
+
+    @property
     def label(self) -> str:
         day_text = ", ".join(self.days) if self.days else "unknown day"
         if self.kind == "bound":
-            return f"{day_text} · {self.session_id}"
+            start = parse_utc(self.first_ts)
+            when = start.astimezone(_ET).strftime("%Y-%m-%d %H:%M ET") if start else day_text
+            config = "config recorded" if self.startup_artifacts else "no startup config"
+            return (
+                f"{when} · {self.run_type} · {self.log_record_count:,} log records · {config} · {self.session_id}"
+            )
         return f"{day_text} · unbound log day (no session id)"
 
 

@@ -732,6 +732,8 @@ def build_evidence_package(
             "key": session.key,
             "kind": session.kind,
             "session_id": session.session_id,
+            "run_type": session.run_type if session.kind == "bound" else "unknown (no session id)",
+            "run_type_source": "session id prefix assigned by the tradeos CLI" if session.kind == "bound" else None,
             "scope": (
                 "single session (records carrying this session id only)"
                 if session.kind == "bound"
@@ -798,6 +800,11 @@ def build_evidence_package(
         limit(
             "Records on this log day carry no session id, so they cannot be attributed to one session or to a launch "
             "configuration. Figures describe the whole log day."
+        )
+    if session.kind == "bound" and session.run_type.endswith("no trading"):
+        limit(
+            f"This session id belongs to a {session.run_type} run, not a trading session; trading decisions, "
+            "orders, and fills are not expected in it."
         )
     total_ambiguous = sum(excluded_ambiguous.values())
     if total_ambiguous:

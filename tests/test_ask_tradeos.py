@@ -799,3 +799,27 @@ def test_dashboard_sources_have_no_double_encoded_text() -> None:
         text = (root / name).read_text(encoding="utf-8")
         for marker in ("â€", "â”", "â†", "â‰", "Ã"):
             assert marker not in text, f"double-encoded text {marker!r} in {name}"
+
+
+def test_session_labels_describe_run_type_and_non_trading_sessions(fx) -> None:
+    with sqlite3.connect(fx["db"]) as connection:
+        connection.execute(
+            "INSERT INTO bot_runs (session_id, environment, timestamp_utc) "
+            "VALUES ('repair-20261016T120000Z-abc', 'paper', '2026-10-16T12:00:00+00:00')"
+        )
+    sessions = {s.key: s for s in discover_sessions(fx["logs"], fx["db"])}
+    repair = sessions["session:repair-20261016T120000Z-abc"]
+    assert repair.run_type == "local state repair, no trading"
+    assert "2026-10-16 08:00 ET" in repair.label and "no startup config" in repair.label
+    assert "config recorded" in sessions["session:sess-A"].label
+    pkg = _package(fx, "session:repair-20261016T120000Z-abc", QUESTION_EXPLAIN)
+    assert pkg.session["run_type"] == "local state repair, no trading"
+    assert any("not a trading session" in text for text in pkg.limitations)
+    from tradeos.ask.records import SessionRef
+
+    def ref(sid: str) -> SessionRef:
+        return SessionRef(f"session:{sid}", "bound", sid, (), None, None, 0, (), 0)
+
+    assert ref("live-20260807T011243Z-698ed063").run_type == "trading run (orders enabled)"
+    assert ref("paper-shadow-20260807T011243Z-1").run_type == "paper-shadow run (no submit)"
+    assert ref("reconcile-20260806T003516Z").run_type == "broker reconciliation, no trading"
