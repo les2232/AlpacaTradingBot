@@ -180,7 +180,13 @@ def _error_message(exc: Exception, settings: AskSettings) -> str:
         if isinstance(exc, openai.NotFoundError):
             return f"Model {settings.model!r} was not found for this API key. Set TRADEOS_ASK_MODEL to an available model."
         if isinstance(exc, openai.RateLimitError):
-            return "OpenAI rate limit or quota reached. Try again later."
+            if "insufficient_quota" in (getattr(exc, "code", None), getattr(exc, "type", None)):
+                return (
+                    "The OpenAI account for this API key has no remaining API credit (insufficient_quota). "
+                    "Add credit under Billing at platform.openai.com; API usage is billed separately from "
+                    "ChatGPT subscriptions."
+                )
+            return "OpenAI rate limit reached. Wait a minute and try again."
         if isinstance(exc, openai.APITimeoutError):
             return f"The model request timed out after {settings.timeout_seconds:.0f}s."
         if isinstance(exc, openai.APIConnectionError):

@@ -671,6 +671,8 @@ def _request() -> httpx.Request:
     [
         (openai.AuthenticationError(f"Incorrect API key provided: {API_KEY}", response=httpx.Response(401, request=_request()), body=None), "authentication failed"),
         (openai.RateLimitError("slow down", response=httpx.Response(429, request=_request()), body=None), "rate limit"),
+        (openai.RateLimitError("quota", response=httpx.Response(429, request=_request()),
+                               body={"code": "insufficient_quota", "type": "insufficient_quota"}), "no remaining API credit"),
         (openai.NotFoundError("no model", response=httpx.Response(404, request=_request()), body=None), "was not found"),
         (openai.InternalServerError("boom", response=httpx.Response(500, request=_request()), body=None), "HTTP 500"),
         (openai.APITimeoutError(request=_request()), "timed out"),
@@ -823,3 +825,20 @@ def test_session_labels_describe_run_type_and_non_trading_sessions(fx) -> None:
     assert ref("live-20260807T011243Z-698ed063").run_type == "trading run (orders enabled)"
     assert ref("paper-shadow-20260807T011243Z-1").run_type == "paper-shadow run (no submit)"
     assert ref("reconcile-20260806T003516Z").run_type == "broker reconciliation, no trading"
+
+
+def test_inspect_reports_session_sources_without_sensitive_values(fx) -> None:
+    from tradeos.ask.inspect import inspect_session
+
+    report = inspect_session("sess-A", fx["logs"], fx["db"])
+    assert report["startup_artifacts"][0]["valid_for_ask_tradeos"] is True
+    assert report["startup_artifacts"][0]["fields"]["strategy_mode"] == "mean_reversion"
+    assert report["log_records_by_day_and_stream"][DAY]["signals"] == 50
+    assert report["lifecycle_steps"][0]["stage"] == "startup.ready"
+    assert report["database_runs"][0]["runs"] == 3
+    assert f"{DAY}/startup_config.2026-10-15T13-30-00Z.json" in report["files_mentioning_session_id"]
+    text = json.dumps(report)
+    for forbidden in (SECRET_FINGERPRINT, "12345.67", "ord-1", "/home/operator", str(fx["root"])):
+        assert forbidden not in text
+    missing = inspect_session("does-not-exist", fx["logs"], fx["db"])
+    assert missing["startup_artifacts"] == [] and missing["log_records_by_day_and_stream"] == {}
