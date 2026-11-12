@@ -11,6 +11,10 @@ holds fallback numbers only, so the report says "comparison unavailable" with
 the validation reasons and omits every backtest-relative statement.  Observed
 metrics and absolute WARN thresholds are still reported.
 
+A valid baseline is compared per metric: only values backed by research or the
+live config (BACKTEST_SOURCE["metric_sources"]) are shown as expectations.
+Metrics still holding a DEFAULT_BACKTEST number are listed as not compared.
+
 Usage:
     python daily_report.py                      # today
     python daily_report.py --date 2026-04-09
@@ -470,6 +474,9 @@ def load_backtest_baseline(
         "effective_runtime_binding_errors": [],
         "validation_errors": [],
         "valid_for_comparison": False,
+        # Where each BACKTEST value came from: "research", "live_config" or
+        # "default" (the hard-coded DEFAULT_BACKTEST number).
+        "metric_sources": {key: "default" for key in DEFAULT_BACKTEST},
     }
 
     effective_binding_requested = any(
@@ -702,6 +709,8 @@ def load_backtest_baseline(
                     1,
                     int((6.5 * 60) / timeframe_minutes),
                 )
+                source["metric_sources"]["symbols"] = "live_config"
+                source["metric_sources"]["bars_per_day"] = "live_config"
 
     selected_context: dict[str, str | bool | int | float] | None = None
     selected_filters: dict[str, object] | None = None
@@ -968,7 +977,9 @@ def load_backtest_baseline(
         if research_valid:
             if base["symbols"] > 0:
                 base["signal_rate_per_symbol_per_day"] = trades_per_day_value / base["symbols"]
+                source["metric_sources"]["signal_rate_per_symbol_per_day"] = "research"
             base["win_rate"] = win_rate
+            source["metric_sources"]["win_rate"] = "research"
             source["research_metrics_used"] = True
             source["mode"] = "live_config+research" if source["mode"] == "live_config" else "research"
 
@@ -1097,9 +1108,30 @@ def baseline_comparison_status() -> dict[str, Any]:
     when the saved baseline is missing or fails validation.  Those fallback
     numbers are not an approved expectation, so every live-vs-backtest
     statement must be gated on this status rather than on ``BACKTEST`` alone.
+
+    Even a valid baseline only backs some metrics: research supplies the signal
+    rate and win rate, the live config supplies symbols and bars per day, and
+    the rest keep their ``DEFAULT_BACKTEST`` value.  ``comparable_metrics``
+    lists the metrics that may be compared; anything else, including a metric
+    whose source is missing or unrecognised, is treated as not backed.
     """
+    raw_sources = BACKTEST_SOURCE.get("metric_sources")
+    if not isinstance(raw_sources, dict):
+        raw_sources = {}
+    metric_sources = {
+        key: raw_sources[key] if raw_sources.get(key) in _BACKED_METRIC_SOURCES else "default"
+        for key in BACKTEST
+    }
     if BACKTEST_SOURCE.get("valid_for_comparison") is True:
-        return {"available": True, "status": "available", "reasons": []}
+        return {
+            "available": True,
+            "status": "available",
+            "reasons": [],
+            "metric_sources": metric_sources,
+            "comparable_metrics": [
+                key for key, origin in metric_sources.items() if origin != "default"
+            ],
+        }
     reasons = [
         str(item)
         for item in (BACKTEST_SOURCE.get("validation_errors") or [])
@@ -1109,7 +1141,35 @@ def baseline_comparison_status() -> dict[str, Any]:
         "available": False,
         "status": "unavailable",
         "reasons": reasons or ["baseline validation failed"],
+        "metric_sources": metric_sources,
+        "comparable_metrics": [],
     }
+
+
+_BACKED_METRIC_SOURCES = frozenset({"research", "live_config"})
+
+# Metric labels for the text report, in comparison-table order.
+_COMPARISON_LABELS: dict[str, str] = {
+    "signal_rate_per_symbol_per_day": "BUY signals/sym/day",
+    "win_rate": "Win rate",
+    "avg_hold_bars": "Avg hold (bars)",
+    "rejection_rate": "Rejection rate",
+    "avg_slippage_bps": "Avg slippage (bps)",
+}
+
+
+def _is_comparable(comparison: dict[str, Any], *metrics: str) -> bool:
+    """True only if every named metric is backed by a valid baseline."""
+    comparable = comparison.get("comparable_metrics") or []
+    return all(metric in comparable for metric in metrics)
+
+
+def _signal_rate_comparable(comparison: dict[str, Any]) -> bool:
+    # The full-day signal-rate estimate and session coverage are normalised by
+    # the baseline's symbols and bars per day, so all three must be backed.
+    return _is_comparable(
+        comparison, "signal_rate_per_symbol_per_day", "symbols", "bars_per_day"
+    )
 
 
 def _session_signal_rate(sig: dict) -> tuple[float | None, float | None, float | None]:
@@ -1331,11 +1391,11 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict, log_health: dic
                 f"(threshold {WARN['worst_slippage_bps']} bps) — check that fill for anomalies"
             )
 
-    # --- Signal rate (backtest-relative: only against a valid baseline) ---
+    # --- Signal rate (backtest-relative: only against a backed baseline) ---
     # Coverage and the full-day equivalent are both derived from the
     # baseline's symbols/bars_per_day, so they are suppressed with it.
     coverage_pct = full_day_signal_rate = None
-    if comparison["available"]:
+    if _signal_rate_comparable(comparison):
         _, coverage_pct, full_day_signal_rate = _session_signal_rate(sig)
     if full_day_signal_rate is not None:
         live_rate = full_day_signal_rate
@@ -1444,6 +1504,12 @@ def print_report(
 ) -> None:
     comparison = baseline_comparison_status()
     comparable = comparison["available"]
+    bars_comparable = _is_comparable(comparison, "symbols", "bars_per_day")
+    signal_comparable = _signal_rate_comparable(comparison)
+
+    def bt_note(metric: str, text: str) -> str:
+        return text if _is_comparable(comparison, metric) else ""
+
     n_sym     = BACKTEST["symbols"]
     bt_bars   = BACKTEST["bars_per_day"]
     divider   = "─" * 60
@@ -1464,7 +1530,7 @@ def print_report(
 
     # ── Data quality ──────────────────────────────────────────────
     section("DATA QUALITY")
-    if comparable:
+    if bars_comparable:
         expected_bars = n_sym * bt_bars
         row("Bars evaluated",        fmt(bar_q["evaluated"]),
             f"(expect ~{expected_bars} = {n_sym} syms × {bt_bars} bars)")
@@ -1494,7 +1560,7 @@ def print_report(
     buy_count  = sig["buy_signals"]
     live_per_sym = None
     row("Total bars evaluated",   fmt(total_eval))
-    if comparable:
+    if signal_comparable:
         bars_per_symbol_seen, coverage_pct, live_per_sym = _session_signal_rate(sig)
         if live_per_sym is None:
             live_per_sym = buy_count / n_sym if n_sym > 0 else 0
@@ -1514,7 +1580,7 @@ def print_report(
         row("SELL signals fired",     fmt(sig["sell_signals"]))
     rej_rate = sig["rejection_rate"]
     row("Rejection rate",         fmt(rej_rate, ".0%") if rej_rate is not None else "n/a",
-        f"(backtest ~{BACKTEST['rejection_rate']:.0%})" if comparable else "")
+        bt_note("rejection_rate", f"(backtest ~{BACKTEST['rejection_rate']:.0%})"))
 
     if sig["rejections"]:
         print()
@@ -1538,7 +1604,7 @@ def print_report(
     avg_slip = ex["avg_slippage_bps"]
     worst_slip = ex["worst_slippage_bps"]
     row("Avg slippage (bps)",      fmt(avg_slip, ".1f"),
-        f"(backtest ~{BACKTEST['avg_slippage_bps']:.1f} bps)" if comparable else "",
+        bt_note("avg_slippage_bps", f"(backtest ~{BACKTEST['avg_slippage_bps']:.1f} bps)"),
         flag=_flag(avg_slip or 0, WARN["avg_slippage_bps"], low_is_bad=False) if avg_slip else "")
     row("Worst slippage (bps)",    fmt(worst_slip, ".1f"),
         flag=_flag(worst_slip or 0, WARN["worst_slippage_bps"], low_is_bad=False) if worst_slip else "")
@@ -1569,7 +1635,7 @@ def print_report(
     if n_closed >= WARN["min_trades_for_win_rate"] and pos["win_rate"] is not None:
         wr = pos["win_rate"]
         row("Win rate",            fmt(wr, ".0%"),
-            f"(backtest {BACKTEST['win_rate']:.0%})" if comparable else "",
+            bt_note("win_rate", f"(backtest {BACKTEST['win_rate']:.0%})"),
             flag=_flag(wr, WARN["win_rate_low"], low_is_bad=True))
     elif n_closed > 0:
         row("Win rate",            f"{pos['win_rate']:.0%}" if pos["win_rate"] else "n/a",
@@ -1579,7 +1645,7 @@ def print_report(
 
     avg_hold = pos["avg_hold_bars"]
     row("Avg hold (bars)",         fmt(avg_hold, ".1f"),
-        f"(backtest {BACKTEST['avg_hold_bars']:.1f})" if comparable else "")
+        bt_note("avg_hold_bars", f"(backtest {BACKTEST['avg_hold_bars']:.1f})"))
     row("Avg PnL per trade ($)",   fmt(pos["avg_pnl_usd"], ".2f"))
     row("Total PnL today ($)",     fmt(pos["total_pnl_usd"], ".2f"))
 
@@ -1597,7 +1663,9 @@ def print_report(
     # ── Backtest comparison ───────────────────────────────────────
     section("vs BACKTEST COMPARISON")
     if comparable:
-        _print_backtest_comparison(sig, ex, pos, live_per_sym if buy_count > 0 else None)
+        _print_backtest_comparison(
+            comparison, sig, ex, pos, live_per_sym if buy_count > 0 else None
+        )
     else:
         print("  Comparison unavailable: baseline is not valid for comparison.")
         for item in comparison["reasons"]:
@@ -1614,10 +1682,22 @@ def print_report(
     print(f"\n{'═' * 60}\n")
 
 
-def _print_backtest_comparison(sig: dict, ex: dict, pos: dict, live_per_sym: float | None) -> None:
-    """Live-vs-backtest table.  Callers must check baseline_comparison_status()."""
-    print(f"  {'Metric':<32} {'Live':>10}  {'Backtest':>10}  {'Delta':>10}")
-    print(f"  {'─'*32} {'─'*10}  {'─'*10}  {'─'*10}")
+def _print_backtest_comparison(
+    comparison: dict[str, Any], sig: dict, ex: dict, pos: dict, live_per_sym: float | None
+) -> None:
+    """Live-vs-backtest table, limited to metrics a valid baseline backs."""
+    live_values: dict[str, tuple[Any, str, bool]] = {
+        "signal_rate_per_symbol_per_day": (live_per_sym, ".2f", False),
+        "win_rate":         (pos["win_rate"], ".0%", False),
+        "avg_hold_bars":    (pos["avg_hold_bars"], ".2f", False),
+        "rejection_rate":   (sig["rejection_rate"], ".0%", False),
+        "avg_slippage_bps": (ex["avg_slippage_bps"], ".2f", True),
+    }
+
+    def backed(metric: str) -> bool:
+        if metric == "signal_rate_per_symbol_per_day":
+            return _signal_rate_comparable(comparison)
+        return _is_comparable(comparison, metric)
 
     def compare_row(label: str, live: Any, bt: Any, fmt_s: str = ".2f", invert: bool = False) -> None:
         if live is None:
@@ -1632,13 +1712,20 @@ def _print_backtest_comparison(sig: dict, ex: dict, pos: dict, live_per_sym: flo
         bt_str = format(bt, fmt_s)
         print(f"  {label:<32} {live_str:>10}  {bt_str:>10}  {delta_str:>10}")
 
-    compare_row("BUY signals/sym/day",   live_per_sym,
-                BACKTEST["signal_rate_per_symbol_per_day"])
-    compare_row("Win rate",              pos["win_rate"], BACKTEST["win_rate"], ".0%")
-    compare_row("Avg hold (bars)",       pos["avg_hold_bars"], BACKTEST["avg_hold_bars"])
-    compare_row("Rejection rate",        sig["rejection_rate"], BACKTEST["rejection_rate"], ".0%")
-    compare_row("Avg slippage (bps)",    ex["avg_slippage_bps"], BACKTEST["avg_slippage_bps"],
-                invert=True)
+    shown = [metric for metric in _COMPARISON_LABELS if backed(metric)]
+    not_backed = [label for metric, label in _COMPARISON_LABELS.items() if metric not in shown]
+
+    if shown:
+        print(f"  {'Metric':<32} {'Live':>10}  {'Backtest':>10}  {'Delta':>10}")
+        print(f"  {'─'*32} {'─'*10}  {'─'*10}  {'─'*10}")
+        for metric in shown:
+            live, fmt_s, invert = live_values[metric]
+            compare_row(_COMPARISON_LABELS[metric], live, BACKTEST[metric], fmt_s, invert=invert)
+    if not_backed:
+        if shown:
+            print()
+        print("  Not compared (no research-backed expectation):")
+        print(f"    {', '.join(not_backed)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1656,11 +1743,12 @@ def build_json_output(
     log_health: dict | None = None,
 ) -> dict:
     comparison = baseline_comparison_status()
-    if comparison["available"]:
-        expected: dict[str, Any] = dict(BACKTEST)
-    else:
-        # Fail closed: never publish DEFAULT_BACKTEST fallbacks as expectations.
-        expected = {key: None for key in BACKTEST}
+    # Fail closed: never publish a DEFAULT_BACKTEST fallback as an expectation,
+    # whether the whole baseline is invalid or only that metric is unbacked.
+    expected: dict[str, Any] = {
+        key: (value if key in comparison["comparable_metrics"] else None)
+        for key, value in BACKTEST.items()
+    }
     return {
         "date":          report_date,
         "backtest_source": BACKTEST_SOURCE,
