@@ -43,7 +43,7 @@ from uuid import uuid4
 
 import pandas as pd
 from dataset_integrity import load_verified_manifest
-from daily_report import DEFAULT_BACKTEST, WARN
+from daily_report import WARN
 from dotenv import dotenv_values
 from research.experiment_log import log_experiment_run
 from tradeos.research_bundle import (
@@ -1316,7 +1316,9 @@ def build_drift_profile_payload(
         "metrics": {
             "buy_signal_rate_per_symbol_per_day": buy_rate,
             "sell_signal_rate_per_symbol_per_day": buy_rate,
-            "rejection_rate": float(DEFAULT_BACKTEST["rejection_rate"]),
+            # Policy threshold shared with the pointer-bound drift profile;
+            # no research artifact measures a rejection rate.
+            "rejection_rate": DRIFT_PROFILE_POLICY_V1.rejection_rate,
             "rejection_breakdown": None,
             "hybrid_branch_participation": hybrid_branch_participation,
             "avg_bar_age_s": float(WARN["avg_bar_age_s"]),
@@ -1325,7 +1327,7 @@ def build_drift_profile_payload(
         "metric_sources": {
             "buy_signal_rate_per_symbol_per_day": "best_row.trades_per_day / promoted symbol_count",
             "sell_signal_rate_per_symbol_per_day": "derived from long-only trades_per_day cadence",
-            "rejection_rate": "daily_report.DEFAULT_BACKTEST.rejection_rate",
+            "rejection_rate": DRIFT_PROFILE_POLICY_V1.metric_sources()["rejection_rate"],
             "rejection_breakdown": "not available from current research artifacts",
             "hybrid_branch_participation": (
                 "best_row branch share columns"
