@@ -283,6 +283,24 @@ _INVALID_BASELINE_REASONS = [
 ]
 
 
+# What load_backtest_baseline() records for a valid baseline: session shape
+# from the live config, signal rate and win rate from research, and nothing
+# else, because no research artifact carries hold time, rejection rate or
+# slippage.
+_VALID_METRIC_SOURCES: dict[str, str] = {
+    "symbols": "live_config",
+    "bars_per_day": "live_config",
+    "signal_rate_per_symbol_per_day": "research",
+    "win_rate": "research",
+    "avg_hold_bars": "unavailable",
+    "rejection_rate": "unavailable",
+    "avg_slippage_bps": "unavailable",
+}
+_ALL_UNAVAILABLE_SOURCES: dict[str, str] = {
+    key: "unavailable" for key in _VALID_METRIC_SOURCES
+}
+
+
 @pytest.fixture
 def valid_baseline(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     baseline = dict(_VALID_BASELINE)
@@ -290,7 +308,35 @@ def valid_baseline(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     monkeypatch.setattr(
         daily_report,
         "BACKTEST_SOURCE",
-        {"mode": "live_config+research", "validation_errors": [], "valid_for_comparison": True},
+        {
+            "mode": "live_config+research",
+            "validation_errors": [],
+            "valid_for_comparison": True,
+            "metric_sources": dict(_VALID_METRIC_SOURCES),
+        },
+    )
+    return baseline
+
+
+@pytest.fixture
+def fully_backed_baseline(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Hypothetical baseline where every metric is artifact-backed."""
+    baseline = dict(_VALID_BASELINE)
+    monkeypatch.setattr(daily_report, "BACKTEST", baseline)
+    monkeypatch.setattr(
+        daily_report,
+        "BACKTEST_SOURCE",
+        {
+            "mode": "live_config+research",
+            "validation_errors": [],
+            "valid_for_comparison": True,
+            "metric_sources": {
+                **_VALID_METRIC_SOURCES,
+                "avg_hold_bars": "research",
+                "rejection_rate": "research",
+                "avg_slippage_bps": "research",
+            },
+        },
     )
     return baseline
 
@@ -367,8 +413,22 @@ def test_detect_concerns_flags_high_signal_rate_against_valid_baseline(valid_bas
 def test_baseline_comparison_status_reflects_baseline_validity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(daily_report, "BACKTEST_SOURCE", {"valid_for_comparison": True, "validation_errors": []})
-    assert daily_report.baseline_comparison_status() == {"available": True, "status": "available", "reasons": []}
+    monkeypatch.setattr(daily_report, "BACKTEST", dict(_VALID_BASELINE))
+    monkeypatch.setattr(
+        daily_report,
+        "BACKTEST_SOURCE",
+        {
+            "valid_for_comparison": True,
+            "validation_errors": [],
+            "metric_sources": dict(_VALID_METRIC_SOURCES),
+        },
+    )
+    assert daily_report.baseline_comparison_status() == {
+        "available": True,
+        "status": "available",
+        "reasons": [],
+        "sources": _VALID_METRIC_SOURCES,
+    }
 
     for source in (
         {"valid_for_comparison": False, "validation_errors": []},
@@ -380,6 +440,7 @@ def test_baseline_comparison_status_reflects_baseline_validity(
             "available": False,
             "status": "unavailable",
             "reasons": ["baseline validation failed"],
+            "sources": _ALL_UNAVAILABLE_SOURCES,
         }
 
 
@@ -432,6 +493,7 @@ def test_build_json_output_nulls_expectations_when_baseline_invalid(invalid_base
         "available": False,
         "status": "unavailable",
         "reasons": _INVALID_BASELINE_REASONS,
+        "sources": _ALL_UNAVAILABLE_SOURCES,
     }
     assert set(output["backtest"]) == set(daily_report.DEFAULT_BACKTEST)
     assert all(value is None for value in output["backtest"].values())
@@ -448,8 +510,21 @@ def test_build_json_output_nulls_expectations_when_baseline_invalid(invalid_base
 def test_build_json_output_reports_expectations_when_baseline_valid(valid_baseline: dict) -> None:
     output = daily_report.build_json_output(*_report_args(_quiet_inputs()))
 
-    assert output["comparison"] == {"available": True, "status": "available", "reasons": []}
-    assert output["backtest"] == valid_baseline
+    assert output["comparison"] == {
+        "available": True,
+        "status": "available",
+        "reasons": [],
+        "sources": _VALID_METRIC_SOURCES,
+    }
+    assert output["backtest"] == {
+        "symbols": 15,
+        "bars_per_day": 26,
+        "signal_rate_per_symbol_per_day": 2.1,
+        "win_rate": 0.65,
+        "avg_hold_bars": None,
+        "rejection_rate": None,
+        "avg_slippage_bps": None,
+    }
     assert any("SIGNAL RATE LOW" in concern for concern in output["concerns"])
 
 
@@ -480,6 +555,280 @@ def test_print_report_shows_backtest_comparison_when_baseline_valid(
     assert "Session coverage" in out
     assert "Backtest" in out and "BUY signals/sym/day" in out
     assert "Comparison unavailable" not in out
+
+
+def test_baseline_comparison_status_fails_closed_without_metric_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daily_report, "BACKTEST", dict(_VALID_BASELINE))
+    for metric_sources in (
+        None,
+        "research",
+        {key: "defaults" for key in _VALID_METRIC_SOURCES},
+        {key: True for key in _VALID_METRIC_SOURCES},
+    ):
+        source: dict[str, object] = {
+            "valid_for_comparison": True,
+            "validation_errors": [],
+        }
+        if metric_sources is not None:
+            source["metric_sources"] = metric_sources
+        monkeypatch.setattr(daily_report, "BACKTEST_SOURCE", source)
+
+        comparison = daily_report.baseline_comparison_status()
+
+        assert comparison["available"] is True
+        assert comparison["sources"] == _ALL_UNAVAILABLE_SOURCES
+        output = daily_report.build_json_output(*_report_args(_quiet_inputs()))
+        assert all(value is None for value in output["backtest"].values())
+
+
+def test_print_report_omits_non_research_backed_expectations_when_baseline_valid(
+    valid_baseline: dict, capsys: pytest.CaptureFixture[str]
+) -> None:
+    daily_report.print_report(*_report_args(_noisy_inputs()))
+    out = capsys.readouterr().out
+
+    # Research / live-config backed expectations are still shown ...
+    assert "(expect ~390 = 15 syms × 26 bars)" in out
+    assert "bt=2.1" in out
+    assert "(backtest 65%)" in out
+    assert "BUY signals/sym/day" in out
+    # ... but DEFAULT_BACKTEST placeholders never are.
+    for placeholder in ("(backtest ~72%)", "(backtest 4.2)", "(backtest ~5.0 bps)", "4.20", "72%", "5.00"):
+        assert placeholder not in out
+    comparison_table = out.split("vs BACKTEST COMPARISON", 1)[1].split("CONCERNS", 1)[0]
+    table_rows = [
+        line.strip().split("  ")[0]
+        for line in comparison_table.splitlines()
+        if line.startswith("  ") and not line.strip().startswith(("Metric", "─", "Not research"))
+    ]
+    assert "Avg hold (bars)" not in table_rows
+    assert "Rejection rate" not in table_rows
+    assert "Avg slippage (bps)" not in table_rows
+    assert (
+        "Not research-backed (no expectation): Avg hold (bars), Rejection rate, "
+        "Avg slippage (bps)"
+    ) in comparison_table
+
+
+def test_build_json_output_publishes_every_artifact_backed_expectation(
+    fully_backed_baseline: dict,
+) -> None:
+    output = daily_report.build_json_output(*_report_args(_noisy_inputs()))
+
+    assert output["comparison"]["sources"]["rejection_rate"] == "research"
+    assert output["backtest"] == fully_backed_baseline
+
+
+def test_print_report_compares_every_metric_when_fully_backed(
+    fully_backed_baseline: dict, capsys: pytest.CaptureFixture[str]
+) -> None:
+    daily_report.print_report(*_report_args(_noisy_inputs()))
+    out = capsys.readouterr().out
+
+    assert "(backtest ~72%)" in out
+    assert "(backtest 4.2)" in out
+    assert "(backtest ~5.0 bps)" in out
+    assert "Not research-backed" not in out
+    # The comparison table keeps its original five rows.
+    assert "4.20" in out and "72%" in out and "5.00" in out
+    assert daily_report.baseline_comparison_status()["sources"]["avg_hold_bars"] == "research"
+
+
+def test_detect_concerns_requires_research_signal_rate_even_when_baseline_valid(
+    valid_baseline: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sources = dict(_VALID_METRIC_SOURCES, signal_rate_per_symbol_per_day="unavailable")
+    monkeypatch.setitem(daily_report.BACKTEST_SOURCE, "metric_sources", sources)
+
+    concerns = daily_report.detect_concerns(*_quiet_inputs())
+
+    assert not any("SIGNAL RATE" in concern for concern in concerns)
+    assert not any("PARTIAL SESSION" in concern for concern in concerns)
+    assert daily_report.build_json_output(*_report_args(_quiet_inputs()))["backtest"][
+        "signal_rate_per_symbol_per_day"
+    ] is None
+
+
+def test_load_backtest_baseline_records_per_metric_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _write_approved_baseline_artifacts(tmp_path)
+    _mock_committed_promotion_pointer(monkeypatch, tmp_path)
+
+    baseline, source = daily_report.load_backtest_baseline(tmp_path)
+
+    assert source["valid_for_comparison"] is True
+    assert source["metric_sources"] == _VALID_METRIC_SOURCES
+    # Non-research-backed metrics keep their placeholder for shape
+    # compatibility, but are marked unavailable.
+    for key in ("avg_hold_bars", "rejection_rate", "avg_slippage_bps"):
+        assert baseline[key] == daily_report.DEFAULT_BACKTEST[key]
+        assert source["metric_sources"][key] == "unavailable"
+
+
+def test_load_backtest_baseline_marks_research_metrics_unavailable_when_invalid(
+    tmp_path: Path,
+) -> None:
+    # Approved artifacts, but no committed promotion pointer: invalid.
+    _write_approved_baseline_artifacts(tmp_path)
+
+    baseline, source = daily_report.load_backtest_baseline(tmp_path)
+
+    assert source["valid_for_comparison"] is False
+    # The live config parsed (BACKTEST["symbols"] is its count), but nothing
+    # from an invalid baseline is a usable expectation.
+    assert baseline["symbols"] == 3
+    assert source["metric_sources"] == _ALL_UNAVAILABLE_SOURCES
+    assert baseline["win_rate"] == daily_report.DEFAULT_BACKTEST["win_rate"]
+
+
+def test_load_backtest_baseline_marks_every_metric_unavailable_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    baseline, source = daily_report.load_backtest_baseline(tmp_path)
+
+    assert source["valid_for_comparison"] is False
+    assert source["metric_sources"] == _ALL_UNAVAILABLE_SOURCES
+    assert baseline == daily_report.DEFAULT_BACKTEST
+
+
+_LONG_FIELD_LIST_REASONS = [
+    "promotion pointer is missing or invalid (Promotion pointer is unreadable.)",
+    "live runtime is missing promoted fields ("
+    + ", ".join(daily_report.PROMOTED_RUNTIME_FIELDS)
+    + ")",
+    "research baseline is missing promoted fields ("
+    + ", ".join(daily_report.PROMOTED_RUNTIME_FIELDS[:-1])
+    + ")",
+]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        # Generic fallback: wording-agnostic preview.  The "is missing N
+        # promoted fields" form is recorded by the producer, not parsed.
+        (
+            "live runtime is missing promoted fields (a, b, c, d, e, f, g)",
+            "live runtime is missing promoted fields (a, b, c, and 4 more)",
+        ),
+        # Short lists stay verbatim.
+        (
+            "live runtime is missing promoted fields (a, b)",
+            "live runtime is missing promoted fields (a, b)",
+        ),
+        (
+            "research baseline symbols are missing or invalid",
+            "research baseline symbols are missing or invalid",
+        ),
+        # "missing or invalid" is not a field list: keep a preview, never a
+        # misleading "is missing N or invalid".
+        (
+            "promotion pointer is missing or invalid (a, b, c, d, e, f)",
+            "promotion pointer is missing or invalid (a, b, c, and 3 more)",
+        ),
+        # Semicolon lists are split at the top level only, so values that
+        # contain commas or brackets stay intact.
+        (
+            "research config does not match live runtime ("
+            "a: live=[1, 2] research=[3]; b: live=1 research=2; "
+            "c: live=1 research=2; d: live=1 research=2; "
+            "e: live=1 research=2; f: live=1 research=2)",
+            "research config does not match live runtime ("
+            "a: live=[1, 2] research=[3]; b: live=1 research=2; "
+            "c: live=1 research=2; and 3 more)",
+        ),
+        # Nested parentheticals are summarized from the inside.
+        (
+            "runtime execution context is missing or invalid (selected runtime "
+            "is missing promoted fields (a, b, c, d, e, f))",
+            "runtime execution context is missing or invalid (selected runtime "
+            "is missing promoted fields (a, b, c, and 3 more))",
+        ),
+        # Unbalanced text is left alone.
+        ("broken (a, b, c, d, e, f", "broken (a, b, c, d, e, f"),
+    ],
+)
+def test_summarize_validation_reason(reason: str, expected: str) -> None:
+    assert daily_report.summarize_validation_reason(reason) == expected
+
+
+def test_baseline_invalid_concern_summarizes_long_field_lists(
+    invalid_baseline: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    n_fields = len(daily_report.PROMOTED_RUNTIME_FIELDS)
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE,
+        "validation_errors",
+        list(_LONG_FIELD_LIST_REASONS),
+    )
+    # As load_backtest_baseline() records them for these two list errors.
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE,
+        "validation_error_summaries",
+        {
+            _LONG_FIELD_LIST_REASONS[1]: f"live runtime is missing {n_fields} promoted fields",
+            _LONG_FIELD_LIST_REASONS[2]: (
+                f"research baseline is missing {n_fields - 1} promoted fields"
+            ),
+        },
+    )
+    assert n_fields > 40
+
+    concerns = daily_report.detect_concerns(*_quiet_inputs())
+
+    assert concerns == [
+        "BASELINE INVALID: promotion pointer is missing or invalid "
+        "(Promotion pointer is unreadable.); "
+        f"live runtime is missing {n_fields} promoted fields; "
+        f"research baseline is missing {n_fields - 1} promoted fields"
+        " — comparison unavailable; backtest-relative checks "
+        "(signal rate, session coverage) suppressed"
+    ]
+
+    daily_report.print_report(*_report_args(_quiet_inputs()))
+    out = capsys.readouterr().out
+    assert f"    - live runtime is missing {n_fields} promoted fields\n" in out
+    assert "long lists summarized; full text in --json comparison.reasons" in out
+    for field in daily_report.PROMOTED_RUNTIME_FIELDS:
+        assert f"{field}," not in out
+
+    # The JSON keeps every field name.
+    output = daily_report.build_json_output(*_report_args(_quiet_inputs()))
+    assert output["comparison"]["reasons"] == _LONG_FIELD_LIST_REASONS
+    assert output["concerns"] == concerns
+
+
+def test_baseline_reason_summary_leaves_valid_and_short_invalid_reports_alone(
+    valid_baseline: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    daily_report.print_report(*_report_args(_quiet_inputs()))
+    valid_out = capsys.readouterr().out
+    assert "BASELINE INVALID" not in valid_out
+    assert "long lists summarized" not in valid_out
+    assert "Baseline validation" not in valid_out
+
+    # Short invalid reasons are printed verbatim without the summary hint.
+    monkeypatch.setitem(daily_report.BACKTEST_SOURCE, "valid_for_comparison", False)
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE, "validation_errors", list(_INVALID_BASELINE_REASONS)
+    )
+    daily_report.print_report(*_report_args(_quiet_inputs()))
+    invalid_out = capsys.readouterr().out
+    for reason in _INVALID_BASELINE_REASONS:
+        assert f"    - {reason}\n" in invalid_out
+    assert "long lists summarized" not in invalid_out
+    assert [
+        daily_report.summarize_validation_reason(reason)
+        for reason in _INVALID_BASELINE_REASONS
+    ] == _INVALID_BASELINE_REASONS
 
 
 def test_load_backtest_baseline_uses_pointer_bound_live_and_research_artifacts(
@@ -1422,3 +1771,303 @@ def test_load_backtest_baseline_rejects_runtime_config_outside_repository() -> N
     finally:
         shutil.rmtree(base_dir, ignore_errors=True)
         outside_config.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("baseline_fixture", ["valid_baseline", "invalid_baseline"])
+@pytest.mark.parametrize(
+    ("win_rate", "expected_value"),
+    [(0.0, "0%"), (1 / 3, "33%"), (None, "n/a")],
+)
+def test_print_report_shows_small_sample_win_rate_including_zero(
+    baseline_fixture: str,
+    win_rate: float | None,
+    expected_value: str,
+    request: pytest.FixtureRequest,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request.getfixturevalue(baseline_fixture)
+    bar_q, sig, ex, _pos, log_health = _quiet_inputs()
+    # Fewer closed trades than WARN["min_trades_for_win_rate"].
+    pos = {
+        "opened": 3, "closed": 3, "win_rate": win_rate, "avg_hold_bars": 2.0,
+        "avg_pnl_usd": -1.0, "exit_reasons": {"stop_loss": 3}, "total_pnl_usd": -3.0,
+    }
+
+    daily_report.print_report(*_report_args((bar_q, sig, ex, pos, log_health)))
+    out = capsys.readouterr().out
+
+    (win_rate_line,) = [
+        line for line in out.splitlines() if line.strip().startswith("Win rate ")
+        and "trade(s)" in line
+    ]
+    assert win_rate_line.split()[2] == expected_value
+    assert "(only 3 trade(s) — not meaningful yet)" in win_rate_line
+
+
+def _full_session_sig(buy_signals: int) -> dict:
+    # 15 symbols x 26 bars: a full session, so no PARTIAL SESSION concern.
+    return {
+        "total_evaluated": 390,
+        "buy_signals": buy_signals,
+        "sell_signals": 0,
+        "hold_count": 390 - buy_signals,
+        "by_symbol": {},
+        "rejections": {},
+        "rejection_rate": (390 - buy_signals) / 390,
+    }
+
+
+@pytest.mark.parametrize("buy_signals", [30, 0])
+def test_zero_research_signal_rate_never_reports_signal_rate_low(
+    valid_baseline: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    buy_signals: int,
+) -> None:
+    valid_baseline["signal_rate_per_symbol_per_day"] = 0.0
+    bar_q, _sig, ex, pos, log_health = _quiet_inputs()
+    sig = _full_session_sig(buy_signals)
+
+    concerns = daily_report.detect_concerns(bar_q, sig, ex, pos, log_health)
+
+    assert not any("SIGNAL RATE LOW" in concern for concern in concerns)
+    signal_concerns = [c for c in concerns if c.startswith("SIGNAL RATE")]
+    if buy_signals:
+        # Live 2.0/symbol/day is above a zero research rate, never below it.
+        assert signal_concerns == [
+            "SIGNAL RATE HIGH: 2.0/symbol/day vs backtest 0.0 (research expected "
+            "no BUY signals) — filter may not be applying correctly in live"
+        ]
+    else:
+        assert signal_concerns == []
+
+    daily_report.print_report(
+        "2026-04-16", bar_q, sig, ex,
+        {"kill_switch_triggered": False, "buy_blocks_by_reason": {}, "sell_blocks_by_reason": {}},
+        pos, concerns, log_health,
+    )
+    out = capsys.readouterr().out
+    (buy_row,) = [line for line in out.splitlines() if "BUY signals fired" in line]
+    assert "bt=0.0  ratio=n/a" in buy_row
+    assert "[WARN]" not in buy_row
+    assert "ratio=0%" not in out
+
+    # Invalid baseline: the zero rate is a placeholder and is never compared.
+    monkeypatch.setitem(daily_report.BACKTEST_SOURCE, "valid_for_comparison", False)
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE, "validation_errors", list(_INVALID_BASELINE_REASONS)
+    )
+    invalid_concerns = daily_report.detect_concerns(bar_q, sig, ex, pos, log_health)
+    assert invalid_concerns[0].startswith("BASELINE INVALID: ")
+    assert not any(c.startswith("SIGNAL RATE") for c in invalid_concerns)
+
+
+
+@pytest.mark.parametrize(
+    ("research_win_rate", "expected_ratio", "expected_text"),
+    [(1.0, 0.01, "(backtest 1%)"), (0.5, 0.005, "(backtest 0%)")],
+)
+def test_research_win_rate_is_always_read_as_a_percent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    research_win_rate: float,
+    expected_ratio: float,
+    expected_text: str,
+) -> None:
+    _write_approved_baseline_artifacts(tmp_path)
+    research_path = tmp_path / "results" / "best_config_latest.json"
+    research = json.loads(research_path.read_text(encoding="utf-8"))
+    research["performance"]["win_rate"] = research_win_rate  # percent, 0-100
+    research_path.write_text(json.dumps(research), encoding="utf-8")
+
+    # Without a committed promotion the research number is never used.
+    invalid_baseline, invalid_source = daily_report.load_backtest_baseline(tmp_path)
+    assert invalid_source["valid_for_comparison"] is False
+    assert invalid_baseline["win_rate"] == daily_report.DEFAULT_BACKTEST["win_rate"]
+    assert invalid_source["metric_sources"]["win_rate"] == "unavailable"
+
+    # With a valid promotion, 1.0 means 1%, not 100%.
+    _mock_committed_promotion_pointer(monkeypatch, tmp_path)
+    baseline, source = daily_report.load_backtest_baseline(tmp_path)
+    assert source["valid_for_comparison"] is True
+    assert baseline["win_rate"] == expected_ratio
+
+    monkeypatch.setattr(daily_report, "BACKTEST", baseline)
+    monkeypatch.setattr(daily_report, "BACKTEST_SOURCE", source)
+    daily_report.print_report(*_report_args(_noisy_inputs()))  # 6 closed trades
+    out = capsys.readouterr().out
+    (win_rate_row,) = [
+        line for line in out.splitlines()
+        if line.strip().startswith("Win rate ") and "backtest" in line
+    ]
+    assert expected_text in win_rate_row
+    assert "(backtest 100%)" not in out and "(backtest 50%)" not in out
+    output = daily_report.build_json_output(*_report_args(_noisy_inputs()))
+    assert output["backtest"]["win_rate"] == expected_ratio
+
+
+@pytest.mark.parametrize("with_pointer", [True, False])
+def test_json_backtest_source_metric_sources_match_comparison_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    with_pointer: bool,
+) -> None:
+    # Approved artifacts whose live config parses; without a committed
+    # promotion pointer the baseline is invalid.
+    _write_approved_baseline_artifacts(tmp_path)
+    if with_pointer:
+        _mock_committed_promotion_pointer(monkeypatch, tmp_path)
+    baseline, source = daily_report.load_backtest_baseline(tmp_path)
+    assert source["valid_for_comparison"] is with_pointer
+    monkeypatch.setattr(daily_report, "BACKTEST", baseline)
+    monkeypatch.setattr(daily_report, "BACKTEST_SOURCE", source)
+
+    output = json.loads(
+        json.dumps(
+            daily_report.build_json_output(*_report_args(_quiet_inputs())),
+            default=str,
+        )
+    )
+
+    assert output["backtest_source"]["metric_sources"] == output["comparison"]["sources"]
+    if with_pointer:
+        assert output["comparison"]["sources"] == _VALID_METRIC_SOURCES
+        assert output["backtest"]["symbols"] == 3
+    else:
+        assert output["comparison"]["sources"] == _ALL_UNAVAILABLE_SOURCES
+        assert all(value is None for value in output["backtest"].values())
+
+
+def _write_live_and_research(
+    base_dir: Path,
+    live_runtime: dict[str, object],
+    research_runtime: dict[str, object],
+) -> None:
+    (base_dir / "config").mkdir(parents=True, exist_ok=True)
+    (base_dir / "results").mkdir(parents=True, exist_ok=True)
+    (base_dir / "config" / "live_config.json").write_text(
+        json.dumps(
+            {
+                "source": {"approved": True, "rejection_reasons": []},
+                "runtime": live_runtime,
+            }
+        ),
+        encoding="utf-8",
+    )
+    research_config = _research_config(research_runtime)
+    (base_dir / "results" / "best_config_latest.json").write_text(
+        json.dumps(
+            {
+                "approved": True,
+                "rejection_reasons": [],
+                "config": research_config,
+                "canonical_strategy_contract": _canonical_research_contract(research_config),
+                "performance": {"trades_per_day": 6.0, "win_rate": 75.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_load_backtest_baseline_records_summaries_for_missing_field_lists(
+    tmp_path: Path,
+) -> None:
+    runtime = _complete_runtime()
+    live_runtime = dict(runtime)
+    dropped_live = list(daily_report.PROMOTED_RUNTIME_FIELDS[:7])
+    for key in dropped_live:
+        live_runtime.pop(key, None)
+    _write_live_and_research(tmp_path, live_runtime, runtime)
+    research_path = tmp_path / "results" / "best_config_latest.json"
+    research = json.loads(research_path.read_text(encoding="utf-8"))
+    for key in daily_report.PROMOTED_RUNTIME_FIELDS[:9]:
+        research["config"].pop(key, None)
+    research_path.write_text(json.dumps(research), encoding="utf-8")
+
+    _baseline, source = daily_report.load_backtest_baseline(tmp_path)
+
+    summaries = source["validation_error_summaries"]
+    live_error = next(e for e in source["validation_errors"] if e.startswith("live runtime is missing"))
+    research_error = next(
+        e for e in source["validation_errors"] if e.startswith("research baseline is missing")
+    )
+    # Full text keeps every name; the summary comes from the producer's count.
+    assert all(key in live_error for key in dropped_live)
+    assert summaries[live_error] == "live runtime is missing 7 promoted fields"
+    assert summaries[research_error] == "research baseline is missing 9 promoted fields"
+
+
+def test_load_backtest_baseline_records_summaries_for_config_and_symbol_mismatch(
+    tmp_path: Path,
+) -> None:
+    live_symbols = ["AMD", "MSFT", "TSLA", "NVDA", "AAPL", "GOOG", "META"]
+    research_symbols = ["AMD", "MSFT", "TSLA", "NVDA", "AAPL", "AMZN", "NFLX"]
+    live_runtime = _complete_runtime(symbols=live_symbols)
+    research_runtime = _complete_runtime(
+        symbols=research_symbols,
+        sma_bars=25,
+        atr_multiple=1.5,
+        vwap_z_entry_threshold=2.0,
+        vwap_z_stop_atr_multiple=2.5,
+        min_atr_percentile=30.0,
+        max_adx_threshold=30.0,
+        trend_pullback_min_adx=25.0,
+    )
+    _write_live_and_research(tmp_path, live_runtime, research_runtime)
+
+    _baseline, source = daily_report.load_backtest_baseline(tmp_path)
+
+    summaries = source["validation_error_summaries"]
+    symbol_error = next(
+        e for e in source["validation_errors"] if e.startswith("research symbols do not match")
+    )
+    config_error = next(
+        e for e in source["validation_errors"] if e.startswith("research config does not match")
+    )
+    assert summaries[symbol_error] == (
+        "research symbols do not match live runtime "
+        "(live has 7 symbols, research has 7; 4 not in both)"
+    )
+    # 7 changed parameters, plus symbol_strategy_modes because the symbols differ.
+    assert summaries[config_error] == (
+        "research config does not match live runtime (8 fields differ: "
+        "sma_bars, symbol_strategy_modes, atr_multiple, and 5 more)"
+    )
+
+
+def test_short_validation_lists_record_no_summary(tmp_path: Path) -> None:
+    runtime = _complete_runtime()
+    live_runtime = dict(runtime)
+    live_runtime.pop("sma_bars")
+    _write_live_and_research(tmp_path, live_runtime, runtime)
+
+    _baseline, source = daily_report.load_backtest_baseline(tmp_path)
+
+    assert "live runtime is missing promoted fields (sma_bars)" in source["validation_errors"]
+    assert source["validation_error_summaries"] == {}
+
+
+def test_report_uses_recorded_summary_regardless_of_error_wording(
+    invalid_baseline: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fields = ", ".join(daily_report.PROMOTED_RUNTIME_FIELDS)
+    # Reworded error text: no "is missing", so parsing could not count it.
+    reworded = f"live runtime lacks promoted fields ({fields})"
+    summary = f"live runtime lacks {len(daily_report.PROMOTED_RUNTIME_FIELDS)} promoted fields"
+    monkeypatch.setitem(daily_report.BACKTEST_SOURCE, "validation_errors", [reworded])
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE, "validation_error_summaries", {reworded: summary}
+    )
+
+    concerns = daily_report.detect_concerns(*_quiet_inputs())
+    daily_report.print_report(*_report_args(_quiet_inputs()))
+    out = capsys.readouterr().out
+    output = daily_report.build_json_output(*_report_args(_quiet_inputs()))
+
+    assert concerns[0].startswith(f"BASELINE INVALID: {summary} — comparison unavailable")
+    assert f"    - {summary}\n" in out
+    assert "and 4" not in out  # no generic preview of the reworded text
+    assert output["comparison"]["reasons"] == [reworded]

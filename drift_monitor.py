@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from daily_report import DEFAULT_BACKTEST, WARN, load_backtest_baseline
-from tradeos.research_bundle import load_verified_promotion_pointer
+from daily_report import load_backtest_baseline, validation_reason_summaries
+from tradeos.research_bundle import DRIFT_PROFILE_POLICY_V1, load_verified_promotion_pointer
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,9 @@ class BaselineProfile:
     stale_bar_rate: float | None
     trade_count_per_day: float | None
     win_rate: float | None
+    # (full validation error, short summary) pairs recorded by the code that
+    # built each long-list error; see daily_report._record_list_error.
+    validation_error_summaries: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -272,8 +275,9 @@ def _load_verified_drift_overlay(
         or baseline_buy_rate is None
         or baseline_win_rate is None
         or trades_per_day / symbol_count != baseline_buy_rate
-        or (overlay_win_rate / 100.0 if overlay_win_rate > 1.0 else overlay_win_rate)
-        != baseline_win_rate
+        # performance.win_rate is a research percent (0-100), never a fraction.
+        or not 0.0 <= overlay_win_rate <= 100.0
+        or overlay_win_rate / 100.0 != baseline_win_rate
     ):
         raise ValueError("drift projection performance contradicts the daily baseline")
 
@@ -289,13 +293,16 @@ def _load_verified_drift_overlay(
         metrics.get("rejection_rate"),
         field="metrics.rejection_rate",
     )
-    baseline_rejection_rate = _safe_float(baseline.get("rejection_rate"))
     if (
         overlay_buy_rate != baseline_buy_rate
         or overlay_sell_rate != baseline_buy_rate
-        or overlay_rejection_rate != baseline_rejection_rate
     ):
         raise ValueError("drift projection metrics contradict the daily baseline")
+    # The daily baseline has no research-backed rejection rate (its BACKTEST
+    # value is a DEFAULT_BACKTEST placeholder), so the bound drift profile is
+    # pinned to the versioned policy its producer writes instead.
+    if overlay_rejection_rate != DRIFT_PROFILE_POLICY_V1.rejection_rate:
+        raise ValueError("drift projection rejection rate does not match drift policy v1")
     avg_bar_age_s = _strict_finite_number(
         metrics.get("avg_bar_age_s"),
         field="metrics.avg_bar_age_s",
@@ -330,6 +337,12 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
     validation_errors = [
         str(item) for item in source.get("validation_errors", []) if str(item)
     ]
+    raw_summaries = source.get("validation_error_summaries")
+    error_summaries = tuple(
+        (error, summary)
+        for error, summary in (raw_summaries.items() if isinstance(raw_summaries, dict) else ())
+        if isinstance(error, str) and isinstance(summary, str) and summary
+    )
     overlay: dict[str, Any] | None = None
     if source.get("valid_for_comparison") is True:
         try:
@@ -340,60 +353,67 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
                 f"pointer-bound drift profile is missing or invalid ({exc})"
             )
 
-    strategy_mode: str | None = None
+    source_label = str(source.get("mode", "defaults"))
+    if source.get("valid_for_comparison") is not True or not isinstance(overlay, dict):
+        # Fail closed: an invalid baseline's numbers are DEFAULT_BACKTEST
+        # placeholders (or unvalidated live/research values).  Carry none of
+        # them, so neither drift expectations nor live per-symbol/day rates
+        # normalized by placeholder symbols/bars_per_day can reach the panel.
+        return BaselineProfile(
+            source_label=source_label,
+            valid_for_comparison=False,
+            validation_errors=tuple(validation_errors),
+            strategy_mode=None,
+            symbols=None,
+            bars_per_day=None,
+            buy_signal_rate_per_symbol_per_day=None,
+            sell_signal_rate_per_symbol_per_day=None,
+            rejection_rate=None,
+            rejection_breakdown=(),
+            hybrid_branch_participation=(),
+            avg_bar_age_s=None,
+            stale_bar_rate=None,
+            trade_count_per_day=None,
+            win_rate=None,
+            validation_error_summaries=error_summaries,
+        )
 
-    rejection_breakdown: tuple[tuple[str, float], ...] = ()
-    hybrid_branch_participation: tuple[tuple[str, float], ...] = ()
-    avg_bar_age_s = float(WARN["avg_bar_age_s"])
-    stale_bar_rate = 0.0
+    # Valid: the daily baseline and the pointer-bound drift overlay were both
+    # verified, and _load_verified_drift_overlay() checked every field below.
+    context = overlay["context"]
+    metrics = overlay["metrics"]
     buy_rate = _safe_float(baseline.get("signal_rate_per_symbol_per_day"))
-    sell_rate = buy_rate
     symbol_count = _safe_int(baseline.get("symbols"))
     trade_count_per_day = (
         buy_rate * symbol_count
         if buy_rate is not None and symbol_count is not None and symbol_count > 0
         else None
     )
-    win_rate = _safe_float(baseline.get("win_rate"))
-
-    if isinstance(overlay, dict):
-        metrics = overlay.get("metrics")
-        context = overlay.get("context")
-        if isinstance(context, dict):
-            strategy_mode = str(context["strategy_mode"])
-        if isinstance(metrics, dict):
-            sell_rate = _safe_float(metrics["sell_signal_rate_per_symbol_per_day"])
-            rejection_breakdown = _validated_mix(
-                metrics.get("rejection_breakdown"),
-                field="rejection_breakdown",
-            )
-            hybrid_branch_participation = _validated_mix(
-                metrics.get("hybrid_branch_participation"),
-                field="hybrid_branch_participation",
-            )
-            avg_bar_age_s = _safe_float(metrics["avg_bar_age_s"])
-            stale_bar_rate = _safe_float(metrics["stale_bar_rate"])
-
-    source_parts = [str(source.get("mode", "defaults"))]
-    if overlay is not None:
-        source_parts.append("pointer_drift_profile")
-
     return BaselineProfile(
-        source_label="+".join(source_parts),
-        valid_for_comparison=source.get("valid_for_comparison") is True,
+        source_label=f"{source_label}+pointer_drift_profile",
+        valid_for_comparison=True,
         validation_errors=tuple(validation_errors),
-        strategy_mode=strategy_mode,
-        symbols=_safe_int(baseline.get("symbols")),
+        strategy_mode=str(context["strategy_mode"]),
+        symbols=symbol_count,
         bars_per_day=_safe_int(baseline.get("bars_per_day")),
         buy_signal_rate_per_symbol_per_day=buy_rate,
-        sell_signal_rate_per_symbol_per_day=sell_rate,
-        rejection_rate=_safe_float(baseline.get("rejection_rate")),
-        rejection_breakdown=rejection_breakdown,
-        hybrid_branch_participation=hybrid_branch_participation,
-        avg_bar_age_s=avg_bar_age_s,
-        stale_bar_rate=stale_bar_rate,
+        sell_signal_rate_per_symbol_per_day=_safe_float(
+            metrics["sell_signal_rate_per_symbol_per_day"]
+        ),
+        rejection_rate=_safe_float(metrics["rejection_rate"]),
+        rejection_breakdown=_validated_mix(
+            metrics.get("rejection_breakdown"),
+            field="rejection_breakdown",
+        ),
+        hybrid_branch_participation=_validated_mix(
+            metrics.get("hybrid_branch_participation"),
+            field="hybrid_branch_participation",
+        ),
+        avg_bar_age_s=_safe_float(metrics["avg_bar_age_s"]),
+        stale_bar_rate=_safe_float(metrics["stale_bar_rate"]),
         trade_count_per_day=trade_count_per_day,
-        win_rate=win_rate,
+        win_rate=_safe_float(baseline.get("win_rate")),
+        validation_error_summaries=error_summaries,
     )
 
 
@@ -570,15 +590,42 @@ def _mix_to_dict(items: tuple[tuple[str, float], ...]) -> dict[str, float]:
     return {key: value for key, value in items}
 
 
+# The rejection_rate_high alert fires when the live rejection rate exceeds the
+# drift policy rate by at least this many points (warn), escalating to err at
+# REJECTION_RATE_ERR_MARGIN.
+REJECTION_RATE_WARN_MARGIN = 0.12
+REJECTION_RATE_ERR_MARGIN = 0.20
+
+
 def _severity_for_ratio(delta_ratio: float) -> str:
     return "err" if delta_ratio >= 0.6 else "warn"
+
+
+def baseline_validation_summary(
+    validation_errors: tuple[str, ...] | list[str],
+    fallback: str = "baseline validation failed",
+    summaries: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """One readable line for operator-facing drift output.
+
+    Long lists use the summary recorded by the code that built the error
+    (``summaries``, e.g. "live runtime is missing 38 promoted fields"), else
+    daily_report's generic fallback.  BaselineProfile.validation_errors keeps
+    the full text.
+    """
+    return "; ".join(
+        validation_reason_summaries(list(validation_errors), dict(summaries))
+    ) or fallback
 
 
 def evaluate_drift(baseline: BaselineProfile, live: LiveMetrics) -> tuple[DriftAlert, ...]:
     alerts: list[DriftAlert] = []
 
     if not baseline.valid_for_comparison:
-        detail = "; ".join(baseline.validation_errors) or "baseline validation failed"
+        detail = baseline_validation_summary(
+            baseline.validation_errors,
+            summaries=baseline.validation_error_summaries,
+        )
         alerts.append(
             DriftAlert(
                 key="baseline_invalid",
@@ -627,15 +674,24 @@ def evaluate_drift(baseline: BaselineProfile, live: LiveMetrics) -> tuple[DriftA
         and live.total_evaluated >= 10
     ):
         delta = live.rejection_rate - baseline.rejection_rate
-        if delta >= 0.12:
+        if delta >= REJECTION_RATE_WARN_MARGIN:
+            # baseline.rejection_rate is the drift policy v1 rate bound into
+            # the promotion, not a research measurement.  The alert fires at
+            # that rate plus REJECTION_RATE_WARN_MARGIN, so the message states
+            # that trigger rather than the policy rate itself.
+            threshold = baseline.rejection_rate + REJECTION_RATE_WARN_MARGIN
             alerts.append(
                 DriftAlert(
                     key="rejection_rate_high",
-                    severity="err" if delta >= 0.2 else "warn",
-                    summary="Rejection rate materially exceeds the validated profile.",
+                    severity="err" if delta >= REJECTION_RATE_ERR_MARGIN else "warn",
+                    summary="Rejection rate materially exceeds the drift policy threshold.",
                     observed=f"{live.rejection_rate:.0%}",
-                    expected=f"{baseline.rejection_rate:.0%}",
-                    why_it_matters="When the bot is rejecting far more setups than research, live behavior can drift away from the tested strategy profile even if the code is still running.",
+                    expected=(
+                        f"at most {threshold:.0%} (drift policy rate "
+                        f"{baseline.rejection_rate:.0%} + {REJECTION_RATE_WARN_MARGIN:.0%} "
+                        "margin, not research-measured)"
+                    ),
+                    why_it_matters="The bot is rejecting far more setups than the operator drift policy allows. This threshold is a fixed policy value rather than a research result, so treat it as an operational check on filters and data, not as proof the strategy has drifted from research.",
                 )
             )
 
