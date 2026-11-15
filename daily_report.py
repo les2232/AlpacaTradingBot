@@ -1026,6 +1026,13 @@ def load_backtest_baseline(
             or source["effective_runtime_binding_valid"] is True
         )
     )
+    if source["valid_for_comparison"] is not True:
+        # metric_sources names where a usable expectation came from.  An
+        # invalid baseline yields none, even for values read from the live
+        # config before validation failed, so it must agree with
+        # baseline_comparison_status()["sources"] (all unavailable).
+        for key in metric_sources:
+            metric_sources[key] = METRIC_SOURCE_UNAVAILABLE
 
     return base, source
 

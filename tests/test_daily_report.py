@@ -678,11 +678,10 @@ def test_load_backtest_baseline_marks_research_metrics_unavailable_when_invalid(
     baseline, source = daily_report.load_backtest_baseline(tmp_path)
 
     assert source["valid_for_comparison"] is False
-    assert source["metric_sources"] == {
-        **_ALL_UNAVAILABLE_SOURCES,
-        "symbols": "live_config",
-        "bars_per_day": "live_config",
-    }
+    # The live config parsed (BACKTEST["symbols"] is its count), but nothing
+    # from an invalid baseline is a usable expectation.
+    assert baseline["symbols"] == 3
+    assert source["metric_sources"] == _ALL_UNAVAILABLE_SOURCES
     assert baseline["win_rate"] == daily_report.DEFAULT_BACKTEST["win_rate"]
 
 
@@ -1893,3 +1892,35 @@ def test_research_win_rate_is_always_read_as_a_percent(
     assert "(backtest 100%)" not in out and "(backtest 50%)" not in out
     output = daily_report.build_json_output(*_report_args(_noisy_inputs()))
     assert output["backtest"]["win_rate"] == expected_ratio
+
+
+@pytest.mark.parametrize("with_pointer", [True, False])
+def test_json_backtest_source_metric_sources_match_comparison_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    with_pointer: bool,
+) -> None:
+    # Approved artifacts whose live config parses; without a committed
+    # promotion pointer the baseline is invalid.
+    _write_approved_baseline_artifacts(tmp_path)
+    if with_pointer:
+        _mock_committed_promotion_pointer(monkeypatch, tmp_path)
+    baseline, source = daily_report.load_backtest_baseline(tmp_path)
+    assert source["valid_for_comparison"] is with_pointer
+    monkeypatch.setattr(daily_report, "BACKTEST", baseline)
+    monkeypatch.setattr(daily_report, "BACKTEST_SOURCE", source)
+
+    output = json.loads(
+        json.dumps(
+            daily_report.build_json_output(*_report_args(_quiet_inputs())),
+            default=str,
+        )
+    )
+
+    assert output["backtest_source"]["metric_sources"] == output["comparison"]["sources"]
+    if with_pointer:
+        assert output["comparison"]["sources"] == _VALID_METRIC_SOURCES
+        assert output["backtest"]["symbols"] == 3
+    else:
+        assert output["comparison"]["sources"] == _ALL_UNAVAILABLE_SOURCES
+        assert all(value is None for value in output["backtest"].values())
