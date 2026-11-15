@@ -664,7 +664,7 @@ def test_load_backtest_baseline_records_per_metric_sources(
     assert source["metric_sources"] == _VALID_METRIC_SOURCES
     # Non-research-backed metrics keep their placeholder for shape
     # compatibility, but are marked unavailable.
-    for key in daily_report.NON_RESEARCH_BACKED_METRICS:
+    for key in ("avg_hold_bars", "rejection_rate", "avg_slippage_bps"):
         assert baseline[key] == daily_report.DEFAULT_BACKTEST[key]
         assert source["metric_sources"][key] == "unavailable"
 

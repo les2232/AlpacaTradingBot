@@ -77,15 +77,6 @@ METRIC_SOURCE_LIVE_CONFIG = "live_config"
 METRIC_SOURCE_UNAVAILABLE = "unavailable"
 _LOADED_METRIC_SOURCES = frozenset({METRIC_SOURCE_RESEARCH, METRIC_SOURCE_LIVE_CONFIG})
 
-# The promotion bundle and best_config_latest.json "performance" block carry
-# trades_per_day and win_rate, but no holding-period, rejection-rate, or
-# slippage measurement, so these never have a research-backed expectation.
-NON_RESEARCH_BACKED_METRICS: tuple[str, ...] = (
-    "avg_hold_bars",
-    "rejection_rate",
-    "avg_slippage_bps",
-)
-
 
 # Backward-compatible name for report/drift consumers.  The explicit, frozen,
 # versioned definition lives in tradeos.strategy_contract.
@@ -504,6 +495,11 @@ def load_backtest_baseline(
         "effective_runtime_binding_errors": [],
         "validation_errors": [],
         "valid_for_comparison": False,
+        # Every metric starts unavailable and is marked only when actually
+        # loaded below.  The promotion bundle and best_config_latest.json
+        # "performance" block carry trades_per_day and win_rate but no
+        # holding-period, rejection-rate or slippage measurement, so
+        # avg_hold_bars, rejection_rate and avg_slippage_bps stay unavailable.
         "metric_sources": {key: METRIC_SOURCE_UNAVAILABLE for key in DEFAULT_BACKTEST},
     }
     metric_sources: dict[str, str] = source["metric_sources"]
