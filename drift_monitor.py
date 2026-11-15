@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from daily_report import WARN, load_backtest_baseline
+from daily_report import WARN, load_backtest_baseline, summarize_validation_reason
 from tradeos.research_bundle import DRIFT_PROFILE_POLICY_V1, load_verified_promotion_pointer
 
 
@@ -608,11 +608,26 @@ def _severity_for_ratio(delta_ratio: float) -> str:
     return "err" if delta_ratio >= 0.6 else "warn"
 
 
+def baseline_validation_summary(
+    validation_errors: tuple[str, ...] | list[str],
+    fallback: str = "baseline validation failed",
+) -> str:
+    """One readable line for operator-facing drift output.
+
+    Long field lists (e.g. "live runtime is missing promoted fields (...40+
+    names...)") are shortened with daily_report.summarize_validation_reason;
+    BaselineProfile.validation_errors keeps the full text.
+    """
+    return "; ".join(
+        summarize_validation_reason(error) for error in validation_errors
+    ) or fallback
+
+
 def evaluate_drift(baseline: BaselineProfile, live: LiveMetrics) -> tuple[DriftAlert, ...]:
     alerts: list[DriftAlert] = []
 
     if not baseline.valid_for_comparison:
-        detail = "; ".join(baseline.validation_errors) or "baseline validation failed"
+        detail = baseline_validation_summary(baseline.validation_errors)
         alerts.append(
             DriftAlert(
                 key="baseline_invalid",

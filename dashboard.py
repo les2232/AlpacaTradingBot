@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 from dashboard_state import DashboardState, DrilldownEvent, load_dashboard_state
+from drift_monitor import baseline_validation_summary
 from research.experiment_log import DEFAULT_LOG_PATH, load_experiment_log_frame
 
 st.set_page_config(page_title="TradeOS", layout="wide")
@@ -4389,7 +4390,9 @@ def _drift_summary_html(report) -> str:
         )
         status_line = f"No active drift alerts in {live.window_label}."
     else:
-        detail = "; ".join(baseline.validation_errors) or "validated baseline is unavailable"
+        detail = baseline_validation_summary(
+            baseline.validation_errors, "validated baseline is unavailable"
+        )
         cards = _status_card_html(
             "warn",
             "Drift comparison is running with an incomplete baseline",

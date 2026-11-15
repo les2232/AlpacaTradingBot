@@ -790,3 +790,38 @@ def test_drift_overlay_win_rate_above_one_hundred_percent_fails_closed(
         "performance contradicts the daily baseline" in error
         for error in profile.validation_errors
     )
+
+
+def test_baseline_invalid_alert_summarizes_long_field_lists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    errors = [
+        "promotion pointer is missing or invalid (Promotion pointer is unreadable.)",
+        "live runtime is missing promoted fields ("
+        + ", ".join(PROMOTED_RUNTIME_FIELDS)
+        + ")",
+    ]
+    monkeypatch.setattr(
+        drift_monitor,
+        "load_backtest_baseline",
+        lambda _root: (
+            dict(DEFAULT_BACKTEST),
+            {"mode": "defaults", "valid_for_comparison": False, "validation_errors": list(errors)},
+        ),
+    )
+
+    report = build_drift_report(
+        signal_events=[], bar_events=[], risk_events=[], repo_root=tmp_path
+    )
+
+    (alert,) = report.alerts
+    assert alert.key == "baseline_invalid"
+    assert alert.observed == (
+        "promotion pointer is missing or invalid (Promotion pointer is unreadable.); "
+        f"live runtime is missing {len(PROMOTED_RUNTIME_FIELDS)} promoted fields"
+    )
+    for field in PROMOTED_RUNTIME_FIELDS:
+        assert f"{field}," not in alert.observed
+    # The profile keeps the full, unsummarized text.
+    assert report.baseline.validation_errors == tuple(errors)

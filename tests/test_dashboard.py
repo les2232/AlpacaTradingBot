@@ -505,3 +505,54 @@ def test_drift_panel_derives_numbers_only_from_a_valid_baseline(
         assert placeholder not in html
     # The directly observed live rejection rate is still shown.
     assert "Rejections 95%" in html
+
+
+def test_drift_panel_summarizes_long_baseline_field_lists(monkeypatch, tmp_path) -> None:
+    import dataclasses
+
+    import drift_monitor
+    from daily_report import PROMOTED_RUNTIME_FIELDS
+
+    n_fields = len(PROMOTED_RUNTIME_FIELDS)
+    errors = [
+        "live runtime is missing promoted fields (" + ", ".join(PROMOTED_RUNTIME_FIELDS) + ")",
+        "research baseline symbols are missing or invalid",
+    ]
+    summary = (
+        f"live runtime is missing {n_fields} promoted fields; "
+        "research baseline symbols are missing or invalid"
+    )
+    monkeypatch.setattr(
+        drift_monitor,
+        "load_backtest_baseline",
+        lambda _root: (
+            dict(DEFAULT_BACKTEST),
+            {"mode": "defaults", "valid_for_comparison": False, "validation_errors": list(errors)},
+        ),
+    )
+    report = drift_monitor.build_drift_report(
+        signal_events=_drift_events(), bar_events=[], risk_events=[], repo_root=tmp_path
+    )
+
+    # Alert card (the path build_drift_report produces).
+    alert_html = dashboard._drift_summary_html(report)
+    assert f"Observed: {summary}." in alert_html
+    # "Incomplete baseline" card (an invalid report with no alerts).
+    no_alert_html = dashboard._drift_summary_html(dataclasses.replace(report, alerts=()))
+    assert "Drift comparison is running with an incomplete baseline" in no_alert_html
+    assert summary in no_alert_html
+    for html in (alert_html, no_alert_html):
+        for field in PROMOTED_RUNTIME_FIELDS:
+            assert f"{field}," not in html
+
+    # A valid baseline shows no validation text at all.
+    valid_report = dataclasses.replace(
+        report,
+        baseline=dataclasses.replace(
+            report.baseline, valid_for_comparison=True, validation_errors=()
+        ),
+        alerts=(),
+    )
+    valid_html = dashboard._drift_summary_html(valid_report)
+    assert "Live behavior is within the validated profile" in valid_html
+    assert "promoted fields" not in valid_html
