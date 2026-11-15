@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from daily_report import WARN, load_backtest_baseline, summarize_validation_reason
+from daily_report import load_backtest_baseline, summarize_validation_reason
 from tradeos.research_bundle import DRIFT_PROFILE_POLICY_V1, load_verified_promotion_pointer
 
 
@@ -344,51 +344,14 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
                 f"pointer-bound drift profile is missing or invalid ({exc})"
             )
 
-    strategy_mode: str | None = None
-
-    rejection_breakdown: tuple[tuple[str, float], ...] = ()
-    hybrid_branch_participation: tuple[tuple[str, float], ...] = ()
-    avg_bar_age_s = float(WARN["avg_bar_age_s"])
-    stale_bar_rate = 0.0
-    buy_rate = _safe_float(baseline.get("signal_rate_per_symbol_per_day"))
-    sell_rate = buy_rate
-    symbol_count = _safe_int(baseline.get("symbols"))
-    trade_count_per_day = (
-        buy_rate * symbol_count
-        if buy_rate is not None and symbol_count is not None and symbol_count > 0
-        else None
-    )
-    win_rate = _safe_float(baseline.get("win_rate"))
-
-    if isinstance(overlay, dict):
-        metrics = overlay.get("metrics")
-        context = overlay.get("context")
-        if isinstance(context, dict):
-            strategy_mode = str(context["strategy_mode"])
-        if isinstance(metrics, dict):
-            sell_rate = _safe_float(metrics["sell_signal_rate_per_symbol_per_day"])
-            rejection_breakdown = _validated_mix(
-                metrics.get("rejection_breakdown"),
-                field="rejection_breakdown",
-            )
-            hybrid_branch_participation = _validated_mix(
-                metrics.get("hybrid_branch_participation"),
-                field="hybrid_branch_participation",
-            )
-            avg_bar_age_s = _safe_float(metrics["avg_bar_age_s"])
-            stale_bar_rate = _safe_float(metrics["stale_bar_rate"])
-
-    source_parts = [str(source.get("mode", "defaults"))]
-    if overlay is not None:
-        source_parts.append("pointer_drift_profile")
-
+    source_label = str(source.get("mode", "defaults"))
     if source.get("valid_for_comparison") is not True or not isinstance(overlay, dict):
         # Fail closed: an invalid baseline's numbers are DEFAULT_BACKTEST
         # placeholders (or unvalidated live/research values).  Carry none of
         # them, so neither drift expectations nor live per-symbol/day rates
         # normalized by placeholder symbols/bars_per_day can reach the panel.
         return BaselineProfile(
-            source_label="+".join(source_parts),
+            source_label=source_label,
             valid_for_comparison=False,
             validation_errors=tuple(validation_errors),
             strategy_mode=None,
@@ -405,22 +368,41 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
             win_rate=None,
         )
 
+    # Valid: the daily baseline and the pointer-bound drift overlay were both
+    # verified, and _load_verified_drift_overlay() checked every field below.
+    context = overlay["context"]
+    metrics = overlay["metrics"]
+    buy_rate = _safe_float(baseline.get("signal_rate_per_symbol_per_day"))
+    symbol_count = _safe_int(baseline.get("symbols"))
+    trade_count_per_day = (
+        buy_rate * symbol_count
+        if buy_rate is not None and symbol_count is not None and symbol_count > 0
+        else None
+    )
     return BaselineProfile(
-        source_label="+".join(source_parts),
-        valid_for_comparison=source.get("valid_for_comparison") is True,
+        source_label=f"{source_label}+pointer_drift_profile",
+        valid_for_comparison=True,
         validation_errors=tuple(validation_errors),
-        strategy_mode=strategy_mode,
-        symbols=_safe_int(baseline.get("symbols")),
+        strategy_mode=str(context["strategy_mode"]),
+        symbols=symbol_count,
         bars_per_day=_safe_int(baseline.get("bars_per_day")),
         buy_signal_rate_per_symbol_per_day=buy_rate,
-        sell_signal_rate_per_symbol_per_day=sell_rate,
-        rejection_rate=_safe_float(overlay["metrics"]["rejection_rate"]),
-        rejection_breakdown=rejection_breakdown,
-        hybrid_branch_participation=hybrid_branch_participation,
-        avg_bar_age_s=avg_bar_age_s,
-        stale_bar_rate=stale_bar_rate,
+        sell_signal_rate_per_symbol_per_day=_safe_float(
+            metrics["sell_signal_rate_per_symbol_per_day"]
+        ),
+        rejection_rate=_safe_float(metrics["rejection_rate"]),
+        rejection_breakdown=_validated_mix(
+            metrics.get("rejection_breakdown"),
+            field="rejection_breakdown",
+        ),
+        hybrid_branch_participation=_validated_mix(
+            metrics.get("hybrid_branch_participation"),
+            field="hybrid_branch_participation",
+        ),
+        avg_bar_age_s=_safe_float(metrics["avg_bar_age_s"]),
+        stale_bar_rate=_safe_float(metrics["stale_bar_rate"]),
         trade_count_per_day=trade_count_per_day,
-        win_rate=win_rate,
+        win_rate=_safe_float(baseline.get("win_rate")),
     )
 
 
