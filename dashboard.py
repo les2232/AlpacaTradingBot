@@ -4391,7 +4391,9 @@ def _drift_summary_html(report) -> str:
         status_line = f"No active drift alerts in {live.window_label}."
     else:
         detail = baseline_validation_summary(
-            baseline.validation_errors, "validated baseline is unavailable"
+            baseline.validation_errors,
+            "validated baseline is unavailable",
+            summaries=baseline.validation_error_summaries,
         )
         cards = _status_card_html(
             "warn",

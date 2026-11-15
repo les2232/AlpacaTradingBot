@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from daily_report import load_backtest_baseline, summarize_validation_reason
+from daily_report import load_backtest_baseline, validation_reason_summaries
 from tradeos.research_bundle import DRIFT_PROFILE_POLICY_V1, load_verified_promotion_pointer
 
 
@@ -28,6 +28,9 @@ class BaselineProfile:
     stale_bar_rate: float | None
     trade_count_per_day: float | None
     win_rate: float | None
+    # (full validation error, short summary) pairs recorded by the code that
+    # built each long-list error; see daily_report._record_list_error.
+    validation_error_summaries: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -334,6 +337,12 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
     validation_errors = [
         str(item) for item in source.get("validation_errors", []) if str(item)
     ]
+    raw_summaries = source.get("validation_error_summaries")
+    error_summaries = tuple(
+        (error, summary)
+        for error, summary in (raw_summaries.items() if isinstance(raw_summaries, dict) else ())
+        if isinstance(error, str) and isinstance(summary, str) and summary
+    )
     overlay: dict[str, Any] | None = None
     if source.get("valid_for_comparison") is True:
         try:
@@ -366,6 +375,7 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
             stale_bar_rate=None,
             trade_count_per_day=None,
             win_rate=None,
+            validation_error_summaries=error_summaries,
         )
 
     # Valid: the daily baseline and the pointer-bound drift overlay were both
@@ -403,6 +413,7 @@ def load_baseline_profile(repo_root: Path | None = None) -> BaselineProfile:
         stale_bar_rate=_safe_float(metrics["stale_bar_rate"]),
         trade_count_per_day=trade_count_per_day,
         win_rate=_safe_float(baseline.get("win_rate")),
+        validation_error_summaries=error_summaries,
     )
 
 
@@ -593,15 +604,17 @@ def _severity_for_ratio(delta_ratio: float) -> str:
 def baseline_validation_summary(
     validation_errors: tuple[str, ...] | list[str],
     fallback: str = "baseline validation failed",
+    summaries: tuple[tuple[str, str], ...] = (),
 ) -> str:
     """One readable line for operator-facing drift output.
 
-    Long field lists (e.g. "live runtime is missing promoted fields (...40+
-    names...)") are shortened with daily_report.summarize_validation_reason;
-    BaselineProfile.validation_errors keeps the full text.
+    Long lists use the summary recorded by the code that built the error
+    (``summaries``, e.g. "live runtime is missing 38 promoted fields"), else
+    daily_report's generic fallback.  BaselineProfile.validation_errors keeps
+    the full text.
     """
     return "; ".join(
-        summarize_validation_reason(error) for error in validation_errors
+        validation_reason_summaries(list(validation_errors), dict(summaries))
     ) or fallback
 
 
@@ -609,7 +622,10 @@ def evaluate_drift(baseline: BaselineProfile, live: LiveMetrics) -> tuple[DriftA
     alerts: list[DriftAlert] = []
 
     if not baseline.valid_for_comparison:
-        detail = baseline_validation_summary(baseline.validation_errors)
+        detail = baseline_validation_summary(
+            baseline.validation_errors,
+            summaries=baseline.validation_error_summaries,
+        )
         alerts.append(
             DriftAlert(
                 key="baseline_invalid",

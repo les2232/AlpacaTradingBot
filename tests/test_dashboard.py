@@ -514,12 +514,13 @@ def test_drift_panel_summarizes_long_baseline_field_lists(monkeypatch, tmp_path)
     from daily_report import PROMOTED_RUNTIME_FIELDS
 
     n_fields = len(PROMOTED_RUNTIME_FIELDS)
+    # Reworded ("lacks"), so only the recorded summary can shorten it.
     errors = [
-        "live runtime is missing promoted fields (" + ", ".join(PROMOTED_RUNTIME_FIELDS) + ")",
+        "live runtime lacks promoted fields (" + ", ".join(PROMOTED_RUNTIME_FIELDS) + ")",
         "research baseline symbols are missing or invalid",
     ]
     summary = (
-        f"live runtime is missing {n_fields} promoted fields; "
+        f"live runtime lacks {n_fields} promoted fields; "
         "research baseline symbols are missing or invalid"
     )
     monkeypatch.setattr(
@@ -527,7 +528,14 @@ def test_drift_panel_summarizes_long_baseline_field_lists(monkeypatch, tmp_path)
         "load_backtest_baseline",
         lambda _root: (
             dict(DEFAULT_BACKTEST),
-            {"mode": "defaults", "valid_for_comparison": False, "validation_errors": list(errors)},
+            {
+                "mode": "defaults",
+                "valid_for_comparison": False,
+                "validation_errors": list(errors),
+                "validation_error_summaries": {
+                    errors[0]: f"live runtime lacks {n_fields} promoted fields"
+                },
+            },
         ),
     )
     report = drift_monitor.build_drift_report(

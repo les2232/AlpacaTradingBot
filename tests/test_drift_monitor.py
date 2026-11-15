@@ -796,18 +796,25 @@ def test_baseline_invalid_alert_summarizes_long_field_lists(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    # Reworded ("lacks"), so only the recorded summary can shorten it.
     errors = [
         "promotion pointer is missing or invalid (Promotion pointer is unreadable.)",
-        "live runtime is missing promoted fields ("
+        "live runtime lacks promoted fields ("
         + ", ".join(PROMOTED_RUNTIME_FIELDS)
         + ")",
     ]
+    summaries = {errors[1]: f"live runtime lacks {len(PROMOTED_RUNTIME_FIELDS)} promoted fields"}
     monkeypatch.setattr(
         drift_monitor,
         "load_backtest_baseline",
         lambda _root: (
             dict(DEFAULT_BACKTEST),
-            {"mode": "defaults", "valid_for_comparison": False, "validation_errors": list(errors)},
+            {
+                "mode": "defaults",
+                "valid_for_comparison": False,
+                "validation_errors": list(errors),
+                "validation_error_summaries": dict(summaries),
+            },
         ),
     )
 
@@ -819,7 +826,7 @@ def test_baseline_invalid_alert_summarizes_long_field_lists(
     assert alert.key == "baseline_invalid"
     assert alert.observed == (
         "promotion pointer is missing or invalid (Promotion pointer is unreadable.); "
-        f"live runtime is missing {len(PROMOTED_RUNTIME_FIELDS)} promoted fields"
+        f"live runtime lacks {len(PROMOTED_RUNTIME_FIELDS)} promoted fields"
     )
     for field in PROMOTED_RUNTIME_FIELDS:
         assert f"{field}," not in alert.observed

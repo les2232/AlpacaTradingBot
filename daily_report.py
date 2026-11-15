@@ -77,6 +77,34 @@ METRIC_SOURCE_LIVE_CONFIG = "live_config"
 METRIC_SOURCE_UNAVAILABLE = "unavailable"
 _LOADED_METRIC_SOURCES = frozenset({METRIC_SOURCE_RESEARCH, METRIC_SOURCE_LIVE_CONFIG})
 
+# Validation errors listing more than this many items get a short summary for
+# human-facing output; the full text is always kept for JSON.
+_REASON_SUMMARY_MAX_ITEMS = 5
+_REASON_SUMMARY_PREVIEW_ITEMS = 3
+
+
+def _record_list_error(
+    source: dict[str, Any],
+    full: str,
+    item_count: int,
+    summary: str,
+) -> None:
+    """Append a validation error and, for a long list, its short summary.
+
+    The summary is built by the code that produced the list, from the counts
+    it already has, so human-facing output never depends on parsing the
+    wording of ``full``.
+    """
+    source["validation_errors"].append(full)
+    if item_count > _REASON_SUMMARY_MAX_ITEMS:
+        source["validation_error_summaries"][full] = summary
+
+
+def _preview(items: list[str], separator: str = ", ") -> str:
+    shown = separator.join(items[:_REASON_SUMMARY_PREVIEW_ITEMS])
+    remaining = len(items) - _REASON_SUMMARY_PREVIEW_ITEMS
+    return f"{shown}{separator}and {remaining} more" if remaining > 0 else shown
+
 
 # Backward-compatible name for report/drift consumers.  The explicit, frozen,
 # versioned definition lives in tradeos.strategy_contract.
@@ -494,6 +522,9 @@ def load_backtest_baseline(
         "effective_runtime_binding_valid": None,
         "effective_runtime_binding_errors": [],
         "validation_errors": [],
+        # Full validation error text -> short summary, recorded by the code
+        # that builds each long-list error (see _record_list_error).
+        "validation_error_summaries": {},
         "valid_for_comparison": False,
         # Every metric starts unavailable and is marked only when actually
         # loaded below.  The promotion bundle and best_config_latest.json
@@ -701,10 +732,13 @@ def load_backtest_baseline(
             key for key in PROMOTED_RUNTIME_FIELDS if key not in live_runtime_cmp
         ]
         if missing_live_fields:
-            source["validation_errors"].append(
+            _record_list_error(
+                source,
                 "live runtime is missing promoted fields ("
                 + ", ".join(missing_live_fields)
-                + ")"
+                + ")",
+                len(missing_live_fields),
+                f"live runtime is missing {len(missing_live_fields)} promoted fields",
             )
         elif isinstance(live_runtime, dict):
             try:
@@ -910,10 +944,14 @@ def load_backtest_baseline(
             key for key in PROMOTED_RUNTIME_FIELDS if key not in research_config
         ]
         if missing_research_fields:
-            source["validation_errors"].append(
+            _record_list_error(
+                source,
                 "research baseline is missing promoted fields ("
                 + ", ".join(missing_research_fields)
-                + ")"
+                + ")",
+                len(missing_research_fields),
+                f"research baseline is missing {len(missing_research_fields)} "
+                "promoted fields",
             )
         elif research_symbols is not None:
             try:
@@ -948,9 +986,15 @@ def load_backtest_baseline(
                 research_contract.symbols == live_contract.symbols
             )
             if source["research_matches_live_symbols"] is not True:
-                source["validation_errors"].append(
+                not_in_both = len(set(live_symbols) ^ set(research_symbols))
+                _record_list_error(
+                    source,
                     "research symbols do not match live runtime "
-                    f"(live={live_symbols!r} research={research_symbols!r})"
+                    f"(live={live_symbols!r} research={research_symbols!r})",
+                    max(len(live_symbols), len(research_symbols)),
+                    "research symbols do not match live runtime "
+                    f"(live has {len(live_symbols)} symbols, research has "
+                    f"{len(research_symbols)}; {not_in_both} not in both)",
                 )
 
             live_runtime_cmp = live_contract.promoted_values
@@ -962,8 +1006,13 @@ def load_backtest_baseline(
                     mismatches.append(f"{key}: live={live_runtime_cmp[key]!r} research={research_value!r}")
             source["research_matches_live_runtime"] = len(mismatches) == 0
             if mismatches:
-                source["validation_errors"].append(
-                    "research config does not match live runtime (" + "; ".join(mismatches) + ")"
+                mismatched_fields = [item.split(":", 1)[0] for item in mismatches]
+                _record_list_error(
+                    source,
+                    "research config does not match live runtime (" + "; ".join(mismatches) + ")",
+                    len(mismatches),
+                    "research config does not match live runtime "
+                    f"({len(mismatches)} fields differ: {_preview(mismatched_fields)})",
                 )
 
         performance = research.get("performance")
@@ -1173,8 +1222,6 @@ def baseline_comparison_status() -> dict[str, Any]:
     }
 
 
-_REASON_SUMMARY_MAX_ITEMS = 5
-_REASON_SUMMARY_PREVIEW_ITEMS = 3
 _OPENERS = {")": "(", "]": "[", "}": "{"}
 
 
@@ -1220,13 +1267,13 @@ def _trailing_parenthetical(text: str) -> tuple[str, str] | None:
 
 
 def summarize_validation_reason(reason: str) -> str:
-    """Shorten one baseline validation error for human-facing output.
+    """Generic fallback summary for one validation error.
 
-    Long trailing lists such as ``live runtime is missing promoted fields
-    (a, b, ... 40 more)`` become ``live runtime is missing 43 promoted
-    fields``; other long lists keep their first few items plus a count.
-    Short reasons are returned unchanged.  The JSON ``comparison.reasons``
-    always carries the full, unsummarized text.
+    A trailing list longer than five items keeps its first three items plus
+    "and N more", whatever the surrounding wording.  Short reasons are
+    returned unchanged.  Errors whose producer recorded a summary (see
+    ``validation_reason_summaries``) never reach this parser.  The JSON
+    ``comparison.reasons`` always carries the full, unsummarized text.
     """
     text = str(reason)
     split = _trailing_parenthetical(text)
@@ -1243,12 +1290,31 @@ def summarize_validation_reason(reason: str) -> str:
         return text if summarized_inner == inner else f"{head} ({summarized_inner})"
     if len(items) <= _REASON_SUMMARY_MAX_ITEMS:
         return text
-    subject, marker, noun = head.partition(" is missing ")
-    if marker and noun.endswith("fields") and " or " not in noun:
-        return f"{subject} is missing {len(items)} {noun}"
-    preview = separator.join(items[:_REASON_SUMMARY_PREVIEW_ITEMS])
-    remaining = len(items) - _REASON_SUMMARY_PREVIEW_ITEMS
-    return f"{head} ({preview}{separator}and {remaining} more)"
+    return f"{head} ({_preview(items, separator)})"
+
+
+def validation_reason_summaries(
+    reasons: list[str] | tuple[str, ...],
+    recorded: object = None,
+) -> list[str]:
+    """Short, human-facing form of each validation error.
+
+    Uses the summary recorded by the code that built the error when there is
+    one (``validation_error_summaries``), else the generic fallback.
+    """
+    known = recorded if isinstance(recorded, dict) else {}
+    return [
+        summary
+        if isinstance(summary := known.get(reason), str) and summary
+        else summarize_validation_reason(reason)
+        for reason in reasons
+    ]
+
+
+def _baseline_reason_summaries(reasons: list[str]) -> list[str]:
+    return validation_reason_summaries(
+        reasons, BACKTEST_SOURCE.get("validation_error_summaries")
+    )
 
 
 def _expectation(comparison: dict[str, Any], key: str) -> Any:
@@ -1467,9 +1533,7 @@ def detect_concerns(bar_q: dict, sig: dict, ex: dict, pos: dict, log_health: dic
     concerns = []
     comparison = baseline_comparison_status()
     if not comparison["available"]:
-        detail = "; ".join(
-            summarize_validation_reason(item) for item in comparison["reasons"]
-        )
+        detail = "; ".join(_baseline_reason_summaries(comparison["reasons"]))
         concerns.append(
             f"BASELINE INVALID: {detail} — comparison unavailable; "
             f"backtest-relative checks (signal rate, session coverage) suppressed"
@@ -1645,9 +1709,7 @@ def print_report(
     else:
         row("Bars evaluated",        fmt(bar_q["evaluated"]))
     row("Baseline source",       str(BACKTEST_SOURCE.get("mode", "defaults")))
-    reason_summaries = [
-        summarize_validation_reason(item) for item in comparison["reasons"]
-    ]
+    reason_summaries = _baseline_reason_summaries(comparison["reasons"])
     if not comparable:
         row("Backtest comparison",   "unavailable", flag="WARN")
         print("  Baseline validation:")

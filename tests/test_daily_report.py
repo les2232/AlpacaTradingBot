@@ -709,9 +709,11 @@ _LONG_FIELD_LIST_REASONS = [
 @pytest.mark.parametrize(
     ("reason", "expected"),
     [
+        # Generic fallback: wording-agnostic preview.  The "is missing N
+        # promoted fields" form is recorded by the producer, not parsed.
         (
             "live runtime is missing promoted fields (a, b, c, d, e, f, g)",
-            "live runtime is missing 7 promoted fields",
+            "live runtime is missing promoted fields (a, b, c, and 4 more)",
         ),
         # Short lists stay verbatim.
         (
@@ -744,7 +746,7 @@ _LONG_FIELD_LIST_REASONS = [
             "runtime execution context is missing or invalid (selected runtime "
             "is missing promoted fields (a, b, c, d, e, f))",
             "runtime execution context is missing or invalid (selected runtime "
-            "is missing 6 promoted fields)",
+            "is missing promoted fields (a, b, c, and 3 more))",
         ),
         # Unbalanced text is left alone.
         ("broken (a, b, c, d, e, f", "broken (a, b, c, d, e, f"),
@@ -759,12 +761,23 @@ def test_baseline_invalid_concern_summarizes_long_field_lists(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    n_fields = len(daily_report.PROMOTED_RUNTIME_FIELDS)
     monkeypatch.setitem(
         daily_report.BACKTEST_SOURCE,
         "validation_errors",
         list(_LONG_FIELD_LIST_REASONS),
     )
-    n_fields = len(daily_report.PROMOTED_RUNTIME_FIELDS)
+    # As load_backtest_baseline() records them for these two list errors.
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE,
+        "validation_error_summaries",
+        {
+            _LONG_FIELD_LIST_REASONS[1]: f"live runtime is missing {n_fields} promoted fields",
+            _LONG_FIELD_LIST_REASONS[2]: (
+                f"research baseline is missing {n_fields - 1} promoted fields"
+            ),
+        },
+    )
     assert n_fields > 40
 
     concerns = daily_report.detect_concerns(*_quiet_inputs())
@@ -1924,3 +1937,137 @@ def test_json_backtest_source_metric_sources_match_comparison_sources(
     else:
         assert output["comparison"]["sources"] == _ALL_UNAVAILABLE_SOURCES
         assert all(value is None for value in output["backtest"].values())
+
+
+def _write_live_and_research(
+    base_dir: Path,
+    live_runtime: dict[str, object],
+    research_runtime: dict[str, object],
+) -> None:
+    (base_dir / "config").mkdir(parents=True, exist_ok=True)
+    (base_dir / "results").mkdir(parents=True, exist_ok=True)
+    (base_dir / "config" / "live_config.json").write_text(
+        json.dumps(
+            {
+                "source": {"approved": True, "rejection_reasons": []},
+                "runtime": live_runtime,
+            }
+        ),
+        encoding="utf-8",
+    )
+    research_config = _research_config(research_runtime)
+    (base_dir / "results" / "best_config_latest.json").write_text(
+        json.dumps(
+            {
+                "approved": True,
+                "rejection_reasons": [],
+                "config": research_config,
+                "canonical_strategy_contract": _canonical_research_contract(research_config),
+                "performance": {"trades_per_day": 6.0, "win_rate": 75.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_load_backtest_baseline_records_summaries_for_missing_field_lists(
+    tmp_path: Path,
+) -> None:
+    runtime = _complete_runtime()
+    live_runtime = dict(runtime)
+    dropped_live = list(daily_report.PROMOTED_RUNTIME_FIELDS[:7])
+    for key in dropped_live:
+        live_runtime.pop(key, None)
+    _write_live_and_research(tmp_path, live_runtime, runtime)
+    research_path = tmp_path / "results" / "best_config_latest.json"
+    research = json.loads(research_path.read_text(encoding="utf-8"))
+    for key in daily_report.PROMOTED_RUNTIME_FIELDS[:9]:
+        research["config"].pop(key, None)
+    research_path.write_text(json.dumps(research), encoding="utf-8")
+
+    _baseline, source = daily_report.load_backtest_baseline(tmp_path)
+
+    summaries = source["validation_error_summaries"]
+    live_error = next(e for e in source["validation_errors"] if e.startswith("live runtime is missing"))
+    research_error = next(
+        e for e in source["validation_errors"] if e.startswith("research baseline is missing")
+    )
+    # Full text keeps every name; the summary comes from the producer's count.
+    assert all(key in live_error for key in dropped_live)
+    assert summaries[live_error] == "live runtime is missing 7 promoted fields"
+    assert summaries[research_error] == "research baseline is missing 9 promoted fields"
+
+
+def test_load_backtest_baseline_records_summaries_for_config_and_symbol_mismatch(
+    tmp_path: Path,
+) -> None:
+    live_symbols = ["AMD", "MSFT", "TSLA", "NVDA", "AAPL", "GOOG", "META"]
+    research_symbols = ["AMD", "MSFT", "TSLA", "NVDA", "AAPL", "AMZN", "NFLX"]
+    live_runtime = _complete_runtime(symbols=live_symbols)
+    research_runtime = _complete_runtime(
+        symbols=research_symbols,
+        sma_bars=25,
+        atr_multiple=1.5,
+        vwap_z_entry_threshold=2.0,
+        vwap_z_stop_atr_multiple=2.5,
+        min_atr_percentile=30.0,
+        max_adx_threshold=30.0,
+        trend_pullback_min_adx=25.0,
+    )
+    _write_live_and_research(tmp_path, live_runtime, research_runtime)
+
+    _baseline, source = daily_report.load_backtest_baseline(tmp_path)
+
+    summaries = source["validation_error_summaries"]
+    symbol_error = next(
+        e for e in source["validation_errors"] if e.startswith("research symbols do not match")
+    )
+    config_error = next(
+        e for e in source["validation_errors"] if e.startswith("research config does not match")
+    )
+    assert summaries[symbol_error] == (
+        "research symbols do not match live runtime "
+        "(live has 7 symbols, research has 7; 4 not in both)"
+    )
+    # 7 changed parameters, plus symbol_strategy_modes because the symbols differ.
+    assert summaries[config_error] == (
+        "research config does not match live runtime (8 fields differ: "
+        "sma_bars, symbol_strategy_modes, atr_multiple, and 5 more)"
+    )
+
+
+def test_short_validation_lists_record_no_summary(tmp_path: Path) -> None:
+    runtime = _complete_runtime()
+    live_runtime = dict(runtime)
+    live_runtime.pop("sma_bars")
+    _write_live_and_research(tmp_path, live_runtime, runtime)
+
+    _baseline, source = daily_report.load_backtest_baseline(tmp_path)
+
+    assert "live runtime is missing promoted fields (sma_bars)" in source["validation_errors"]
+    assert source["validation_error_summaries"] == {}
+
+
+def test_report_uses_recorded_summary_regardless_of_error_wording(
+    invalid_baseline: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fields = ", ".join(daily_report.PROMOTED_RUNTIME_FIELDS)
+    # Reworded error text: no "is missing", so parsing could not count it.
+    reworded = f"live runtime lacks promoted fields ({fields})"
+    summary = f"live runtime lacks {len(daily_report.PROMOTED_RUNTIME_FIELDS)} promoted fields"
+    monkeypatch.setitem(daily_report.BACKTEST_SOURCE, "validation_errors", [reworded])
+    monkeypatch.setitem(
+        daily_report.BACKTEST_SOURCE, "validation_error_summaries", {reworded: summary}
+    )
+
+    concerns = daily_report.detect_concerns(*_quiet_inputs())
+    daily_report.print_report(*_report_args(_quiet_inputs()))
+    out = capsys.readouterr().out
+    output = daily_report.build_json_output(*_report_args(_quiet_inputs()))
+
+    assert concerns[0].startswith(f"BASELINE INVALID: {summary} — comparison unavailable")
+    assert f"    - {summary}\n" in out
+    assert "and 4" not in out  # no generic preview of the reworded text
+    assert output["comparison"]["reasons"] == [reworded]
